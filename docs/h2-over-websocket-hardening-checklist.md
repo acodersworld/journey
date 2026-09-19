@@ -516,4 +516,10 @@ The crate may move to a separate repository when:
 
 ### Result
 
-Not completed.
+Partially verified. The full workspace tests and strict Clippy pass, and the
+transport test suite completed 100 consecutive runs without failure. Local
+gateway/home binaries also passed health, ping, and pong checks over one
+persistent session; after stopping and restarting home, the gateway logged a
+replacement session and requests continued to succeed. Docker and Podman are
+unavailable in this environment, so container-specific checks, sustained RSS
+observation, and the final extraction gate remain unverified.
