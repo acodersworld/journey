@@ -750,18 +750,78 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn binary_messages_form_one_continuous_byte_stream() {
-        let (mut client, mut server) = websocket_pair(Config::default()).await;
+    async fn bridge_websocket_messages_form_one_continuous_byte_stream() {
+        let config = Config {
+            bridge_buffer_size: 4,
+            ..Config::default()
+        };
+        let (mut client, server) = websocket_pair(config).await;
+        let (mut application, bridge_io) = duplex(64);
+        let bridge = tokio::spawn(bridge(server, bridge_io, config.bridge_buffer_size));
+
         client
             .send(Message::Binary(Bytes::from_static(b"hello")))
             .await
             .expect("send first message");
         client
-            .send(Message::Binary(Bytes::from_static(b" world")))
+            .send(Message::Binary(Bytes::from_static(b"websocket")))
             .await
             .expect("send second message");
-        assert_eq!(server.next().await.expect("first message").expect("message"), Message::Binary(Bytes::from_static(b"hello")));
-        assert_eq!(server.next().await.expect("second message").expect("message"), Message::Binary(Bytes::from_static(b" world")));
+        client
+            .send(Message::Binary(Bytes::from_static(b"bridge!")))
+            .await
+            .expect("send third message");
+
+        let mut received = Vec::new();
+        for size in [2, 7, 3, 9] {
+            let mut chunk = vec![0_u8; size];
+            timeout(Duration::from_millis(100), application.read_exact(&mut chunk))
+                .await
+                .expect("byte-stream read timed out")
+                .expect("byte-stream read");
+            received.extend_from_slice(&chunk);
+        }
+        assert_eq!(received, b"hellowebsocketbridge!");
+
+        bridge.abort();
+        let _ = bridge.await;
+    }
+
+    #[tokio::test]
+    async fn bridge_byte_stream_forms_binary_websocket_messages() {
+        let config = Config {
+            bridge_buffer_size: 4,
+            ..Config::default()
+        };
+        let (mut client, server) = websocket_pair(config).await;
+        let (mut application, bridge_io) = duplex(64);
+        let bridge = tokio::spawn(bridge(server, bridge_io, config.bridge_buffer_size));
+        let expected = b"uneven byte-stream writes";
+
+        for chunk in [b"uneven ".as_slice(), b"byte-stream ".as_slice(), b"writes".as_slice()] {
+            application.write_all(chunk).await.expect("byte-stream write");
+        }
+        application.shutdown().await.expect("byte-stream shutdown");
+
+        let mut received = Vec::new();
+        while received.len() < expected.len() {
+            let message = timeout(Duration::from_millis(100), client.next())
+                .await
+                .expect("WebSocket read timed out")
+                .expect("WebSocket ended")
+                .expect("WebSocket read");
+            match message {
+                Message::Binary(data) => received.extend_from_slice(&data),
+                message => panic!("unexpected WebSocket message: {message:?}"),
+            }
+        }
+        assert_eq!(received, expected);
+
+        assert!(timeout(Duration::from_millis(100), bridge)
+            .await
+            .expect("bridge task timed out")
+            .expect("bridge task")
+            .is_ok());
     }
 
     #[tokio::test]

@@ -28,7 +28,7 @@ The crate remains usable as a prototype during this work, but it is not consider
 |---:|---|---|---|
 | 1 | Eliminate the session-state lost-wakeup race | Critical | Complete |
 | 2 | Validate relationships between bridge and WebSocket limits | High | Complete |
-| 3 | Replace the misleading byte-stream test with a real bridge test | High | Not started |
+| 3 | Replace the misleading byte-stream test with a real bridge test | High | Complete |
 | 4 | Test independent bidirectional progress under backpressure | Critical | Not started |
 | 5 | Make close and shutdown bounded | High | Not started |
 | 6 | Test bridge failure, cancellation, EOF, and task cleanup | High | Not started |
@@ -164,7 +164,10 @@ Tests must not assume that one byte-stream write produces one WebSocket message 
 
 ### Result
 
-Not completed.
+Complete. The direct WebSocket endpoint test was replaced with production
+`bridge()` tests in both directions. They use message boundaries and byte
+reads/writes that do not align, and all reads are time-bounded. Crate and
+workspace tests pass; strict Clippy still has the Step 10 findings.
 
 ## 7. Step 4: prove independent progress under backpressure
 
