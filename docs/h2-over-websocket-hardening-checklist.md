@@ -32,7 +32,7 @@ The crate remains usable as a prototype during this work, but it is not consider
 | 4 | Test independent bidirectional progress under backpressure | Critical | Complete |
 | 5 | Make close and shutdown bounded | High | Complete |
 | 6 | Test bridge failure, cancellation, EOF, and task cleanup | High | Complete |
-| 7 | Complete subprotocol and configuration tests | Medium | Not started |
+| 7 | Complete subprotocol and configuration tests | Medium | Complete |
 | 8 | Resolve the generic `serve` versus HTTP/2 `ServerSession` API | High | Not started |
 | 9 | Tighten Journey's public-response backpressure | High | Not started |
 | 10 | Clear strict Clippy findings manually | Medium | Not started |
@@ -334,7 +334,13 @@ Document clearly that `connect_client()` and `server_session()` accept an alread
 
 ### Result
 
-Not completed.
+Complete. Handshake tests cover client offers, exact server selection, missing
+and unequal offers, comma-separated offers, and client rejection when the
+server selects nothing. Default and custom handshake limits are asserted, and
+invalid configuration is rejected before handshake work. Lower-level session
+API documentation now states the caller’s handshake-limit obligations. Crate
+and workspace tests pass; strict Clippy still has the Step 10 findings,
+including the required handshake-callback lint.
 
 ## 11. Step 8: settle the public server API
 

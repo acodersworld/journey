@@ -601,6 +601,11 @@ async fn connect_h2(
 }
 
 /// Establishes an HTTP/2 client session over an already-upgraded WebSocket.
+///
+/// The caller must have applied [`Config`] limits and negotiated [`SUBPROTOCOL`]
+/// during the WebSocket handshake. This function cannot retroactively constrain
+/// allocations made during that handshake. Prefer [`connect`] or
+/// [`connect_websocket`] when this crate should own those defaults.
 pub async fn connect_client<S>(
     websocket: WebSocketStream<S>,
     config: Config,
@@ -729,6 +734,11 @@ async fn run_server_connection(
 }
 
 /// Establishes an HTTP/2 server session over an already-upgraded WebSocket.
+///
+/// The caller must have applied [`Config`] limits and negotiated [`SUBPROTOCOL`]
+/// during the WebSocket handshake. This function cannot retroactively constrain
+/// allocations made during that handshake. Prefer [`accept_server`] or
+/// [`accept_websocket`] when this crate should own those defaults.
 pub async fn server_session<S>(
     websocket: WebSocketStream<S>,
     config: Config,
@@ -787,6 +797,7 @@ mod tests {
     use tokio::io::duplex;
     use tokio::time::{timeout, Duration};
     use tokio_tungstenite::client_async_with_config;
+    use tokio_tungstenite::tungstenite::handshake::client::Response as ClientResponse;
 
     struct PendingWriteNotifier {
         inner: DuplexStream,
@@ -904,6 +915,32 @@ mod tests {
                 .expect("server websocket handshake")
         });
         (client.await.expect("client task"), server.await.expect("server task"))
+    }
+
+    async fn websocket_handshake_with_offer(
+        config: Config,
+        offer: Option<&str>,
+    ) -> (
+        Result<(WebSocketStream<DuplexStream>, ClientResponse), tokio_tungstenite::tungstenite::Error>,
+        Result<WebSocketStream<DuplexStream>, Error>,
+    ) {
+        let (client_io, server_io) = duplex(1024 * 1024);
+        let offer = offer.map(str::to_owned);
+        let client = tokio::spawn(async move {
+            let mut request = "ws://localhost".into_client_request().expect("request");
+            if let Some(offer) = offer {
+                request.headers_mut().insert(
+                    "Sec-WebSocket-Protocol",
+                    HeaderValue::from_str(&offer).expect("subprotocol offer"),
+                );
+            }
+            client_async_with_config(request, client_io, Some(config.websocket_config())).await
+        });
+        let server = tokio::spawn(async move { accept_websocket(server_io, config).await });
+        (
+            client.await.expect("client task"),
+            server.await.expect("server task"),
+        )
     }
 
     async fn websocket_pair_with_server_write_backpressure(
@@ -1708,6 +1745,160 @@ mod tests {
             .await
             .expect("send oversized message");
         assert!(server.next().await.expect("message result").is_err());
+    }
+
+    #[tokio::test]
+    async fn server_selects_exact_subprotocol_from_client_offer() {
+        let config = Config::default();
+        let (client, server) = websocket_handshake_with_offer(config, Some(SUBPROTOCOL)).await;
+        let (_, response) = client.expect("client handshake");
+        server.expect("server handshake");
+        assert_eq!(
+            response
+                .headers()
+                .get("Sec-WebSocket-Protocol")
+                .and_then(|value| value.to_str().ok()),
+            Some(SUBPROTOCOL)
+        );
+    }
+
+    #[tokio::test]
+    async fn server_accepts_comma_separated_subprotocol_offer() {
+        let config = Config::default();
+        let (client, server) = websocket_handshake_with_offer(
+            config,
+            Some("other-protocol, h2-over-websocket-v1, another-protocol"),
+        )
+        .await;
+        let (_, response) = client.expect("client handshake");
+        server.expect("server handshake");
+        assert_eq!(
+            response
+                .headers()
+                .get("Sec-WebSocket-Protocol")
+                .and_then(|value| value.to_str().ok()),
+            Some(SUBPROTOCOL)
+        );
+    }
+
+    #[tokio::test]
+    async fn server_rejects_missing_or_unequal_subprotocol_offer() {
+        for offer in [None, Some("h2-over-websocket-v10")] {
+            let (_, server) = websocket_handshake_with_offer(Config::default(), offer).await;
+            assert!(matches!(server, Err(Error::WebSocket(_))));
+        }
+    }
+
+    #[tokio::test]
+    async fn default_and_custom_handshake_limits_are_installed() {
+        let default_config = Config::default().websocket_config();
+        assert_eq!(default_config.max_message_size, Some(DEFAULT_MAX_MESSAGE_SIZE));
+        assert_eq!(default_config.max_frame_size, Some(DEFAULT_MAX_FRAME_SIZE));
+
+        let custom = Config {
+            max_message_size: 32,
+            max_frame_size: 16,
+            bridge_buffer_size: 16,
+            ..Config::default()
+        }
+        .websocket_config();
+        assert_eq!(custom.max_message_size, Some(32));
+        assert_eq!(custom.max_frame_size, Some(16));
+    }
+
+    #[tokio::test]
+    async fn invalid_config_is_rejected_before_handshake_work() {
+        let config = Config {
+            close_timeout: Duration::ZERO,
+            ..Config::default()
+        };
+        assert!(matches!(
+            connect_websocket("not a URL", config).await,
+            Err(Error::Configuration("close timeout must be greater than zero"))
+        ));
+        let (_client_io, server_io) = duplex(64);
+        assert!(matches!(
+            accept_websocket(server_io, config).await,
+            Err(Error::Configuration("close timeout must be greater than zero"))
+        ));
+    }
+
+    #[tokio::test]
+    async fn connect_websocket_offers_and_server_selects_exact_subprotocol() {
+        let config = Config::default();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("listener");
+        let address = listener.local_addr().expect("listener address");
+        let offered = Arc::new(std::sync::Mutex::new(None));
+        let server_offered = Arc::clone(&offered);
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("accept");
+            let websocket = accept_hdr_async_with_config(
+                stream,
+                move |request: &Request, mut response: Response| {
+                    *server_offered.lock().expect("offered lock") = request
+                        .headers()
+                        .get("Sec-WebSocket-Protocol")
+                        .and_then(|value| value.to_str().ok())
+                        .map(str::to_owned);
+                    response.headers_mut().insert(
+                        "Sec-WebSocket-Protocol",
+                        HeaderValue::from_static(SUBPROTOCOL),
+                    );
+                    Ok(response)
+                },
+                Some(config.websocket_config()),
+            )
+            .await
+            .expect("server handshake");
+            drop(websocket);
+        });
+
+        let (_, response) = connect_websocket(&format!("ws://{address}"), config)
+            .await
+            .expect("client handshake");
+        assert_eq!(
+            response
+                .headers()
+                .get("Sec-WebSocket-Protocol")
+                .and_then(|value| value.to_str().ok()),
+            Some(SUBPROTOCOL)
+        );
+        server.await.expect("server task");
+        assert_eq!(
+            offered
+                .lock()
+                .expect("offered lock")
+                .as_deref(),
+            Some(SUBPROTOCOL)
+        );
+    }
+
+    #[tokio::test]
+    async fn connect_websocket_rejects_response_without_selected_subprotocol() {
+        let config = Config::default();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("listener");
+        let address = listener.local_addr().expect("listener address");
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("accept");
+            let websocket = accept_hdr_async_with_config(
+                stream,
+                |_request: &Request, response: Response| Ok(response),
+                Some(config.websocket_config()),
+            )
+            .await
+            .expect("server handshake");
+            drop(websocket);
+        });
+
+        let error = connect_websocket(&format!("ws://{address}"), config)
+            .await
+            .expect_err("missing selected subprotocol must fail");
+        assert!(matches!(error, Error::WebSocket(_)), "error: {error:?}");
+        server.await.expect("server task");
     }
 
     #[tokio::test]
