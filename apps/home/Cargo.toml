@@ -1,0 +1,10 @@
+[package]
+name = "journey-home"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+journey-h2-duplex = { path = "../.." }
+journey-websocket = { path = "../../crates/journey-websocket" }
+tokio = { version = "1", features = ["io-util", "macros", "rt-multi-thread", "time"] }
+tokio-tungstenite = "0.27"

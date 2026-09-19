@@ -1,13 +1,19 @@
+[workspace]
+members = [
+    ".",
+    "apps/gateway",
+    "apps/home",
+    "crates/journey-websocket",
+]
+resolver = "2"
+
 [package]
 name = "journey-h2-duplex"
 version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-axum = "0.8"
 bytes = "1"
-futures-util = "0.3"
 h2 = "0.4"
 http = "1"
-tokio = { version = "1", features = ["macros", "rt-multi-thread", "io-util", "time"] }
-tokio-tungstenite = "0.27"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "io-util"] }

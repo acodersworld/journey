@@ -1,0 +1,10 @@
+[package]
+name = "journey-gateway"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+axum = "0.8"
+journey-websocket = { path = "../../crates/journey-websocket" }
+tokio = { version = "1", features = ["macros", "net", "rt-multi-thread", "sync"] }
+tokio-tungstenite = "0.27"

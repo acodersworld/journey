@@ -1,18 +1,18 @@
 services:
-  home:
-    build: .
-    command: ["/usr/local/bin/home"]
-    environment:
-      HOME_BIND: 0.0.0.0:9000
-    expose:
-      - "9000"
-
   gateway:
     build: .
     environment:
       GATEWAY_BIND: 0.0.0.0:8080
-      HOME_WEBSOCKET_URL: ws://home:9000
-    depends_on:
-      - home
+      GATEWAY_WEBSOCKET_BIND: 0.0.0.0:9000
+    expose:
+      - "9000"
     ports:
       - "8080:8080"
+
+  home:
+    build: .
+    command: ["/usr/local/bin/home"]
+    depends_on:
+      - gateway
+    environment:
+      HOME_WEBSOCKET_URL: ws://gateway:9000

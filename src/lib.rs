@@ -1,23 +1,18 @@
-use std::{fmt, sync::Arc};
+use std::fmt;
 
 use bytes::Bytes;
-use futures_util::{SinkExt, StreamExt};
-use h2::client::{self, SendRequest};
 use http::{Request, Response, StatusCode, Version};
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
-use tokio_tungstenite::{WebSocketStream, tungstenite::Message};
+use tokio::io::{AsyncRead, AsyncWrite};
 
 /// The capacity of the in-process byte stream used by the proof of concept.
 pub const DUPLEX_CAPACITY: usize = 256 * 1024;
 
-/// Errors returned by the minimal HTTP/2 client/server helpers.
+/// Errors returned by the minimal HTTP/2 server.
 #[derive(Debug)]
 pub enum Error {
     Http(http::Error),
     H2(h2::Error),
     Io(std::io::Error),
-    WebSocket(Box<tokio_tungstenite::tungstenite::Error>),
-    InvalidResponse(&'static str),
 }
 
 impl fmt::Display for Error {
@@ -26,8 +21,6 @@ impl fmt::Display for Error {
             Self::Http(error) => write!(formatter, "HTTP error: {error}"),
             Self::H2(error) => write!(formatter, "HTTP/2 error: {error}"),
             Self::Io(error) => write!(formatter, "I/O error: {error}"),
-            Self::WebSocket(error) => write!(formatter, "WebSocket error: {error}"),
-            Self::InvalidResponse(message) => formatter.write_str(message),
         }
     }
 }
@@ -49,12 +42,6 @@ impl From<h2::Error> for Error {
 impl From<std::io::Error> for Error {
     fn from(error: std::io::Error) -> Self {
         Self::Io(error)
-    }
-}
-
-impl From<tokio_tungstenite::tungstenite::Error> for Error {
-    fn from(error: tokio_tungstenite::tungstenite::Error) -> Self {
-        Self::WebSocket(Box::new(error))
     }
 }
 
@@ -109,183 +96,57 @@ async fn respond_to(
     Ok(())
 }
 
-/// Performs the client-side HTTP/2 handshake and returns the request handle.
-///
-/// The returned connection future must be spawned or otherwise polled for
-/// requests and responses to make progress.
-pub async fn connect<T>(
-    io: T,
-) -> Result<
-    (
-        SendRequest<Bytes>,
-        h2::client::Connection<T, Bytes>,
-    ),
-    Error,
->
-where
-    T: AsyncRead + AsyncWrite + Unpin + Send + 'static,
-{
-    Ok(client::handshake(io).await?)
-}
-
-/// Sends one ping/pong request and collects its small response body.
-pub async fn request(
-    client: &mut SendRequest<Bytes>,
-    path: &str,
-) -> Result<(StatusCode, String), Error> {
-    let request = Request::builder()
-        .version(Version::HTTP_2)
-        .method("GET")
-        .uri(format!("https://home.internal{path}"))
-        .body(())?;
-
-    let (response_future, _request_body) = client.send_request(request, true)?;
-    let response = response_future.await?;
-    let status = response.status();
-    let mut body = response.into_body();
-    let mut bytes = Vec::new();
-
-    while let Some(chunk) = body.data().await {
-        let chunk = chunk?;
-        bytes.extend_from_slice(&chunk);
-        body.flow_control().release_capacity(chunk.len())?;
-    }
-
-    let body = String::from_utf8(bytes)
-        .map_err(|_| Error::InvalidResponse("response body was not UTF-8"))?;
-    Ok((status, body))
-}
-
-/// Pumps a WebSocket and a byte stream in both directions.
-///
-/// HTTP/2 sees only the byte stream. WebSocket message boundaries are not
-/// exposed to it. Binary messages carry stream bytes; control frames remain
-/// WebSocket control traffic.
-pub async fn bridge_websocket<S, T>(
-    websocket: WebSocketStream<S>,
-    io: T,
-) -> Result<(), Error>
-where
-    S: AsyncRead + AsyncWrite + Unpin,
-    T: AsyncRead + AsyncWrite + Unpin,
-{
-    let (mut websocket_write, mut websocket_read) = websocket.split();
-    let (mut io_read, mut io_write) = tokio::io::split(io);
-    let mut buffer = [0_u8; 16 * 1024];
-
-    loop {
-        tokio::select! {
-            message = websocket_read.next() => {
-                match message {
-                    Some(Ok(Message::Binary(data))) => io_write.write_all(&data).await?,
-                    Some(Ok(Message::Ping(data))) => {
-                        websocket_write.send(Message::Pong(data)).await?;
-                    }
-                    Some(Ok(Message::Pong(_))) => {}
-                    Some(Ok(Message::Close(frame))) => {
-                        let _ = websocket_write.send(Message::Close(frame)).await;
-                        return Ok(());
-                    }
-                    Some(Ok(Message::Text(_))) => {
-                        return Err(Error::InvalidResponse("text WebSocket messages are not supported"));
-                    }
-                    Some(Ok(_)) => {}
-                    Some(Err(error)) => return Err(error.into()),
-                    None => return Ok(()),
-                }
-            }
-            read = io_read.read(&mut buffer) => {
-                let read = read?;
-                if read == 0 {
-                    let _ = websocket_write.send(Message::Close(None)).await;
-                    return Ok(());
-                }
-                websocket_write.send(Message::Binary(Bytes::copy_from_slice(&buffer[..read]))).await?;
-            }
-        }
-    }
-}
-
-/// A reusable HTTP/2 client carried by one persistent WebSocket connection.
-#[derive(Clone)]
-pub struct PersistentClient {
-    client: Arc<SendRequest<Bytes>>,
-}
-
-impl PersistentClient {
-    /// Sends one request over the existing inner HTTP/2 connection.
-    pub async fn request(&self, path: &str) -> Result<(StatusCode, String), Error> {
-        let mut client = self.client.as_ref().clone();
-        request(&mut client, path).await
-    }
-}
-
-/// Opens one persistent WebSocket and the inner HTTP/2 connection it carries.
-///
-/// The returned client can issue multiple requests without reconnecting. The
-/// driver task owns both connection pumps and stops the remaining pump when
-/// either side terminates.
-pub async fn connect_over_websocket(
-    websocket_url: &str,
-) -> Result<PersistentClient, Error> {
-    let (websocket, _) = tokio_tungstenite::connect_async(websocket_url).await?;
-    let (client_io, bridge_io) = tokio::io::duplex(DUPLEX_CAPACITY);
-    let bridge = tokio::spawn(bridge_websocket(websocket, bridge_io));
-
-    let (client, connection) = match connect(client_io).await {
-        Ok(connection) => connection,
-        Err(error) => {
-            bridge.abort();
-            return Err(error);
-        }
-    };
-
-    tokio::spawn(async move {
-        let mut bridge = bridge;
-        tokio::select! {
-            result = connection => {
-                if let Err(error) = result {
-                    eprintln!("inner HTTP/2 connection stopped: {error}");
-                }
-                bridge.abort();
-            }
-            result = &mut bridge => match result {
-                Ok(Ok(())) => {}
-                Ok(Err(error)) => eprintln!("WebSocket bridge stopped: {error}"),
-                Err(error) => eprintln!("WebSocket bridge task stopped: {error}"),
-            }
-        }
-    });
-
-    Ok(PersistentClient {
-        client: Arc::new(client),
-    })
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use bytes::Bytes;
+    use h2::client::{self, SendRequest};
     use tokio::io::duplex;
+
+    async fn request(client: &mut SendRequest<Bytes>, path: &str) -> (StatusCode, String) {
+        let request = Request::builder()
+            .version(Version::HTTP_2)
+            .method("GET")
+            .uri(format!("https://home.internal{path}"))
+            .body(())
+            .expect("request builder");
+
+        let (response_future, _request_body) = client
+            .send_request(request, true)
+            .expect("send request");
+        let response = response_future.await.expect("response");
+        let status = response.status();
+        let mut body = response.into_body();
+        let mut bytes = Vec::new();
+
+        while let Some(chunk) = body.data().await {
+            let chunk = chunk.expect("response data");
+            bytes.extend_from_slice(&chunk);
+            body.flow_control()
+                .release_capacity(chunk.len())
+                .expect("release capacity");
+        }
+
+        (status, String::from_utf8(bytes).expect("UTF-8 response"))
+    }
 
     #[tokio::test]
     async fn completes_http2_handshake_and_ping_pong_requests() {
         let (client_io, server_io) = duplex(DUPLEX_CAPACITY);
         let server = tokio::spawn(serve(server_io));
 
-        let (mut client, connection) = connect(client_io).await.expect("client handshake");
+        let (mut client, connection) = client::handshake(client_io).await.expect("client handshake");
         let client_driver = tokio::spawn(connection);
 
-        let (status, body) = request(&mut client, "/ping").await.expect("ping request");
+        let (status, body) = request(&mut client, "/ping").await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(body, "pong");
 
-        let (status, body) = request(&mut client, "/pong").await.expect("pong request");
+        let (status, body) = request(&mut client, "/pong").await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(body, "ping");
 
-        let (status, body) = request(&mut client, "/unknown")
-            .await
-            .expect("unknown route request");
+        let (status, body) = request(&mut client, "/unknown").await;
         assert_eq!(status, StatusCode::NOT_FOUND);
         assert_eq!(body, "not found");
 
