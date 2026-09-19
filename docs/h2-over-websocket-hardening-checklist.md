@@ -385,7 +385,14 @@ The home application should:
 
 ### Result
 
-Not completed.
+Complete. `journey-websocket` now exposes the symmetric HTTP/2-specific
+`connect`/`connect_client` and `accept_server`/`server_session` APIs while the
+raw bridge remains private. The generic transport `serve()` and `ServeError`
+were removed. `journey-home` now establishes the bounded, negotiated outbound
+WebSocket, creates a `ServerSession`, dispatches accepted requests to the
+existing Journey handler, observes terminal session state, and reconnects
+through its existing loop. Journey routing and response policy remain in the
+application crate.
 
 ## 12. Step 9: tighten Journey response backpressure
 

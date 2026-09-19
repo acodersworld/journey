@@ -67,7 +67,8 @@ where
     Ok(())
 }
 
-async fn respond_to(
+/// Handles one Journey HTTP/2 request and writes its response.
+pub async fn respond_to(
     request: Request<h2::RecvStream>,
     mut respond: h2::server::SendResponse<Bytes>,
 ) -> Result<(), Error> {

@@ -178,37 +178,6 @@ impl From<tokio_tungstenite::tungstenite::Error> for Error {
     }
 }
 
-/// The result of serving an application protocol over a WebSocket.
-#[derive(Debug)]
-pub enum ServeError<E> {
-    /// The WebSocket or byte-stream bridge stopped with an error.
-    Transport(Error),
-    /// The application protocol running over the byte stream stopped with an
-    /// error.
-    Application(E),
-}
-
-impl<E: fmt::Display> fmt::Display for ServeError<E> {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Transport(error) => write!(formatter, "WebSocket transport error: {error}"),
-            Self::Application(error) => write!(formatter, "application server error: {error}"),
-        }
-    }
-}
-
-impl<E> std::error::Error for ServeError<E>
-where
-    E: std::error::Error + 'static,
-{
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        match self {
-            Self::Transport(error) => Some(error),
-            Self::Application(error) => Some(error),
-        }
-    }
-}
-
 enum WriterCommand {
     Binary(Bytes),
     Pong(Bytes),
@@ -393,38 +362,6 @@ where
     tasks.abort_all();
     while tasks.join_next().await.is_some() {}
     result
-}
-
-/// Serves an application protocol over an established WebSocket.
-///
-/// Callers that perform the outer WebSocket handshake themselves must apply
-/// the limits in [`Config`] and negotiate [`SUBPROTOCOL`] before calling this
-/// function. Prefer [`accept_websocket`] or [`connect_websocket`] when the
-/// crate can own the outer handshake.
-pub async fn serve<S, F, Fut, E>(
-    websocket: WebSocketStream<S>,
-    config: Config,
-    start_server: F,
-) -> Result<(), ServeError<E>>
-where
-    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
-    F: FnOnce(DuplexStream) -> Fut,
-    Fut: std::future::Future<Output = Result<(), E>>,
-{
-    config.validate().map_err(ServeError::Transport)?;
-    let (server_io, bridge_io) = tokio::io::duplex(config.duplex_capacity);
-    let server = start_server(server_io);
-    let bridge = bridge(
-        websocket,
-        bridge_io,
-        config.bridge_buffer_size,
-        config.close_timeout,
-    );
-
-    tokio::select! {
-        result = server => result.map_err(ServeError::Application),
-        result = bridge => result.map_err(ServeError::Transport),
-    }
 }
 
 fn has_subprotocol(value: Option<&HeaderValue>) -> bool {
