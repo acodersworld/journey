@@ -4,6 +4,7 @@
 **Updated:** 19 September 2026  
 **Scope:** Validate HTTP/2 as the protocol carried inside WebSocket, then prove the WebSocket bridge on a LAN  
 **Parent architecture:** [Journey Architecture](architecture.md)
+**Implementation plan:** [Checkpoint 1: Transferable HTTP/2 Transport Boundary](vertical-slice-01-implementation-plan.md)
 
 ## 1. Purpose
 
