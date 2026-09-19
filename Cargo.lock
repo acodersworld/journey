@@ -337,9 +337,12 @@ name = "journey-gateway"
 version = "0.1.0"
 dependencies = [
  "axum",
+ "bytes",
+ "futures-util",
+ "h2",
+ "http",
  "journey-websocket",
  "tokio",
- "tokio-tungstenite",
 ]
 
 [[package]]
@@ -359,7 +362,6 @@ dependencies = [
  "journey-h2-duplex",
  "journey-websocket",
  "tokio",
- "tokio-tungstenite",
 ]
 
 [[package]]

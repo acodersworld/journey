@@ -7,4 +7,3 @@ edition = "2024"
 journey-h2-duplex = { path = "../.." }
 journey-websocket = { path = "../../crates/journey-websocket" }
 tokio = { version = "1", features = ["io-util", "macros", "rt-multi-thread", "time"] }
-tokio-tungstenite = "0.27"

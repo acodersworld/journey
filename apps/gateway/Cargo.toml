@@ -5,6 +5,9 @@ edition = "2024"
 
 [dependencies]
 axum = "0.8"
+bytes = "1"
+h2 = "0.4"
+futures-util = "0.3"
+http = "1"
 journey-websocket = { path = "../../crates/journey-websocket" }
 tokio = { version = "1", features = ["macros", "net", "rt-multi-thread", "sync"] }
-tokio-tungstenite = "0.27"

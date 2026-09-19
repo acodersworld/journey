@@ -5,6 +5,8 @@
 **Implements:** [Vertical Slice 01: HTTP/2 over WebSocket Object Download](vertical-slice-01-http2-over-websocket.md)  
 **This plan covers:** Checkpoint 1 only — HTTP/2 over a transferable Tokio byte-stream boundary
 
+**Extraction review:** [HTTP/2-over-WebSocket Crate Extraction Review](h2-over-websocket-crate-extraction.md)
+
 ## 1. Goal
 
 The immediate goal is to determine whether HTTP/2 is a good protocol to carry inside the already-selected WebSocket transport.
@@ -623,4 +625,3 @@ Record the following measurements and observations in this document or a linked 
 - Whether the transport boundary remained clean enough for the WebSocket adapter to be plug-compatible.
 
 Proceed to Checkpoint 2 only if HTTP/2 provides enough value to justify its implementation and operational complexity.
-

@@ -1,7 +1,6 @@
 use journey_h2_duplex::serve;
-use journey_websocket::{Config, serve as serve_websocket};
+use journey_websocket::{Config, connect_websocket, serve as serve_websocket};
 use tokio::time::{Duration, sleep};
-use tokio_tungstenite::connect_async;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -10,7 +9,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("home connecting to gateway WebSocket at {gateway_websocket_url}");
 
     loop {
-        match connect_async(&gateway_websocket_url).await {
+        match connect_websocket(&gateway_websocket_url, Config::default()).await {
             Ok((websocket, _)) => {
                 println!("home WebSocket connected to gateway");
                 if let Err(error) = serve_websocket(websocket, Config::default(), serve).await {
