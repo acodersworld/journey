@@ -83,6 +83,16 @@ impl Config {
         if self.max_frame_size == 0 {
             return Err(Error::Configuration("maximum frame size must be greater than zero"));
         }
+        if self.bridge_buffer_size > self.max_message_size {
+            return Err(Error::Configuration(
+                "bridge buffer size must not exceed maximum message size",
+            ));
+        }
+        if self.bridge_buffer_size > self.max_frame_size {
+            return Err(Error::Configuration(
+                "bridge buffer size must not exceed maximum frame size",
+            ));
+        }
         if self.write_buffer_size == 0 {
             return Err(Error::Configuration("write buffer size must be greater than zero"));
         }
@@ -827,8 +837,55 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn default_configuration_is_valid() {
+        assert!(Config::default().validate().is_ok());
+    }
+
+    #[tokio::test]
+    async fn bridge_buffer_equal_to_message_and_frame_limits_is_valid() {
+        let config = Config {
+            bridge_buffer_size: 8,
+            max_message_size: 8,
+            max_frame_size: 8,
+            ..Config::default()
+        };
+        assert!(config.validate().is_ok());
+    }
+
+    #[tokio::test]
+    async fn bridge_buffer_above_message_limit_is_rejected() {
+        let config = Config {
+            bridge_buffer_size: 9,
+            max_message_size: 8,
+            ..Config::default()
+        };
+        assert!(matches!(
+            config.validate(),
+            Err(Error::Configuration(
+                "bridge buffer size must not exceed maximum message size"
+            ))
+        ));
+    }
+
+    #[tokio::test]
+    async fn bridge_buffer_above_frame_limit_is_rejected() {
+        let config = Config {
+            bridge_buffer_size: 9,
+            max_frame_size: 8,
+            ..Config::default()
+        };
+        assert!(matches!(
+            config.validate(),
+            Err(Error::Configuration(
+                "bridge buffer size must not exceed maximum frame size"
+            ))
+        ));
+    }
+
+    #[tokio::test]
     async fn incoming_message_limit_is_enforced_by_websocket_configuration() {
         let config = Config {
+            bridge_buffer_size: 8,
             max_message_size: 8,
             max_frame_size: 8,
             ..Config::default()

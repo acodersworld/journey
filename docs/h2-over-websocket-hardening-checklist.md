@@ -27,7 +27,7 @@ The crate remains usable as a prototype during this work, but it is not consider
 | Step | Work item | Priority | Status |
 |---:|---|---|---|
 | 1 | Eliminate the session-state lost-wakeup race | Critical | Complete |
-| 2 | Validate relationships between bridge and WebSocket limits | High | Not started |
+| 2 | Validate relationships between bridge and WebSocket limits | High | Complete |
 | 3 | Replace the misleading byte-stream test with a real bridge test | High | Not started |
 | 4 | Test independent bidirectional progress under backpressure | Critical | Not started |
 | 5 | Make close and shutdown bounded | High | Not started |
@@ -124,7 +124,11 @@ Test:
 
 ### Result
 
-Not completed.
+Complete. `Config::validate()` now requires the bridge buffer to fit within
+both the maximum message and frame sizes. Tests cover defaults, equality,
+one-byte violations, zero sizes, and write-buffer ordering. The existing
+Tungstenite write-buffer relationship remains unchanged. Crate and workspace
+tests pass; strict Clippy still has the Step 10 findings.
 
 ## 6. Step 3: test actual message-to-byte-stream adaptation
 
