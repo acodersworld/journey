@@ -30,7 +30,7 @@ The crate remains usable as a prototype during this work, but it is not consider
 | 2 | Validate relationships between bridge and WebSocket limits | High | Complete |
 | 3 | Replace the misleading byte-stream test with a real bridge test | High | Complete |
 | 4 | Test independent bidirectional progress under backpressure | Critical | Complete |
-| 5 | Make close and shutdown bounded | High | Not started |
+| 5 | Make close and shutdown bounded | High | Complete |
 | 6 | Test bridge failure, cancellation, EOF, and task cleanup | High | Not started |
 | 7 | Complete subprotocol and configuration tests | Medium | Not started |
 | 8 | Resolve the generic `serve` versus HTTP/2 `ServerSession` API | High | Not started |
@@ -250,7 +250,13 @@ Use paused Tokio time where practical to avoid slow wall-clock tests.
 
 ### Result
 
-Not completed.
+Complete. `Config::close_timeout` bounds the queued close command and
+acknowledgement, and local write-half shutdown is bounded as well. Timeout
+expiry tears down the bridge cleanly; the close command remains behind the
+bounded writer queue. `SendAfterClosing` is treated as an already-completed
+orderly close. Tests cover normal local EOF, stalled writers, remote close,
+local EOF propagation, and bridge completion. Crate and workspace tests pass;
+strict Clippy still has the Step 10 findings.
 
 ## 9. Step 6: test failure, cancellation, EOF, and cleanup
 

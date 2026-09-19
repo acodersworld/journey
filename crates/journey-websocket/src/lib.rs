@@ -4,7 +4,7 @@
 //! inner HTTP/2 connection. WebSocket framing and control traffic stay here;
 //! applications receive normal streaming `h2` request and response values.
 
-use std::{fmt, sync::Arc};
+use std::{fmt, sync::Arc, time::Duration};
 
 use bytes::Bytes;
 use futures_util::{SinkExt, StreamExt};
@@ -32,6 +32,7 @@ const DEFAULT_MAX_MESSAGE_SIZE: usize = 256 * 1024;
 const DEFAULT_MAX_FRAME_SIZE: usize = 256 * 1024;
 const DEFAULT_WRITE_BUFFER_SIZE: usize = 16 * 1024;
 const DEFAULT_MAX_WRITE_BUFFER_SIZE: usize = 512 * 1024;
+const DEFAULT_CLOSE_TIMEOUT: Duration = Duration::from_secs(5);
 const WRITER_CHANNEL_CAPACITY: usize = 8;
 
 /// WebSocket subprotocol negotiated by this crate.
@@ -54,6 +55,9 @@ pub struct Config {
     pub write_buffer_size: usize,
     /// Maximum size of the WebSocket write buffer.
     pub max_write_buffer_size: usize,
+    /// Maximum time to wait for a queued WebSocket close command and local
+    /// write-half shutdown. Expiration tears down the bridge cleanly.
+    pub close_timeout: Duration,
 }
 
 impl Default for Config {
@@ -65,6 +69,7 @@ impl Default for Config {
             max_frame_size: DEFAULT_MAX_FRAME_SIZE,
             write_buffer_size: DEFAULT_WRITE_BUFFER_SIZE,
             max_write_buffer_size: DEFAULT_MAX_WRITE_BUFFER_SIZE,
+            close_timeout: DEFAULT_CLOSE_TIMEOUT,
         }
     }
 }
@@ -100,6 +105,9 @@ impl Config {
             return Err(Error::Configuration(
                 "maximum write buffer size must be greater than write buffer size",
             ));
+        }
+        if self.close_timeout.is_zero() {
+            return Err(Error::Configuration("close timeout must be greater than zero"));
         }
         Ok(())
     }
@@ -222,9 +230,15 @@ where
             WriterCommand::Binary(data) => websocket_write.send(Message::Binary(data)).await?,
             WriterCommand::Pong(data) => websocket_write.send(Message::Pong(data)).await?,
             WriterCommand::Close { frame, completed } => {
-                websocket_write.send(Message::Close(frame)).await?;
+                let result = websocket_write.send(Message::Close(frame)).await;
                 let _ = completed.send(());
-                return Ok(());
+                match result {
+                    Ok(())
+                    | Err(tokio_tungstenite::tungstenite::Error::Protocol(
+                        tokio_tungstenite::tungstenite::error::ProtocolError::SendAfterClosing,
+                    )) => return Ok(()),
+                    Err(error) => return Err(error.into()),
+                }
             }
         }
     }
@@ -232,21 +246,29 @@ where
     Ok(())
 }
 
-async fn close_websocket(commands: &mpsc::Sender<WriterCommand>, frame: Option<CloseFrame>) {
+async fn close_websocket(
+    commands: &mpsc::Sender<WriterCommand>,
+    frame: Option<CloseFrame>,
+    close_timeout: Duration,
+) {
     let (completed, wait) = tokio::sync::oneshot::channel();
-    if commands
-        .send(WriterCommand::Close { frame, completed })
-        .await
-        .is_ok()
-    {
-        let _ = wait.await;
-    }
+    let close = async {
+        if commands
+            .send(WriterCommand::Close { frame, completed })
+            .await
+            .is_ok()
+        {
+            let _ = wait.await;
+        }
+    };
+    let _ = tokio::time::timeout(close_timeout, close).await;
 }
 
 async fn local_to_websocket<T>(
     mut io_read: tokio::io::ReadHalf<T>,
     commands: mpsc::Sender<WriterCommand>,
     buffer_size: usize,
+    close_timeout: Duration,
 ) -> Result<(), Error>
 where
     T: AsyncRead + AsyncWrite + Unpin,
@@ -256,7 +278,7 @@ where
     loop {
         let read = io_read.read(&mut buffer).await?;
         if read == 0 {
-            close_websocket(&commands, None).await;
+            close_websocket(&commands, None, close_timeout).await;
             return Ok(());
         }
 
@@ -272,10 +294,29 @@ where
     }
 }
 
+async fn shutdown_local<T>(
+    mut io_write: tokio::io::WriteHalf<T>,
+    close_timeout: Duration,
+) -> Result<(), Error>
+where
+    T: AsyncRead + AsyncWrite + Unpin,
+{
+    tokio::time::timeout(close_timeout, io_write.shutdown())
+        .await
+        .map_err(|_| {
+            Error::Io(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "local byte-stream shutdown timed out",
+            ))
+        })??;
+    Ok(())
+}
+
 async fn websocket_to_local<S, T>(
     mut websocket_read: futures_util::stream::SplitStream<WebSocketStream<S>>,
     mut io_write: tokio::io::WriteHalf<T>,
     commands: mpsc::Sender<WriterCommand>,
+    close_timeout: Duration,
 ) -> Result<(), Error>
 where
     S: AsyncRead + AsyncWrite + Unpin,
@@ -297,9 +338,8 @@ where
             }
             Message::Pong(_) => {}
             Message::Close(frame) => {
-                close_websocket(&commands, frame).await;
-                io_write.shutdown().await?;
-                return Ok(());
+                close_websocket(&commands, frame, close_timeout).await;
+                return shutdown_local(io_write, close_timeout).await;
             }
             Message::Text(_) => {
                 return Err(Error::Protocol("text WebSocket messages are not supported"));
@@ -308,12 +348,16 @@ where
         }
     }
 
-    io_write.shutdown().await?;
-    Ok(())
+    shutdown_local(io_write, close_timeout).await
 }
 
 /// Pumps a WebSocket and byte stream in both directions.
-async fn bridge<S, T>(websocket: WebSocketStream<S>, io: T, buffer_size: usize) -> Result<(), Error>
+async fn bridge<S, T>(
+    websocket: WebSocketStream<S>,
+    io: T,
+    buffer_size: usize,
+    close_timeout: Duration,
+) -> Result<(), Error>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     T: AsyncRead + AsyncWrite + Unpin + Send + 'static,
@@ -324,8 +368,18 @@ where
     let mut tasks = JoinSet::new();
 
     tasks.spawn(websocket_writer(websocket_write, command_queue));
-    tasks.spawn(local_to_websocket(io_read, commands.clone(), buffer_size));
-    tasks.spawn(websocket_to_local(websocket_read, io_write, commands));
+    tasks.spawn(local_to_websocket(
+        io_read,
+        commands.clone(),
+        buffer_size,
+        close_timeout,
+    ));
+    tasks.spawn(websocket_to_local(
+        websocket_read,
+        io_write,
+        commands,
+        close_timeout,
+    ));
 
     let result = match tasks.join_next().await {
         Some(Ok(result)) => result,
@@ -360,7 +414,12 @@ where
     config.validate().map_err(ServeError::Transport)?;
     let (server_io, bridge_io) = tokio::io::duplex(config.duplex_capacity);
     let server = start_server(server_io);
-    let bridge = bridge(websocket, bridge_io, config.bridge_buffer_size);
+    let bridge = bridge(
+        websocket,
+        bridge_io,
+        config.bridge_buffer_size,
+        config.close_timeout,
+    );
 
     tokio::select! {
         result = server => result.map_err(ServeError::Application),
@@ -551,7 +610,12 @@ where
 {
     config.validate()?;
     let (client_io, bridge_io) = tokio::io::duplex(config.duplex_capacity);
-    let mut bridge_task = tokio::spawn(bridge(websocket, bridge_io, config.bridge_buffer_size));
+    let mut bridge_task = tokio::spawn(bridge(
+        websocket,
+        bridge_io,
+        config.bridge_buffer_size,
+        config.close_timeout,
+    ));
     let (client, connection) = match connect_h2(client_io).await {
         Ok(connection) => connection,
         Err(error) => {
@@ -674,7 +738,12 @@ where
 {
     config.validate()?;
     let (server_io, bridge_io) = tokio::io::duplex(config.duplex_capacity);
-    let bridge_task = tokio::spawn(bridge(websocket, bridge_io, config.bridge_buffer_size));
+    let bridge_task = tokio::spawn(bridge(
+        websocket,
+        bridge_io,
+        config.bridge_buffer_size,
+        config.close_timeout,
+    ));
     let connection = match server::handshake(server_io).await {
         Ok(connection) => connection,
         Err(error) => {
@@ -844,7 +913,12 @@ mod tests {
         };
         let (mut client, server) = websocket_pair(config).await;
         let (mut application, bridge_io) = duplex(64);
-        let bridge = tokio::spawn(bridge(server, bridge_io, config.bridge_buffer_size));
+        let bridge = tokio::spawn(bridge(
+            server,
+            bridge_io,
+            config.bridge_buffer_size,
+            config.close_timeout,
+        ));
 
         client
             .send(Message::Binary(Bytes::from_static(b"hello")))
@@ -882,7 +956,12 @@ mod tests {
         };
         let (mut client, server) = websocket_pair(config).await;
         let (mut application, bridge_io) = duplex(64);
-        let bridge = tokio::spawn(bridge(server, bridge_io, config.bridge_buffer_size));
+        let bridge = tokio::spawn(bridge(
+            server,
+            bridge_io,
+            config.bridge_buffer_size,
+            config.close_timeout,
+        ));
         let expected = b"uneven byte-stream writes";
 
         for chunk in [b"uneven ".as_slice(), b"byte-stream ".as_slice(), b"writes".as_slice()] {
@@ -927,6 +1006,7 @@ mod tests {
                 pending: Arc::clone(&pending),
             },
             config.bridge_buffer_size,
+            config.close_timeout,
         ));
         let pending_write = pending.notified();
 
@@ -971,7 +1051,12 @@ mod tests {
         let (mut remote, server, pending) =
             websocket_pair_with_server_write_backpressure(config, 64).await;
         let (application, bridge_io) = duplex(64);
-        let bridge = tokio::spawn(bridge(server, bridge_io, config.bridge_buffer_size));
+        let bridge = tokio::spawn(bridge(
+            server,
+            bridge_io,
+            config.bridge_buffer_size,
+            config.close_timeout,
+        ));
         let (mut application_read, mut application_write) = tokio::io::split(application);
         let pending_write = pending.notified();
         let application_writer = tokio::spawn(async move {
@@ -1002,6 +1087,117 @@ mod tests {
         let _ = application_writer.await;
         bridge.abort();
         let _ = bridge.await;
+    }
+
+    #[tokio::test]
+    async fn local_eof_performs_a_bounded_websocket_close() {
+        let config = Config {
+            close_timeout: Duration::from_millis(50),
+            ..Config::default()
+        };
+        let (mut remote, server) = websocket_pair(config).await;
+        let (application, bridge_io) = duplex(64);
+        let bridge = tokio::spawn(bridge(
+            server,
+            bridge_io,
+            config.bridge_buffer_size,
+            config.close_timeout,
+        ));
+        drop(application);
+
+        let message = timeout(Duration::from_millis(100), remote.next())
+            .await
+            .expect("close frame timed out")
+            .expect("WebSocket ended")
+            .expect("WebSocket read");
+        assert!(matches!(message, Message::Close(_)));
+        assert!(timeout(Duration::from_millis(100), bridge)
+            .await
+            .expect("bridge task timed out")
+            .expect("bridge task")
+            .is_ok());
+    }
+
+    #[tokio::test]
+    async fn blocked_writer_reaches_the_close_deadline() {
+        let config = Config {
+            bridge_buffer_size: 4,
+            close_timeout: Duration::from_millis(20),
+            ..Config::default()
+        };
+        let (mut remote, server, pending) =
+            websocket_pair_with_server_write_backpressure(config, 64).await;
+        let (application, bridge_io) = duplex(64);
+        let bridge = tokio::spawn(bridge(
+            server,
+            bridge_io,
+            config.bridge_buffer_size,
+            config.close_timeout,
+        ));
+        let (_application_read, mut application_write) = tokio::io::split(application);
+        let pending_write = pending.notified();
+        let application_writer = tokio::spawn(async move {
+            application_write
+                .write_all(&vec![b'x'; 4096])
+                .await
+                .expect("write stalled-direction data");
+        });
+
+        timeout(Duration::from_millis(100), pending_write)
+            .await
+            .expect("local-to-WebSocket write did not stall");
+        remote
+            .send(Message::Close(None))
+            .await
+            .expect("send close frame");
+        assert!(timeout(Duration::from_millis(200), bridge)
+            .await
+            .expect("blocked close did not reach its deadline")
+            .expect("bridge task")
+            .is_ok());
+
+        application_writer.abort();
+        let _ = application_writer.await;
+    }
+
+    #[tokio::test]
+    async fn remote_close_shuts_down_the_local_byte_stream() {
+        let config = Config {
+            close_timeout: Duration::from_millis(50),
+            ..Config::default()
+        };
+        let (mut remote, server) = websocket_pair(config).await;
+        let (mut application, bridge_io) = duplex(64);
+        let bridge = tokio::spawn(bridge(
+            server,
+            bridge_io,
+            config.bridge_buffer_size,
+            config.close_timeout,
+        ));
+
+        remote
+            .send(Message::Binary(Bytes::from_static(b"before close")))
+            .await
+            .expect("send data");
+        remote
+            .send(Message::Close(None))
+            .await
+            .expect("send close frame");
+        let mut received = Vec::new();
+        timeout(
+            Duration::from_millis(100),
+            application.read_to_end(&mut received),
+        )
+        .await
+        .expect("local EOF timed out")
+        .expect("local read");
+        assert_eq!(received, b"before close");
+        let result = timeout(Duration::from_millis(100), bridge)
+            .await
+            .expect("bridge task timed out")
+            .expect("bridge task");
+        assert!(result.is_ok(), "bridge result: {result:?}");
+        assert!(application.write_all(b"after close").await.is_err());
     }
 
     #[tokio::test]
@@ -1077,6 +1273,18 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn zero_close_timeout_is_rejected() {
+        let config = Config {
+            close_timeout: Duration::ZERO,
+            ..Config::default()
+        };
+        assert!(matches!(
+            config.validate(),
+            Err(Error::Configuration("close timeout must be greater than zero"))
+        ));
+    }
+
+    #[tokio::test]
     async fn default_configuration_is_valid() {
         assert!(Config::default().validate().is_ok());
     }
@@ -1142,7 +1350,12 @@ mod tests {
     async fn text_messages_are_rejected_by_the_bridge() {
         let (client_websocket, server_websocket) = websocket_pair(Config::default()).await;
         let (_server_io, bridge_io) = duplex(64);
-        let bridge = tokio::spawn(bridge(client_websocket, bridge_io, 16));
+        let bridge = tokio::spawn(bridge(
+            client_websocket,
+            bridge_io,
+            16,
+            Config::default().close_timeout,
+        ));
         let mut server_websocket = server_websocket;
         server_websocket
             .send(Message::Text("text".into()))
