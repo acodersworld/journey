@@ -428,7 +428,13 @@ Verify:
 
 ### Result
 
-Not completed.
+Complete. The gateway now wraps each inner `h2::RecvStream` in a stateful
+stream that records the last yielded DATA length, releases that capacity only
+when downstream polls for the next item, and owns the inner stream so dropping
+the public body resets the corresponding HTTP/2 stream. Tests verify delayed
+capacity release, bounded progress while the public body is paused, and
+cancellation/reset behavior. The gateway continues to forward bodies
+incrementally without collecting complete responses.
 
 ## 13. Step 10: clear strict Clippy findings manually
 
