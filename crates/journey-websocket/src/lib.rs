@@ -781,6 +781,7 @@ mod tests {
     use super::*;
     use std::{
         pin::Pin,
+        sync::atomic::{AtomicBool, Ordering},
         task::{Context, Poll},
     };
     use tokio::io::duplex;
@@ -813,6 +814,58 @@ mod tests {
                 self.pending.notify_waiters();
             }
             result
+        }
+
+        fn poll_flush(
+            mut self: Pin<&mut Self>,
+            context: &mut Context<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            Pin::new(&mut self.inner).poll_flush(context)
+        }
+
+        fn poll_shutdown(
+            mut self: Pin<&mut Self>,
+            context: &mut Context<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            Pin::new(&mut self.inner).poll_shutdown(context)
+        }
+    }
+
+    struct FailingIo {
+        inner: DuplexStream,
+        fail_read: Arc<AtomicBool>,
+        fail_write: Arc<AtomicBool>,
+    }
+
+    impl AsyncRead for FailingIo {
+        fn poll_read(
+            mut self: Pin<&mut Self>,
+            context: &mut Context<'_>,
+            buffer: &mut tokio::io::ReadBuf<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            if self.fail_read.load(Ordering::SeqCst) {
+                return Poll::Ready(Err(std::io::Error::new(
+                    std::io::ErrorKind::ConnectionReset,
+                    "injected read failure",
+                )));
+            }
+            Pin::new(&mut self.inner).poll_read(context, buffer)
+        }
+    }
+
+    impl AsyncWrite for FailingIo {
+        fn poll_write(
+            mut self: Pin<&mut Self>,
+            context: &mut Context<'_>,
+            buffer: &[u8],
+        ) -> Poll<std::io::Result<usize>> {
+            if self.fail_write.load(Ordering::SeqCst) {
+                return Poll::Ready(Err(std::io::Error::new(
+                    std::io::ErrorKind::BrokenPipe,
+                    "injected write failure",
+                )));
+            }
+            Pin::new(&mut self.inner).poll_write(context, buffer)
         }
 
         fn poll_flush(
@@ -890,6 +943,50 @@ mod tests {
             client.await.expect("client task"),
             server.await.expect("server task"),
             pending,
+        )
+    }
+
+    async fn websocket_pair_with_failures(
+        config: Config,
+    ) -> (
+        WebSocketStream<DuplexStream>,
+        WebSocketStream<FailingIo>,
+        Arc<AtomicBool>,
+        Arc<AtomicBool>,
+    ) {
+        let (client_io, server_io) = duplex(1024 * 1024);
+        let fail_read = Arc::new(AtomicBool::new(false));
+        let fail_write = Arc::new(AtomicBool::new(false));
+        let server_fail_read = Arc::clone(&fail_read);
+        let server_fail_write = Arc::clone(&fail_write);
+        let client = tokio::spawn(async move {
+            let mut request = "ws://localhost".into_client_request().expect("request");
+            request.headers_mut().insert(
+                "Sec-WebSocket-Protocol",
+                HeaderValue::from_static(SUBPROTOCOL),
+            );
+            client_async_with_config(request, client_io, Some(config.websocket_config()))
+                .await
+                .expect("client websocket handshake")
+                .0
+        });
+        let server = tokio::spawn(async move {
+            accept_websocket(
+                FailingIo {
+                    inner: server_io,
+                    fail_read: server_fail_read,
+                    fail_write: server_fail_write,
+                },
+                config,
+            )
+            .await
+            .expect("server websocket handshake")
+        });
+        (
+            client.await.expect("client task"),
+            server.await.expect("server task"),
+            fail_read,
+            fail_write,
         )
     }
 
@@ -1201,6 +1298,147 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn websocket_read_failure_terminates_the_bridge() {
+        let config = Config::default();
+        let (_remote, server, fail_read, _fail_write) =
+            websocket_pair_with_failures(config).await;
+        fail_read.store(true, Ordering::SeqCst);
+        let (_application, bridge_io) = duplex(64);
+        let bridge = tokio::spawn(bridge(
+            server,
+            bridge_io,
+            config.bridge_buffer_size,
+            config.close_timeout,
+        ));
+
+        let result = timeout(Duration::from_millis(100), bridge)
+            .await
+            .expect("bridge task timed out")
+            .expect("bridge task");
+        assert!(matches!(result, Err(Error::WebSocket(_))), "result: {result:?}");
+    }
+
+    #[tokio::test]
+    async fn websocket_write_failure_terminates_the_bridge() {
+        let config = Config::default();
+        let (_remote, server, _fail_read, fail_write) =
+            websocket_pair_with_failures(config).await;
+        fail_write.store(true, Ordering::SeqCst);
+        let (mut application, bridge_io) = duplex(64);
+        let bridge = tokio::spawn(bridge(
+            server,
+            bridge_io,
+            config.bridge_buffer_size,
+            config.close_timeout,
+        ));
+        application
+            .write_all(b"trigger WebSocket write")
+            .await
+            .expect("application write");
+
+        let result = timeout(Duration::from_millis(100), bridge)
+            .await
+            .expect("bridge task timed out")
+            .expect("bridge task");
+        assert!(matches!(result, Err(Error::WebSocket(_))), "result: {result:?}");
+    }
+
+    #[tokio::test]
+    async fn local_read_failure_terminates_the_bridge() {
+        let config = Config::default();
+        let (_remote, server) = websocket_pair(config).await;
+        let (_application, bridge_io) = duplex(64);
+        let fail_read = Arc::new(AtomicBool::new(true));
+        let bridge = tokio::spawn(bridge(
+            server,
+            FailingIo {
+                inner: bridge_io,
+                fail_read,
+                fail_write: Arc::new(AtomicBool::new(false)),
+            },
+            config.bridge_buffer_size,
+            config.close_timeout,
+        ));
+
+        let result = timeout(Duration::from_millis(100), bridge)
+            .await
+            .expect("bridge task timed out")
+            .expect("bridge task");
+        assert!(matches!(result, Err(Error::Io(_))), "result: {result:?}");
+    }
+
+    #[tokio::test]
+    async fn local_write_failure_terminates_the_bridge() {
+        let config = Config::default();
+        let (mut remote, server) = websocket_pair(config).await;
+        let (_application, bridge_io) = duplex(64);
+        let bridge = tokio::spawn(bridge(
+            server,
+            FailingIo {
+                inner: bridge_io,
+                fail_read: Arc::new(AtomicBool::new(false)),
+                fail_write: Arc::new(AtomicBool::new(true)),
+            },
+            config.bridge_buffer_size,
+            config.close_timeout,
+        ));
+        remote
+            .send(Message::Binary(Bytes::from_static(b"trigger local write")))
+            .await
+            .expect("send binary message");
+
+        let result = timeout(Duration::from_millis(100), bridge)
+            .await
+            .expect("bridge task timed out")
+            .expect("bridge task");
+        assert!(matches!(result, Err(Error::Io(_))), "result: {result:?}");
+    }
+
+    #[tokio::test]
+    async fn oversized_incoming_message_terminates_the_bridge() {
+        let config = Config {
+            bridge_buffer_size: 8,
+            max_message_size: 8,
+            max_frame_size: 8,
+            ..Config::default()
+        };
+        let (mut remote, server) = websocket_pair(config).await;
+        let (_application, bridge_io) = duplex(64);
+        let bridge = tokio::spawn(bridge(
+            server,
+            bridge_io,
+            config.bridge_buffer_size,
+            config.close_timeout,
+        ));
+        remote
+            .send(Message::Binary(Bytes::from_static(b"too large")))
+            .await
+            .expect("send oversized message");
+
+        let result = timeout(Duration::from_millis(100), bridge)
+            .await
+            .expect("bridge task timed out")
+            .expect("bridge task");
+        assert!(matches!(result, Err(Error::WebSocket(_))), "result: {result:?}");
+    }
+
+    #[tokio::test]
+    async fn aborting_the_outer_bridge_future_cancels_it() {
+        let config = Config::default();
+        let (_remote, server) = websocket_pair(config).await;
+        let (_application, bridge_io) = duplex(64);
+        let bridge = tokio::spawn(bridge(
+            server,
+            bridge_io,
+            config.bridge_buffer_size,
+            config.close_timeout,
+        ));
+        bridge.abort();
+
+        assert!(bridge.await.expect_err("bridge should be cancelled").is_cancelled());
+    }
+
+    #[tokio::test]
     async fn http2_client_and_server_reuse_one_websocket() {
         let config = Config::default();
         let (client_websocket, server_websocket) = websocket_pair(config).await;
@@ -1261,6 +1499,132 @@ mod tests {
 
         drop(client);
         server_task.abort();
+    }
+
+    #[tokio::test]
+    async fn cancelled_http2_response_does_not_close_other_streams() {
+        let config = Config::default();
+        let (client_websocket, server_websocket) = websocket_pair(config).await;
+        let server_session_task = tokio::spawn(server_session(server_websocket, config));
+        let client = connect_client(client_websocket, config)
+            .await
+            .expect("client session");
+        let mut server = server_session_task
+            .await
+            .expect("server session task")
+            .expect("server session");
+        let cancelled = Arc::new(Notify::new());
+        let server_cancelled = Arc::clone(&cancelled);
+        let server_task = tokio::spawn(async move {
+            let mut response_tasks = JoinSet::new();
+            while let Some((request, mut respond)) = server.accept().await.expect("accept") {
+                if request.uri().path() == "/large" {
+                    let cancelled = Arc::clone(&server_cancelled);
+                    response_tasks.spawn(async move {
+                        let response = http::Response::builder()
+                            .version(http::Version::HTTP_2)
+                            .status(200)
+                            .body(())
+                            .expect("response");
+                        let mut send = respond.send_response(response, false).expect("headers");
+                        loop {
+                            send.reserve_capacity(1024);
+                            let capacity = futures_util::future::poll_fn(|context| {
+                                send.poll_capacity(context)
+                            })
+                            .await;
+                            let capacity = match capacity {
+                                Some(Ok(capacity)) if capacity > 0 => capacity,
+                                Some(Ok(_)) => continue,
+                                Some(Err(_)) | None => {
+                                    cancelled.notify_one();
+                                    return;
+                                }
+                            };
+                            if send
+                                .send_data(Bytes::from(vec![b'x'; capacity.min(1024)]), false)
+                                .is_err()
+                            {
+                                cancelled.notify_one();
+                                return;
+                            }
+                        }
+                    });
+                } else {
+                    let body = if request.uri().path() == "/small" {
+                        Bytes::from_static(b"small response")
+                    } else {
+                        Bytes::from_static(b"not found")
+                    };
+                    let status = if request.uri().path() == "/small" {
+                        200
+                    } else {
+                        404
+                    };
+                    let response = http::Response::builder()
+                        .version(http::Version::HTTP_2)
+                        .status(status)
+                        .body(())
+                        .expect("response");
+                    respond
+                        .send_response(response, false)
+                        .expect("headers")
+                        .send_data(body, true)
+                        .expect("body");
+                }
+            }
+            while response_tasks.join_next().await.is_some() {}
+        });
+
+        let sender = client.sender();
+        let large_request = http::Request::builder()
+            .version(http::Version::HTTP_2)
+            .method("GET")
+            .uri("https://home.internal/large")
+            .body(())
+            .expect("large request");
+        let (large_response, _) = sender
+            .send_request(large_request, true)
+            .await
+            .expect("large request send");
+        let large_response = timeout(Duration::from_millis(100), large_response)
+            .await
+            .expect("large response timed out")
+            .expect("large response");
+        let mut large_body = large_response.into_body();
+        let first_chunk = timeout(Duration::from_millis(100), large_body.data())
+            .await
+            .expect("large body timed out")
+            .expect("large body ended")
+            .expect("large body data");
+        assert!(!first_chunk.is_empty());
+        let cancellation = cancelled.notified();
+        drop(large_body);
+        timeout(Duration::from_millis(100), cancellation)
+            .await
+            .expect("server did not observe response cancellation");
+
+        let small_request = http::Request::builder()
+            .version(http::Version::HTTP_2)
+            .method("GET")
+            .uri("https://home.internal/small")
+            .body(())
+            .expect("small request");
+        let (small_response, _) = sender
+            .send_request(small_request, true)
+            .await
+            .expect("small request send");
+        let small_response = timeout(Duration::from_millis(100), small_response)
+            .await
+            .expect("small response timed out")
+            .expect("small response");
+        assert_eq!(read_body(small_response.into_body()).await, Bytes::from_static(b"small response"));
+
+        server_task.abort();
+        let _ = server_task.await;
+        let _ = timeout(Duration::from_millis(100), client.wait())
+            .await
+            .expect("client session did not terminate");
     }
 
     #[tokio::test]
@@ -1361,7 +1725,11 @@ mod tests {
             .send(Message::Text("text".into()))
             .await
             .expect("send text");
-        let error = bridge.await.expect("bridge task").expect_err("text must fail");
+        let error = timeout(Duration::from_millis(100), bridge)
+            .await
+            .expect("bridge task timed out")
+            .expect("bridge task")
+            .expect_err("text must fail");
         assert!(matches!(error, Error::Protocol(_)));
     }
 

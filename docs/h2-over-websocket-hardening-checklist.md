@@ -31,7 +31,7 @@ The crate remains usable as a prototype during this work, but it is not consider
 | 3 | Replace the misleading byte-stream test with a real bridge test | High | Complete |
 | 4 | Test independent bidirectional progress under backpressure | Critical | Complete |
 | 5 | Make close and shutdown bounded | High | Complete |
-| 6 | Test bridge failure, cancellation, EOF, and task cleanup | High | Not started |
+| 6 | Test bridge failure, cancellation, EOF, and task cleanup | High | Complete |
 | 7 | Complete subprotocol and configuration tests | Medium | Not started |
 | 8 | Resolve the generic `serve` versus HTTP/2 `ServerSession` API | High | Not started |
 | 9 | Tighten Journey's public-response backpressure | High | Not started |
@@ -299,7 +299,12 @@ Over a real WebSocket-backed HTTP/2 session:
 
 ### Result
 
-Not completed.
+Complete. Time-bounded tests cover WebSocket and local read/write failures,
+text protocol errors, oversized messages, local EOF, dropped local streams,
+outer bridge cancellation, and blocked-task cleanup. A real WebSocket-backed
+HTTP/2 test confirms that cancelling a streaming response resets only that
+stream and another stream still completes on the same connection. Crate and
+workspace tests pass; strict Clippy still has the Step 10 findings.
 
 ## 10. Step 7: complete configuration and subprotocol tests
 
