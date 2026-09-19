@@ -462,7 +462,12 @@ Do not run `cargo fmt`, `cargo fmt --check`, or `rustfmt`.
 
 ### Result
 
-Not completed.
+Complete. The `ErrorKind::Other` constructions now use
+`std::io::Error::other`, the redundant `Arc` mapping closure is removed, and
+the Tungstenite handshake callback uses a narrow, documented
+`clippy::result_large_err` allowance because its external callback signature
+requires the concrete unboxed error response. Strict workspace Clippy passes,
+and the full workspace test suite passes. No automated formatter was run.
 
 ## 14. Step 11: extraction-readiness verification
 

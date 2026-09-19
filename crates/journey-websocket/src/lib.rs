@@ -352,8 +352,7 @@ where
 
     let result = match tasks.join_next().await {
         Some(Ok(result)) => result,
-        Some(Err(error)) => Err(Error::Io(std::io::Error::new(
-            std::io::ErrorKind::Other,
+        Some(Err(error)) => Err(Error::Io(std::io::Error::other(
             format!("WebSocket bridge task failed: {error}"),
         ))),
         None => Ok(()),
@@ -378,6 +377,24 @@ fn reject_subprotocol() -> ErrorResponse {
         .expect("valid WebSocket rejection response")
 }
 
+// Tungstenite requires this concrete, non-boxed error type for its handshake
+// callback, so this narrow allowance is intentional.
+#[allow(clippy::result_large_err)]
+fn accept_websocket_response(
+    request: &Request,
+    mut response: Response,
+) -> Result<Response, ErrorResponse> {
+    if !has_subprotocol(request.headers().get("Sec-WebSocket-Protocol")) {
+        return Err(reject_subprotocol());
+    }
+
+    response.headers_mut().insert(
+        "Sec-WebSocket-Protocol",
+        HeaderValue::from_static(SUBPROTOCOL),
+    );
+    Ok(response)
+}
+
 /// Accepts a WebSocket with the transport's limits and subprotocol.
 pub async fn accept_websocket<S>(stream: S, config: Config) -> Result<WebSocketStream<S>, Error>
 where
@@ -386,17 +403,7 @@ where
     config.validate()?;
     let websocket = accept_hdr_async_with_config(
         stream,
-        |request: &Request, mut response: Response| {
-            if !has_subprotocol(request.headers().get("Sec-WebSocket-Protocol")) {
-                return Err(reject_subprotocol());
-            }
-
-            response.headers_mut().insert(
-                "Sec-WebSocket-Protocol",
-                HeaderValue::from_static(SUBPROTOCOL),
-            );
-            Ok(response)
-        },
+        accept_websocket_response,
         Some(config.websocket_config()),
     )
     .await?;
@@ -458,7 +465,7 @@ impl SessionState {
     async fn finish(&self, result: Result<(), Error>) {
         let mut terminal = self.result.lock().await;
         if terminal.is_none() {
-            *terminal = Some(result.map_err(|error| Arc::new(error)));
+            *terminal = Some(result.map_err(Arc::new));
             self.notify.notify_waiters();
         }
     }
@@ -577,8 +584,7 @@ where
             },
             result = &mut bridge_task => match result {
                 Ok(result) => result,
-                Err(error) => Err(Error::Io(std::io::Error::new(
-                    std::io::ErrorKind::Other,
+                Err(error) => Err(Error::Io(std::io::Error::other(
                     format!("WebSocket bridge task failed: {error}"),
                 ))),
             },
@@ -656,8 +662,7 @@ async fn run_server_connection(
         },
         result = &mut bridge_task => match result {
             Ok(result) => result,
-            Err(error) => Err(Error::Io(std::io::Error::new(
-                std::io::ErrorKind::Other,
+            Err(error) => Err(Error::Io(std::io::Error::other(
                 format!("WebSocket bridge task failed: {error}"),
             ))),
         },
@@ -735,6 +740,15 @@ mod tests {
     use tokio::time::{timeout, Duration};
     use tokio_tungstenite::client_async_with_config;
     use tokio_tungstenite::tungstenite::handshake::client::Response as ClientResponse;
+
+    // Tungstenite requires its concrete, non-boxed handshake error type here.
+    #[allow(clippy::result_large_err)]
+    fn accept_without_subprotocol(
+        _request: &Request,
+        response: Response,
+    ) -> Result<Response, ErrorResponse> {
+        Ok(response)
+    }
 
     struct PendingWriteNotifier {
         inner: DuplexStream,
@@ -1760,6 +1774,9 @@ mod tests {
         ));
     }
 
+    // Tungstenite requires its concrete, non-boxed handshake error type for
+    // this stateful callback, so the allowance is limited to this test.
+    #[allow(clippy::result_large_err)]
     #[tokio::test]
     async fn connect_websocket_offers_and_server_selects_exact_subprotocol() {
         let config = Config::default();
@@ -1823,7 +1840,7 @@ mod tests {
             let (stream, _) = listener.accept().await.expect("accept");
             let websocket = accept_hdr_async_with_config(
                 stream,
-                |_request: &Request, response: Response| Ok(response),
+                accept_without_subprotocol,
                 Some(config.websocket_config()),
             )
             .await
