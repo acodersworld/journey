@@ -710,9 +710,56 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::{
+        pin::Pin,
+        task::{Context, Poll},
+    };
     use tokio::io::duplex;
     use tokio::time::{timeout, Duration};
     use tokio_tungstenite::client_async_with_config;
+
+    struct PendingWriteNotifier {
+        inner: DuplexStream,
+        pending: Arc<Notify>,
+    }
+
+    impl AsyncRead for PendingWriteNotifier {
+        fn poll_read(
+            mut self: Pin<&mut Self>,
+            context: &mut Context<'_>,
+            buffer: &mut tokio::io::ReadBuf<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            Pin::new(&mut self.inner).poll_read(context, buffer)
+        }
+    }
+
+    impl AsyncWrite for PendingWriteNotifier {
+        fn poll_write(
+            mut self: Pin<&mut Self>,
+            context: &mut Context<'_>,
+            buffer: &[u8],
+        ) -> Poll<std::io::Result<usize>> {
+            let result = Pin::new(&mut self.inner).poll_write(context, buffer);
+            if result.is_pending() {
+                self.pending.notify_waiters();
+            }
+            result
+        }
+
+        fn poll_flush(
+            mut self: Pin<&mut Self>,
+            context: &mut Context<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            Pin::new(&mut self.inner).poll_flush(context)
+        }
+
+        fn poll_shutdown(
+            mut self: Pin<&mut Self>,
+            context: &mut Context<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            Pin::new(&mut self.inner).poll_shutdown(context)
+        }
+    }
 
     async fn websocket_pair(
         config: Config,
@@ -735,6 +782,46 @@ mod tests {
                 .expect("server websocket handshake")
         });
         (client.await.expect("client task"), server.await.expect("server task"))
+    }
+
+    async fn websocket_pair_with_server_write_backpressure(
+        config: Config,
+        capacity: usize,
+    ) -> (
+        WebSocketStream<DuplexStream>,
+        WebSocketStream<PendingWriteNotifier>,
+        Arc<Notify>,
+    ) {
+        let (client_io, server_io) = duplex(capacity);
+        let pending = Arc::new(Notify::new());
+        let server_pending = Arc::clone(&pending);
+        let client = tokio::spawn(async move {
+            let mut request = "ws://localhost".into_client_request().expect("request");
+            request.headers_mut().insert(
+                "Sec-WebSocket-Protocol",
+                HeaderValue::from_static(SUBPROTOCOL),
+            );
+            client_async_with_config(request, client_io, Some(config.websocket_config()))
+                .await
+                .expect("client websocket handshake")
+                .0
+        });
+        let server = tokio::spawn(async move {
+            accept_websocket(
+                PendingWriteNotifier {
+                    inner: server_io,
+                    pending: server_pending,
+                },
+                config,
+            )
+            .await
+            .expect("server websocket handshake")
+        });
+        (
+            client.await.expect("client task"),
+            server.await.expect("server task"),
+            pending,
+        )
     }
 
     async fn read_body(mut body: h2::RecvStream) -> Bytes {
@@ -822,6 +909,99 @@ mod tests {
             .expect("bridge task timed out")
             .expect("bridge task")
             .is_ok());
+    }
+
+    #[tokio::test]
+    async fn stalled_websocket_to_local_does_not_block_local_to_websocket() {
+        let config = Config {
+            bridge_buffer_size: 8,
+            ..Config::default()
+        };
+        let (mut remote, server) = websocket_pair(config).await;
+        let (application, bridge_io) = duplex(16);
+        let pending = Arc::new(Notify::new());
+        let bridge = tokio::spawn(bridge(
+            server,
+            PendingWriteNotifier {
+                inner: bridge_io,
+                pending: Arc::clone(&pending),
+            },
+            config.bridge_buffer_size,
+        ));
+        let pending_write = pending.notified();
+
+        remote
+            .send(Message::Binary(Bytes::from(vec![b'x'; 128])))
+            .await
+            .expect("send stalled-direction message");
+        timeout(Duration::from_millis(100), pending_write)
+            .await
+            .expect("WebSocket-to-local write did not stall");
+
+        let (_application_read, mut application_write) = tokio::io::split(application);
+        application_write
+            .write_all(b"reverse direction")
+            .await
+            .expect("write opposite direction");
+        let expected = b"reverse direction";
+        let mut received = Vec::new();
+        while received.len() < expected.len() {
+            let message = timeout(Duration::from_millis(100), remote.next())
+                .await
+                .expect("local-to-WebSocket progress timed out")
+                .expect("WebSocket ended")
+                .expect("WebSocket read");
+            match message {
+                Message::Binary(data) => received.extend_from_slice(&data),
+                message => panic!("unexpected WebSocket message: {message:?}"),
+            }
+        }
+        assert_eq!(received, expected);
+
+        bridge.abort();
+        let _ = bridge.await;
+    }
+
+    #[tokio::test]
+    async fn stalled_local_to_websocket_does_not_block_websocket_to_local() {
+        let config = Config {
+            bridge_buffer_size: 4,
+            ..Config::default()
+        };
+        let (mut remote, server, pending) =
+            websocket_pair_with_server_write_backpressure(config, 64).await;
+        let (application, bridge_io) = duplex(64);
+        let bridge = tokio::spawn(bridge(server, bridge_io, config.bridge_buffer_size));
+        let (mut application_read, mut application_write) = tokio::io::split(application);
+        let pending_write = pending.notified();
+        let application_writer = tokio::spawn(async move {
+            application_write
+                .write_all(&vec![b'x'; 4096])
+                .await
+                .expect("write stalled-direction data");
+        });
+
+        timeout(Duration::from_millis(100), pending_write)
+            .await
+            .expect("local-to-WebSocket write did not stall");
+        remote
+            .send(Message::Binary(Bytes::from_static(b"reverse direction")))
+            .await
+            .expect("send opposite-direction message");
+        let mut received = vec![0_u8; b"reverse direction".len()];
+        timeout(
+            Duration::from_millis(100),
+            application_read.read_exact(&mut received),
+        )
+        .await
+        .expect("WebSocket-to-local progress timed out")
+        .expect("read opposite-direction message");
+        assert_eq!(received, b"reverse direction");
+
+        application_writer.abort();
+        let _ = application_writer.await;
+        bridge.abort();
+        let _ = bridge.await;
     }
 
     #[tokio::test]

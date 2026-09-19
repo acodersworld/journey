@@ -29,7 +29,7 @@ The crate remains usable as a prototype during this work, but it is not consider
 | 1 | Eliminate the session-state lost-wakeup race | Critical | Complete |
 | 2 | Validate relationships between bridge and WebSocket limits | High | Complete |
 | 3 | Replace the misleading byte-stream test with a real bridge test | High | Complete |
-| 4 | Test independent bidirectional progress under backpressure | Critical | Not started |
+| 4 | Test independent bidirectional progress under backpressure | Critical | Complete |
 | 5 | Make close and shutdown bounded | High | Not started |
 | 6 | Test bridge failure, cancellation, EOF, and task cleanup | High | Not started |
 | 7 | Complete subprotocol and configuration tests | Medium | Not started |
@@ -203,7 +203,11 @@ If the WebSocket implementation makes Scenario B difficult to control determinis
 
 ### Result
 
-Not completed.
+Complete. Controlled small-capacity duplex tests now stall each direction in
+turn and verify that the opposite direction still makes progress. A test-only
+write wrapper signals actual `Pending` writes, keeping the scenarios
+deterministic without changing production buffering. Crate and workspace tests
+pass; strict Clippy still has the Step 10 findings.
 
 ## 8. Step 5: make close and shutdown bounded
 
