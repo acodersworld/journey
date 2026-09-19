@@ -459,10 +459,13 @@ impl SessionState {
 
     async fn wait(&self) -> Result<(), Arc<Error>> {
         loop {
+            // Create this before checking the result: finish() may notify between
+            // the check and the await, and notify_waiters() does not retain permits.
+            let notified = self.notify.notified();
             if let Some(result) = self.result.lock().await.clone() {
                 return result;
             }
-            self.notify.notified().await;
+            notified.await;
         }
     }
 }
@@ -698,6 +701,7 @@ where
 mod tests {
     use super::*;
     use tokio::io::duplex;
+    use tokio::time::{timeout, Duration};
     use tokio_tungstenite::client_async_with_config;
 
     async fn websocket_pair(
@@ -849,5 +853,80 @@ mod tests {
             .expect("send text");
         let error = bridge.await.expect("bridge task").expect_err("text must fail");
         assert!(matches!(error, Error::Protocol(_)));
+    }
+
+    #[tokio::test]
+    async fn session_waiter_registered_before_finish_is_not_lost() {
+        let state = Arc::new(SessionState::new());
+        let waiter_state = Arc::clone(&state);
+        let waiter = tokio::spawn(async move { waiter_state.wait().await });
+
+        tokio::task::yield_now().await;
+        state.finish(Ok(())).await;
+
+        assert!(timeout(Duration::from_millis(100), waiter)
+            .await
+            .expect("waiter timed out")
+            .expect("waiter task")
+            .is_ok());
+    }
+
+    #[tokio::test]
+    async fn session_wait_after_finish_returns_immediately() {
+        let state = SessionState::new();
+        state.finish(Ok(())).await;
+
+        assert!(timeout(Duration::from_millis(100), state.wait())
+            .await
+            .expect("wait timed out")
+            .is_ok());
+    }
+
+    #[tokio::test]
+    async fn simultaneous_session_waiters_receive_the_terminal_result() {
+        let state = Arc::new(SessionState::new());
+        let mut waiters = Vec::new();
+        for _ in 0..4 {
+            let waiter_state = Arc::clone(&state);
+            waiters.push(tokio::spawn(async move { waiter_state.wait().await }));
+        }
+
+        tokio::task::yield_now().await;
+        state.finish(Ok(())).await;
+
+        for waiter in waiters {
+            assert!(timeout(Duration::from_millis(100), waiter)
+                .await
+                .expect("waiter timed out")
+                .expect("waiter task")
+                .is_ok());
+        }
+    }
+
+    #[tokio::test]
+    async fn repeated_session_waits_after_completion_return_immediately() {
+        let state = SessionState::new();
+        state.finish(Ok(())).await;
+
+        for _ in 0..4 {
+            assert!(timeout(Duration::from_millis(100), state.wait())
+                .await
+                .expect("wait timed out")
+                .is_ok());
+        }
+    }
+
+    #[tokio::test]
+    async fn session_wait_preserves_error_result() {
+        let state = SessionState::new();
+        state
+            .finish(Err(Error::Protocol("session failed")))
+            .await;
+
+        let error = timeout(Duration::from_millis(100), state.wait())
+            .await
+            .expect("wait timed out")
+            .expect_err("wait should preserve the error");
+        assert!(matches!(error.as_ref(), Error::Protocol("session failed")));
     }
 }
