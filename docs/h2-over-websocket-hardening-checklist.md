@@ -38,6 +38,7 @@ The crate remains usable as a prototype during this work, but it is not consider
 | 10 | Clear strict Clippy findings manually | Medium | Complete |
 | 11 | Run extraction-readiness verification | Critical | Partially verified; Docker unavailable |
 | 12 | Keep the HTTP/2 driver responsive when request admission is full | Critical | Complete |
+| 13 | Enforce the complete HTTP/2 flow-control window range | High | Complete |
 
 Update the status column to `In progress` and then `Complete` as work proceeds. Add a short result note under each step when completed.
 
@@ -583,3 +584,24 @@ sender clones, bounding `h2`'s pending request slot. Regression tests verify
 that the advertised concurrent-stream limit backpressures client clones, fill
 the request queue, verify refusal of only the excess stream, and confirm that
 an active response still completes.
+
+## 16. Step 13: enforce the complete HTTP/2 flow-control window range
+
+### Correction
+
+The public stream and connection window settings are independent HTTP/2 flow-
+control limits. Each is now validated before any WebSocket or HTTP/2 handshake
+against the complete protocol range `1..=2^31 - 1`; the previous ordering
+requirement has been removed.
+
+### Tests
+
+Focused validation tests cover zero, values above the protocol maximum,
+`u32::MAX`, both inclusive boundaries, and both window orderings. Public
+session entry-point tests confirm an oversized setting returns
+`Error::Configuration` before handshake work begins.
+
+### Result
+
+Complete. The focused crate tests, full workspace tests, strict Clippy, and
+`git diff --check` pass without running an automated formatter.

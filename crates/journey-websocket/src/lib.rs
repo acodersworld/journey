@@ -35,6 +35,7 @@ const DEFAULT_MAX_WRITE_BUFFER_SIZE: usize = 512 * 1024;
 const DEFAULT_CLOSE_TIMEOUT: Duration = Duration::from_secs(5);
 const DEFAULT_H2_INITIAL_STREAM_WINDOW_SIZE: u32 = 64 * 1024;
 const DEFAULT_H2_INITIAL_CONNECTION_WINDOW_SIZE: u32 = 512 * 1024;
+const MAX_H2_WINDOW_SIZE: u32 = (1 << 31) - 1;
 const DEFAULT_H2_MAX_HEADER_LIST_SIZE: u32 = 16 * 1024;
 const DEFAULT_H2_MAX_CONCURRENT_REQUESTS: u32 = 8;
 const DEFAULT_REQUEST_QUEUE_CAPACITY: usize = 8;
@@ -67,13 +68,15 @@ pub struct Config {
     ///
     /// Increase this to let one stream make more progress before flow control
     /// pauses it; decrease it to limit per-stream in-flight DATA and memory.
-    /// This must not exceed `h2_initial_connection_window_size`.
+    /// This must be between 1 and `2^31 - 1`, independently of the connection
+    /// window.
     pub h2_initial_stream_window_size: u32,
     /// Initial connection-level HTTP/2 receive window in bytes, shared by all streams.
     ///
     /// Increase this for aggregate throughput with many concurrent streams;
     /// decrease it to cap total in-flight DATA and memory across the connection.
-    /// This must be at least `h2_initial_stream_window_size`.
+    /// This must be between 1 and `2^31 - 1`, independently of the stream
+    /// window.
     pub h2_initial_connection_window_size: u32,
     /// Maximum decoded HTTP/2 header-list size accepted from the peer, in bytes.
     ///
@@ -147,14 +150,14 @@ impl Config {
         if self.close_timeout.is_zero() {
             return Err(Error::Configuration("close timeout must be greater than zero"));
         }
-        if self.h2_initial_stream_window_size == 0 {
+        if !(1..=MAX_H2_WINDOW_SIZE).contains(&self.h2_initial_stream_window_size) {
             return Err(Error::Configuration(
-                "HTTP/2 stream window size must be greater than zero",
+                "HTTP/2 stream window size must be between 1 and 2^31 - 1",
             ));
         }
-        if self.h2_initial_connection_window_size < self.h2_initial_stream_window_size {
+        if !(1..=MAX_H2_WINDOW_SIZE).contains(&self.h2_initial_connection_window_size) {
             return Err(Error::Configuration(
-                "HTTP/2 connection window must not be smaller than the stream window",
+                "HTTP/2 connection window size must be between 1 and 2^31 - 1",
             ));
         }
         if self.h2_max_header_list_size == 0 {
@@ -1892,8 +1895,23 @@ mod tests {
                 ..Config::default()
             },
             Config {
-                h2_initial_stream_window_size: 1024,
-                h2_initial_connection_window_size: 512,
+                h2_initial_connection_window_size: 0,
+                ..Config::default()
+            },
+            Config {
+                h2_initial_stream_window_size: 0x8000_0000,
+                ..Config::default()
+            },
+            Config {
+                h2_initial_connection_window_size: 0x8000_0000,
+                ..Config::default()
+            },
+            Config {
+                h2_initial_stream_window_size: u32::MAX,
+                ..Config::default()
+            },
+            Config {
+                h2_initial_connection_window_size: u32::MAX,
                 ..Config::default()
             },
             Config {
@@ -1910,6 +1928,34 @@ mod tests {
             },
         ] {
             assert!(matches!(config.validate(), Err(Error::Configuration(_))));
+        }
+    }
+
+    #[tokio::test]
+    async fn http2_window_boundaries_and_relationships_are_valid() {
+        for config in [
+            Config {
+                h2_initial_stream_window_size: 1,
+                h2_initial_connection_window_size: 1,
+                ..Config::default()
+            },
+            Config {
+                h2_initial_stream_window_size: MAX_H2_WINDOW_SIZE,
+                h2_initial_connection_window_size: MAX_H2_WINDOW_SIZE,
+                ..Config::default()
+            },
+            Config {
+                h2_initial_stream_window_size: 512,
+                h2_initial_connection_window_size: 1024,
+                ..Config::default()
+            },
+            Config {
+                h2_initial_stream_window_size: 1024,
+                h2_initial_connection_window_size: 512,
+                ..Config::default()
+            },
+        ] {
+            assert!(config.validate().is_ok(), "config: {config:?}");
         }
     }
 
@@ -2048,6 +2094,28 @@ mod tests {
         assert!(matches!(
             accept_websocket(server_io, config).await,
             Err(Error::Configuration("close timeout must be greater than zero"))
+        ));
+    }
+
+    #[tokio::test]
+    async fn oversized_window_is_rejected_before_session_handshake() {
+        let config = Config {
+            h2_initial_stream_window_size: 0x8000_0000,
+            ..Config::default()
+        };
+        assert!(matches!(
+            connect("not a URL", config).await,
+            Err(Error::Configuration(
+                "HTTP/2 stream window size must be between 1 and 2^31 - 1"
+            ))
+        ));
+
+        let (_client_io, server_io) = duplex(64);
+        assert!(matches!(
+            accept_server(server_io, config).await,
+            Err(Error::Configuration(
+                "HTTP/2 stream window size must be between 1 and 2^31 - 1"
+            ))
         ));
     }
 
