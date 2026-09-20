@@ -1,7 +1,7 @@
 # HTTP/2-over-WebSocket Hardening Checklist
 
 **Status:** Active  
-**Updated:** 19 September 2026  
+**Updated:** 20 September 2026
 **Component:** `crates/journey-websocket`  
 **Related review:** [HTTP/2-over-WebSocket Crate Extraction Review](h2-over-websocket-crate-extraction.md)
 
@@ -33,10 +33,11 @@ The crate remains usable as a prototype during this work, but it is not consider
 | 5 | Make close and shutdown bounded | High | Complete |
 | 6 | Test bridge failure, cancellation, EOF, and task cleanup | High | Complete |
 | 7 | Complete subprotocol and configuration tests | Medium | Complete |
-| 8 | Resolve the generic `serve` versus HTTP/2 `ServerSession` API | High | Not started |
-| 9 | Tighten Journey's public-response backpressure | High | Not started |
-| 10 | Clear strict Clippy findings manually | Medium | Not started |
-| 11 | Run extraction-readiness verification | Critical | Not started |
+| 8 | Resolve the generic `serve` versus HTTP/2 `ServerSession` API | High | Complete |
+| 9 | Tighten Journey's public-response backpressure | High | Complete |
+| 10 | Clear strict Clippy findings manually | Medium | Complete |
+| 11 | Run extraction-readiness verification | Critical | Partially verified; Docker unavailable |
+| 12 | Keep the HTTP/2 driver responsive when request admission is full | Critical | Complete |
 
 Update the status column to `In progress` and then `Complete` as work proceeds. Add a short result note under each step when completed.
 
@@ -523,3 +524,62 @@ persistent session; after stopping and restarting home, the gateway logged a
 replacement session and requests continued to succeed. Docker and Podman are
 unavailable in this environment, so container-specific checks, sustained RSS
 observation, and the final extraction gate remain unverified.
+
+## 15. Step 12: keep request admission from stalling HTTP/2
+
+### Problem
+
+The server connection driver previously awaited space in the application
+request queue after accepting a stream. Although this wait yielded to Tokio,
+the waiting task owned the HTTP/2 connection. While the queue remained full,
+no task polled that connection, so existing streams and control traffic could
+also stop progressing.
+
+The client and server handshakes also relied on the `h2` crate defaults rather
+than making the prototype's stream, header, and receive-window limits
+explicit.
+
+### Required change
+
+- Advertise an explicit maximum number of concurrent client-initiated streams
+  from the HTTP/2 server.
+- Give the application request queue its own configurable bounded capacity.
+- Dispatch accepted requests with non-waiting queue admission.
+- Reset only an excess, unprocessed stream with `REFUSED_STREAM` when the queue
+  is full.
+- Continue polling the shared HTTP/2 connection immediately afterward.
+- Configure stream receive windows, connection receive windows, and maximum
+  decoded header-list sizes on both HTTP/2 handshakes.
+- Coordinate readiness and stream creation across all clones of the client
+  sender. The `h2` sender permits one stream to wait behind the peer's
+  concurrency limit; clones must not each create an additional pending stream.
+- Validate all new limits before opening a session.
+
+Response handlers continue to wait asynchronously for per-stream HTTP/2 flow
+control. That wait does not own the connection driver and therefore does not
+block unrelated streams.
+
+### Tests
+
+Verify that:
+
+- Invalid zero or inconsistent HTTP/2 and queue limits are rejected.
+- The server advertises and applies the configured stream limit.
+- Client sender clones share one bounded pending-stream slot when that limit is
+  reached.
+- Filling the application request queue causes only the next stream to receive
+  `REFUSED_STREAM`.
+- An already-active response continues and completes while the queue is full.
+
+### Result
+
+Complete. `Config` now contains explicit HTTP/2 stream-window,
+connection-window, header-list, concurrent-request, and application-queue
+limits. Both HTTP/2 handshakes use configured builders. The server driver uses
+non-waiting request admission and resets an excess stream with
+`REFUSED_STREAM`, so it immediately resumes polling the connection. A
+shared readiness gate makes readiness and stream creation atomic across client
+sender clones, bounding `h2`'s pending request slot. Regression tests verify
+that the advertised concurrent-stream limit backpressures client clones, fill
+the request queue, verify refusal of only the excess stream, and confirm that
+an active response still completes.

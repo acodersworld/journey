@@ -1,7 +1,7 @@
 # HTTP/2-over-WebSocket Crate Extraction Review
 
-**Status:** Prototype works; extraction preparation remains  
-**Updated:** 19 September 2026  
+**Status:** Source hardening complete; Docker and sustained RSS verification remain
+**Updated:** 20 September 2026
 **Reviewed component:** `crates/journey-websocket`  
 **Related plan:** [Vertical Slice 01 Implementation Plan](vertical-slice-01-implementation-plan.md)
 
@@ -11,12 +11,17 @@
 
 The current implementation proves that an HTTP/2 connection can be carried over one persistent WebSocket between the gateway and home processes. The adapter is appropriately small, the two-process prototype operates successfully, and the complete workspace test suite passes.
 
-The code is close to being suitable for extraction into a separate repository, but it should not be published as a reusable crate yet. Four areas should be completed first:
+The four original extraction blockers have now been completed:
 
-1. Make the bridge genuinely full duplex under backpressure.
-2. Replace the application-specific HTTP/2 client API with streaming `h2` primitives.
-3. Bound incoming WebSocket messages at handshake time.
-4. Add direct adapter and HTTP/2-over-WebSocket tests.
+1. The bridge is genuinely full duplex under backpressure.
+2. The client and server expose symmetric streaming `h2` primitives.
+3. Incoming WebSocket messages are bounded at handshake time.
+4. Direct adapter, lifecycle, backpressure, cancellation, and HTTP/2-over-WebSocket tests are present.
+
+Subsequent review also added explicit HTTP/2 connection limits, coordinated
+client request readiness, and non-waiting server request admission. A full
+application request queue now resets only the excess stream with
+`REFUSED_STREAM` while the driver continues polling existing streams.
 
 The intended extracted crate is specifically an **HTTP/2-over-WebSocket** crate. It should know about WebSocket transport, the byte-stream conversion, HTTP/2 handshakes, and connection lifecycle. It should not know about Journey routes, object storage, files, caching, or gateway policy.
 
@@ -85,7 +90,7 @@ Journey should continue to own:
 
 The low-level WebSocket bridge can remain an internal module of the extracted crate. It does not need to become a separate published crate unless another concrete use case later requires a generic WebSocket byte stream.
 
-## 4. Remaining issue: full-duplex backpressure
+## 4. Resolved issue: full-duplex backpressure
 
 ### Current behavior
 
@@ -135,7 +140,7 @@ Requirements:
 
 This is the most important transport correction before extraction.
 
-## 5. Remaining issue: application-specific client API
+## 5. Resolved issue: application-specific client API
 
 ### Current behavior
 
@@ -166,7 +171,7 @@ Expose normal streaming HTTP/2 primitives. A client session should provide acces
 
 Journey can provide a local convenience wrapper for its own object API, but that wrapper should not live in the extracted transport crate.
 
-## 6. Remaining issue: inbound WebSocket limits
+## 6. Resolved issue: inbound WebSocket limits
 
 ### Current behavior
 
@@ -196,7 +201,7 @@ The crate has two possible API strategies:
 
 The first option is safer and easier to use correctly. The second is useful when another HTTP framework owns the upgrade. If both are supported, the documentation must clearly state that accepting an arbitrary preconstructed `WebSocketStream` cannot retroactively limit memory used while parsing a message.
 
-## 7. Remaining issue: missing adapter tests
+## 7. Resolved issue: missing adapter tests
 
 The current workspace test proves HTTP/2 over an in-process Tokio duplex pair. It does not directly exercise the WebSocket bridge.
 
@@ -278,14 +283,21 @@ Recommended session behavior:
 
 ## 9. HTTP/2 request readiness
 
-Before creating a stream, an `h2` client must wait for its request handle to become ready. The prototype currently sends directly after cloning the handle.
+Before creating a stream, an `h2` client must wait for its request handle to
+become ready. `ClientSender` now provides that behavior without serializing
+response bodies: it holds a shared gate only while waiting for readiness and
+creating the stream, then returns the response future and streaming request
+body handle to the caller.
 
-The reusable API must either:
+The shared gate is important because a cloned `h2::client::SendRequest` has its
+own pending-stream state. The `h2` crate intentionally permits one request to
+wait behind the peer's concurrent-stream limit. Allowing every application
+clone to own that pending state would allow each clone to queue another stream.
+All `ClientSender` clones therefore coordinate through the same underlying
+handle, limiting the session to the one pending stream managed by `h2`.
 
-- Expose the underlying `SendRequest` and document normal `h2` readiness requirements, or
-- Provide a wrapper that calls `ready().await` before `send_request`.
-
-This matters once requests are concurrent or the peer's maximum concurrent-stream limit is reached. The current gateway mutex serializes complete requests and masks this behavior; it is not a substitute for HTTP/2 readiness.
+This mutex is not held while awaiting response headers or streaming either
+body, so independent active streams still progress concurrently.
 
 ## 10. Multiplexing and streaming in Journey
 
@@ -396,6 +408,8 @@ The crate is ready to move when:
 - Driver failures are observable without parsing logs.
 - A WebSocket subprotocol identifies the wire protocol.
 - Adapter and HTTP/2-over-WebSocket tests cover backpressure and cancellation.
+- A full application request queue refuses only the excess stream without stopping the connection driver.
+- HTTP/2 stream, connection-window, header-list, concurrency, and request-queue limits are explicit.
 - Journey can perform concurrent requests without holding a global request mutex.
 - Journey compiles and runs using the crate through an external path or Git dependency.
 - The crate has a clear license, README, compatibility statement, and runnable examples.

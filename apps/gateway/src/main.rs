@@ -111,6 +111,8 @@ async fn collect_body(mut body: h2::RecvStream) -> Option<Vec<u8>> {
 
 struct H2BodyStream {
     body: Option<h2::RecvStream>,
+    // Capacity for the last yielded DATA chunk is released only when the
+    // downstream body is polled again, so a paused client applies backpressure.
     pending_release: usize,
 }
 

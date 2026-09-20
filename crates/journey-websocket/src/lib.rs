@@ -33,6 +33,11 @@ const DEFAULT_MAX_FRAME_SIZE: usize = 256 * 1024;
 const DEFAULT_WRITE_BUFFER_SIZE: usize = 16 * 1024;
 const DEFAULT_MAX_WRITE_BUFFER_SIZE: usize = 512 * 1024;
 const DEFAULT_CLOSE_TIMEOUT: Duration = Duration::from_secs(5);
+const DEFAULT_H2_INITIAL_STREAM_WINDOW_SIZE: u32 = 64 * 1024;
+const DEFAULT_H2_INITIAL_CONNECTION_WINDOW_SIZE: u32 = 512 * 1024;
+const DEFAULT_H2_MAX_HEADER_LIST_SIZE: u32 = 16 * 1024;
+const DEFAULT_H2_MAX_CONCURRENT_REQUESTS: u32 = 8;
+const DEFAULT_REQUEST_QUEUE_CAPACITY: usize = 8;
 const WRITER_CHANNEL_CAPACITY: usize = 8;
 
 /// WebSocket subprotocol negotiated by this crate.
@@ -58,6 +63,34 @@ pub struct Config {
     /// Maximum time to wait for a queued WebSocket close command and local
     /// write-half shutdown. Expiration tears down the bridge cleanly.
     pub close_timeout: Duration,
+    /// Initial per-stream HTTP/2 receive window in bytes.
+    ///
+    /// Increase this to let one stream make more progress before flow control
+    /// pauses it; decrease it to limit per-stream in-flight DATA and memory.
+    /// This must not exceed `h2_initial_connection_window_size`.
+    pub h2_initial_stream_window_size: u32,
+    /// Initial connection-level HTTP/2 receive window in bytes, shared by all streams.
+    ///
+    /// Increase this for aggregate throughput with many concurrent streams;
+    /// decrease it to cap total in-flight DATA and memory across the connection.
+    /// This must be at least `h2_initial_stream_window_size`.
+    pub h2_initial_connection_window_size: u32,
+    /// Maximum decoded HTTP/2 header-list size accepted from the peer, in bytes.
+    ///
+    /// Increase this when peers need to send large headers; decrease it to
+    /// reject oversized header blocks earlier and reduce header memory use.
+    pub h2_max_header_list_size: u32,
+    /// Maximum number of active request streams advertised by the HTTP/2 server.
+    ///
+    /// Lower this to limit peer concurrency and application work; raise it to
+    /// permit more multiplexing. It controls the server side of the session.
+    pub h2_max_concurrent_requests: u32,
+    /// Number of accepted requests buffered while waiting for the application.
+    ///
+    /// Raise this to absorb bursts when handlers are slow; lower it to reduce
+    /// queued work and memory. When full, a new request stream is reset with
+    /// `REFUSED_STREAM` rather than blocking the HTTP/2 driver.
+    pub request_queue_capacity: usize,
 }
 
 impl Default for Config {
@@ -70,6 +103,11 @@ impl Default for Config {
             write_buffer_size: DEFAULT_WRITE_BUFFER_SIZE,
             max_write_buffer_size: DEFAULT_MAX_WRITE_BUFFER_SIZE,
             close_timeout: DEFAULT_CLOSE_TIMEOUT,
+            h2_initial_stream_window_size: DEFAULT_H2_INITIAL_STREAM_WINDOW_SIZE,
+            h2_initial_connection_window_size: DEFAULT_H2_INITIAL_CONNECTION_WINDOW_SIZE,
+            h2_max_header_list_size: DEFAULT_H2_MAX_HEADER_LIST_SIZE,
+            h2_max_concurrent_requests: DEFAULT_H2_MAX_CONCURRENT_REQUESTS,
+            request_queue_capacity: DEFAULT_REQUEST_QUEUE_CAPACITY,
         }
     }
 }
@@ -108,6 +146,31 @@ impl Config {
         }
         if self.close_timeout.is_zero() {
             return Err(Error::Configuration("close timeout must be greater than zero"));
+        }
+        if self.h2_initial_stream_window_size == 0 {
+            return Err(Error::Configuration(
+                "HTTP/2 stream window size must be greater than zero",
+            ));
+        }
+        if self.h2_initial_connection_window_size < self.h2_initial_stream_window_size {
+            return Err(Error::Configuration(
+                "HTTP/2 connection window must not be smaller than the stream window",
+            ));
+        }
+        if self.h2_max_header_list_size == 0 {
+            return Err(Error::Configuration(
+                "HTTP/2 maximum header-list size must be greater than zero",
+            ));
+        }
+        if self.h2_max_concurrent_requests == 0 {
+            return Err(Error::Configuration(
+                "HTTP/2 maximum concurrent requests must be greater than zero",
+            ));
+        }
+        if self.request_queue_capacity == 0 {
+            return Err(Error::Configuration(
+                "request queue capacity must be greater than zero",
+            ));
         }
         Ok(())
     }
@@ -201,6 +264,8 @@ where
             WriterCommand::Close { frame, completed } => {
                 let result = websocket_write.send(Message::Close(frame)).await;
                 let _ = completed.send(());
+                // The peer may already have initiated the close handshake, so
+                // SendAfterClosing means the bridge is already terminating cleanly.
                 match result {
                     Ok(())
                     | Err(tokio_tungstenite::tungstenite::Error::Protocol(
@@ -486,13 +551,18 @@ impl SessionState {
 /// A cloneable streaming request handle for one HTTP/2 connection.
 #[derive(Clone)]
 pub struct ClientSender {
-    client: Arc<client::SendRequest<Bytes>>,
+    client: Arc<Mutex<client::SendRequest<Bytes>>>,
 }
 
 impl ClientSender {
     /// Waits until the peer permits another HTTP/2 stream.
+    // Keep one SendRequest behind the mutex: cloning h2::SendRequest resets its
+    // pending-readiness state, which could otherwise bypass stream-limit backpressure.
+    // ReadyClientSender keeps this lock held until the request is sent.
     pub async fn ready(&self) -> Result<ReadyClientSender, Error> {
-        Ok(ReadyClientSender(self.client.as_ref().clone().ready().await?))
+        let mut client = Arc::clone(&self.client).lock_owned().await;
+        futures_util::future::poll_fn(|context| client.poll_ready(context)).await?;
+        Ok(ReadyClientSender(client))
     }
 
     /// Sends a complete HTTP/2 request head and returns its streaming response future.
@@ -506,7 +576,7 @@ impl ClientSender {
 }
 
 /// A sender that has completed the HTTP/2 stream-readiness check.
-pub struct ReadyClientSender(client::SendRequest<Bytes>);
+pub struct ReadyClientSender(tokio::sync::OwnedMutexGuard<client::SendRequest<Bytes>>);
 
 impl ReadyClientSender {
     /// Sends a request using this ready HTTP/2 sender.
@@ -540,8 +610,14 @@ impl ClientSession {
 
 async fn connect_h2(
     io: DuplexStream,
+    config: Config,
 ) -> Result<(client::SendRequest<Bytes>, client::Connection<DuplexStream, Bytes>), Error> {
-    Ok(client::handshake(io).await?)
+    let mut builder = client::Builder::new();
+    builder
+        .initial_window_size(config.h2_initial_stream_window_size)
+        .initial_connection_window_size(config.h2_initial_connection_window_size)
+        .max_header_list_size(config.h2_max_header_list_size);
+    Ok(builder.handshake(io).await?)
 }
 
 /// Establishes an HTTP/2 client session over an already-upgraded WebSocket.
@@ -565,7 +641,7 @@ where
         config.bridge_buffer_size,
         config.close_timeout,
     ));
-    let (client, connection) = match connect_h2(client_io).await {
+    let (client, connection) = match connect_h2(client_io, config).await {
         Ok(connection) => connection,
         Err(error) => {
             bridge_task.abort();
@@ -594,7 +670,7 @@ where
 
     Ok(ClientSession {
         sender: ClientSender {
-            client: Arc::new(client),
+            client: Arc::new(Mutex::new(client)),
         },
         state,
     })
@@ -647,8 +723,15 @@ async fn run_server_connection(
     let connection_result = async move {
         while let Some(result) = connection.accept().await {
             let request = result?;
-            if requests.send(request).await.is_err() {
-                return Ok(());
+            // Do not block the HTTP/2 driver behind a slow application. Refuse
+            // only the new stream when the bounded application queue is full.
+            match requests.try_send(request) {
+                Ok(()) => {}
+                Err(mpsc::error::TrySendError::Full((request, mut respond))) => {
+                    respond.send_reset(h2::Reason::REFUSED_STREAM);
+                    drop(request);
+                }
+                Err(mpsc::error::TrySendError::Closed(_)) => return Ok(()),
             }
         }
         Ok(())
@@ -696,14 +779,20 @@ where
         config.bridge_buffer_size,
         config.close_timeout,
     ));
-    let connection = match server::handshake(server_io).await {
+    let mut builder = server::Builder::new();
+    builder
+        .initial_window_size(config.h2_initial_stream_window_size)
+        .initial_connection_window_size(config.h2_initial_connection_window_size)
+        .max_header_list_size(config.h2_max_header_list_size)
+        .max_concurrent_streams(config.h2_max_concurrent_requests);
+    let connection = match builder.handshake(server_io).await {
         Ok(connection) => connection,
         Err(error) => {
             bridge_task.abort();
             return Err(error.into());
         }
     };
-    let (requests, request_queue) = mpsc::channel(WRITER_CHANNEL_CAPACITY);
+    let (requests, request_queue) = mpsc::channel(config.request_queue_capacity);
     let (shutdown, shutdown_signal) = tokio::sync::oneshot::channel();
     let state = Arc::new(SessionState::new());
     let driver_state = Arc::clone(&state);
@@ -1616,6 +1705,165 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn full_request_queue_refuses_only_the_new_stream() {
+        let config = Config {
+            h2_max_concurrent_requests: 3,
+            request_queue_capacity: 1,
+            ..Config::default()
+        };
+        let (client_websocket, server_websocket) = websocket_pair(config).await;
+        let server_session_task = tokio::spawn(server_session(server_websocket, config));
+        let client = connect_client(client_websocket, config)
+            .await
+            .expect("client session");
+        let mut server = server_session_task
+            .await
+            .expect("server session task")
+            .expect("server session");
+        let sender = client.sender();
+
+        let active_request = http::Request::builder()
+            .version(http::Version::HTTP_2)
+            .method("GET")
+            .uri("https://home.internal/active")
+            .body(())
+            .expect("active request");
+        let (active_response, _) = sender
+            .send_request(active_request, true)
+            .await
+            .expect("active request send");
+        let (_, mut active_respond) = timeout(Duration::from_millis(100), server.accept())
+            .await
+            .expect("active request accept timed out")
+            .expect("active request accept")
+            .expect("active request missing");
+
+        let queued_request = http::Request::builder()
+            .version(http::Version::HTTP_2)
+            .method("GET")
+            .uri("https://home.internal/queued")
+            .body(())
+            .expect("queued request");
+        let (_queued_response, _) = sender
+            .send_request(queued_request, true)
+            .await
+            .expect("queued request send");
+
+        let refused_request = http::Request::builder()
+            .version(http::Version::HTTP_2)
+            .method("GET")
+            .uri("https://home.internal/refused")
+            .body(())
+            .expect("refused request");
+        let (refused_response, _) = sender
+            .send_request(refused_request, true)
+            .await
+            .expect("refused request send");
+        let refused = timeout(Duration::from_millis(100), refused_response)
+            .await
+            .expect("refused response timed out")
+            .expect_err("overflow request must be refused");
+        assert_eq!(refused.reason(), Some(h2::Reason::REFUSED_STREAM));
+
+        let response = http::Response::builder()
+            .version(http::Version::HTTP_2)
+            .status(200)
+            .body(())
+            .expect("active response");
+        active_respond
+            .send_response(response, false)
+            .expect("active response headers")
+            .send_data(Bytes::from_static(b"active response"), true)
+            .expect("active response body");
+        let active_response = timeout(Duration::from_millis(100), active_response)
+            .await
+            .expect("active response timed out")
+            .expect("active response");
+        assert_eq!(
+            read_body(active_response.into_body()).await,
+            Bytes::from_static(b"active response"),
+        );
+    }
+
+    #[tokio::test]
+    async fn server_concurrent_request_limit_applies_client_readiness_backpressure() {
+        let config = Config {
+            h2_max_concurrent_requests: 1,
+            request_queue_capacity: 1,
+            ..Config::default()
+        };
+        let (client_websocket, server_websocket) = websocket_pair(config).await;
+        let server_session_task = tokio::spawn(server_session(server_websocket, config));
+        let client = connect_client(client_websocket, config)
+            .await
+            .expect("client session");
+        let mut server = server_session_task
+            .await
+            .expect("server session task")
+            .expect("server session");
+        let sender = client.sender();
+
+        let first_request = http::Request::builder()
+            .version(http::Version::HTTP_2)
+            .method("GET")
+            .uri("https://home.internal/first")
+            .body(())
+            .expect("first request");
+        let (first_response, _) = sender
+            .send_request(first_request, true)
+            .await
+            .expect("first request send");
+        let (_, mut first_respond) = timeout(Duration::from_millis(100), server.accept())
+            .await
+            .expect("first request accept timed out")
+            .expect("first request accept")
+            .expect("first request missing");
+        let response = http::Response::builder()
+            .version(http::Version::HTTP_2)
+            .status(200)
+            .body(())
+            .expect("first response");
+        let mut first_body = first_respond
+            .send_response(response, false)
+            .expect("first response headers");
+        let first_response = timeout(Duration::from_millis(100), first_response)
+            .await
+            .expect("first response timed out")
+            .expect("first response");
+
+        // h2 permits one request to wait behind the peer's concurrency limit.
+        // All ClientSender clones must share that pending slot so an additional
+        // clone cannot build an unbounded queue inside h2.
+        let second_request = http::Request::builder()
+            .version(http::Version::HTTP_2)
+            .method("GET")
+            .uri("https://home.internal/second")
+            .body(())
+            .expect("second request");
+        let (_second_response, _) = sender
+            .clone()
+            .send_request(second_request, true)
+            .await
+            .expect("second request send");
+        assert!(timeout(Duration::from_millis(20), server.accept()).await.is_err());
+        assert!(timeout(Duration::from_millis(20), sender.ready()).await.is_err());
+
+        first_body
+            .send_data(Bytes::new(), true)
+            .expect("finish first response");
+        assert!(read_body(first_response.into_body()).await.is_empty());
+        timeout(Duration::from_millis(100), server.accept())
+            .await
+            .expect("second request remained blocked")
+            .expect("second request accept failed")
+            .expect("second request missing");
+        timeout(Duration::from_millis(100), sender.ready())
+            .await
+            .expect("client readiness remained blocked")
+            .expect("client readiness failed");
+    }
+
+    #[tokio::test]
     async fn invalid_limits_are_rejected() {
         let config = Config {
             max_write_buffer_size: 1,
@@ -1634,6 +1882,35 @@ mod tests {
             config.validate(),
             Err(Error::Configuration("close timeout must be greater than zero"))
         ));
+    }
+
+    #[tokio::test]
+    async fn invalid_http2_and_request_queue_limits_are_rejected() {
+        for config in [
+            Config {
+                h2_initial_stream_window_size: 0,
+                ..Config::default()
+            },
+            Config {
+                h2_initial_stream_window_size: 1024,
+                h2_initial_connection_window_size: 512,
+                ..Config::default()
+            },
+            Config {
+                h2_max_header_list_size: 0,
+                ..Config::default()
+            },
+            Config {
+                h2_max_concurrent_requests: 0,
+                ..Config::default()
+            },
+            Config {
+                request_queue_capacity: 0,
+                ..Config::default()
+            },
+        ] {
+            assert!(matches!(config.validate(), Err(Error::Configuration(_))));
+        }
     }
 
     #[tokio::test]
