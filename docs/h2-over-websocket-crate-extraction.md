@@ -409,7 +409,7 @@ The crate is ready to move when:
 - A WebSocket subprotocol identifies the wire protocol.
 - Adapter and HTTP/2-over-WebSocket tests cover backpressure and cancellation.
 - A full application request queue refuses only the excess stream without stopping the connection driver.
-- HTTP/2 stream, connection-window, header-list, concurrency, and request-queue limits are explicit; stream and connection windows enforce the complete protocol range `1..=2^31 - 1` independently.
+- HTTP/2 stream, connection-window, header-list, concurrency, and request-queue limits are explicit; stream and connection windows independently enforce the crate's supported nonzero range `1..=2^31 - 1`.
 - Journey can perform concurrent requests without holding a global request mutex.
 - Journey compiles and runs using the crate through an external path or Git dependency.
 - The crate has a clear license, README, compatibility statement, and runnable examples.

@@ -38,7 +38,7 @@ The crate remains usable as a prototype during this work, but it is not consider
 | 10 | Clear strict Clippy findings manually | Medium | Complete |
 | 11 | Run extraction-readiness verification | Critical | Partially verified; Docker unavailable |
 | 12 | Keep the HTTP/2 driver responsive when request admission is full | Critical | Complete |
-| 13 | Enforce the complete HTTP/2 flow-control window range | High | Complete |
+| 13 | Enforce bounded HTTP/2 flow-control window ranges | High | Complete |
 
 Update the status column to `In progress` and then `Complete` as work proceeds. Add a short result note under each step when completed.
 
@@ -585,14 +585,20 @@ that the advertised concurrent-stream limit backpressures client clones, fill
 the request queue, verify refusal of only the excess stream, and confirm that
 an active response still completes.
 
-## 16. Step 13: enforce the complete HTTP/2 flow-control window range
+## 16. Step 13: enforce bounded HTTP/2 flow-control window ranges
 
 ### Correction
 
 The public stream and connection window settings are independent HTTP/2 flow-
 control limits. Each is now validated before any WebSocket or HTTP/2 handshake
-against the complete protocol range `1..=2^31 - 1`; the previous ordering
-requirement has been removed.
+against the crate's supported nonzero range `1..=2^31 - 1`; the previous
+ordering requirement has been removed. HTTP/2 permits a zero stream window,
+but the crate rejects zero so DATA can make progress without a later window
+update.
+
+The connection setting is a target. HTTP/2 connection credit starts at 65,535
+bytes, so a smaller configured target does not revoke that initial credit. It
+takes effect as the application releases received capacity.
 
 ### Tests
 

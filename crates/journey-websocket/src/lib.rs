@@ -68,15 +68,19 @@ pub struct Config {
     ///
     /// Increase this to let one stream make more progress before flow control
     /// pauses it; decrease it to limit per-stream in-flight DATA and memory.
-    /// This must be between 1 and `2^31 - 1`, independently of the connection
-    /// window.
+    /// HTTP/2 permits zero, but this crate requires the nonzero range
+    /// `1..=2^31 - 1` so a newly opened stream can make DATA progress without
+    /// a later flow-control update. This limit is independent of the
+    /// connection window.
     pub h2_initial_stream_window_size: u32,
-    /// Initial connection-level HTTP/2 receive window in bytes, shared by all streams.
+    /// Target connection-level HTTP/2 receive window in bytes, shared by all streams.
     ///
     /// Increase this for aggregate throughput with many concurrent streams;
     /// decrease it to cap total in-flight DATA and memory across the connection.
-    /// This must be between 1 and `2^31 - 1`, independently of the stream
-    /// window.
+    /// HTTP/2 connection credit starts at 65,535 bytes, so a lower value cannot
+    /// revoke that initial credit; it becomes the target as received capacity
+    /// is released. This crate requires the nonzero range `1..=2^31 - 1`,
+    /// independently of the stream window.
     pub h2_initial_connection_window_size: u32,
     /// Maximum decoded HTTP/2 header-list size accepted from the peer, in bytes.
     ///
