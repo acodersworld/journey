@@ -9,6 +9,10 @@ RUN cargo build --locked --release -p journey-gateway -p journey-home
 
 FROM debian:bookworm-slim
 
+RUN apt-get update \
+    && apt-get install --no-install-recommends --yes ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
 COPY --from=build /src/target/release/journey-gateway /usr/local/bin/gateway
 COPY --from=build /src/target/release/journey-home /usr/local/bin/home
 

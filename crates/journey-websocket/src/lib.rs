@@ -15,7 +15,7 @@ use tokio::{
     task::JoinSet,
 };
 use tokio_tungstenite::{
-    accept_hdr_async_with_config, connect_async_with_config,
+    accept_hdr_async_with_config, connect_async_tls_with_config,
     tungstenite::{
         client::IntoClientRequest,
         handshake::server::{ErrorResponse, Request, Response},
@@ -25,6 +25,8 @@ use tokio_tungstenite::{
     },
     WebSocketStream,
 };
+
+pub use tokio_tungstenite::{tungstenite, Connector};
 
 const DEFAULT_DUPLEX_CAPACITY: usize = 256 * 1024;
 const DEFAULT_BRIDGE_BUFFER_SIZE: usize = 16 * 1024;
@@ -467,19 +469,41 @@ fn accept_websocket_response(
     Ok(response)
 }
 
+/// Accepts a WebSocket after a synchronous application authorization decision.
+///
+/// The callback runs during the HTTP upgrade, before an HTTP/2 session or any
+/// inner request is started. It may return a complete HTTP rejection response.
+/// The transport still validates its configuration before reading the request,
+/// and it still enforces the required subprotocol after authorization succeeds.
+pub async fn accept_websocket_with_authorizer<S, F>(
+    stream: S,
+    config: Config,
+    authorize: F,
+) -> Result<WebSocketStream<S>, Error>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+    F: FnOnce(&Request) -> Result<(), ErrorResponse> + Unpin,
+{
+    config.validate()?;
+    let callback = move |request: &Request, response: Response| {
+        authorize(request)?;
+        accept_websocket_response(request, response)
+    };
+    let websocket = accept_hdr_async_with_config(
+        stream,
+        callback,
+        Some(config.websocket_config()),
+    )
+    .await?;
+    Ok(websocket)
+}
+
 /// Accepts a WebSocket with the transport's limits and subprotocol.
 pub async fn accept_websocket<S>(stream: S, config: Config) -> Result<WebSocketStream<S>, Error>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
-    config.validate()?;
-    let websocket = accept_hdr_async_with_config(
-        stream,
-        accept_websocket_response,
-        Some(config.websocket_config()),
-    )
-    .await?;
-    Ok(websocket)
+    accept_websocket_with_authorizer(stream, config, |_| Ok(())).await
 }
 
 /// Connects a WebSocket with the transport's limits and subprotocol.
@@ -496,16 +520,39 @@ pub async fn connect_websocket<R>(
 where
     R: IntoClientRequest + Unpin,
 {
+    connect_websocket_with_connector(request, config, None).await
+}
+
+/// Connects a WebSocket with an optional verified TLS connector.
+///
+/// Passing a Rustls connector lets an application add a private test CA while
+/// retaining normal certificate-chain and hostname verification. `None` uses
+/// the native-root configuration supplied by `tokio-tungstenite`.
+pub async fn connect_websocket_with_connector<R>(
+    request: R,
+    config: Config,
+    connector: Option<Connector>,
+) -> Result<
+    (
+        WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>,
+        tokio_tungstenite::tungstenite::handshake::client::Response,
+    ),
+    Error,
+>
+where
+    R: IntoClientRequest + Unpin,
+{
     config.validate()?;
     let mut request = request.into_client_request()?;
     request.headers_mut().insert(
         "Sec-WebSocket-Protocol",
         HeaderValue::from_static(SUBPROTOCOL),
     );
-    let (websocket, response) = connect_async_with_config(
+    let (websocket, response) = connect_async_tls_with_config(
         request,
         Some(config.websocket_config()),
         false,
+        connector,
     )
     .await?;
 
@@ -2065,6 +2112,80 @@ mod tests {
             let (_, server) = websocket_handshake_with_offer(Config::default(), offer).await;
             assert!(matches!(server, Err(Error::WebSocket(_))));
         }
+    }
+
+    #[tokio::test]
+    async fn authorizer_rejects_before_an_inner_session_can_start() {
+        let (client_io, server_io) = duplex(1024 * 1024);
+        let server = tokio::spawn(async move {
+            accept_websocket_with_authorizer(server_io, Config::default(), |_request| {
+                Err(http::Response::builder()
+                    .status(http::StatusCode::UNAUTHORIZED)
+                    .body(Some("rejected".to_owned()))
+                    .expect("rejection response"))
+            })
+            .await
+        });
+        let client = tokio::spawn(async move {
+            let mut request = "ws://localhost".into_client_request().expect("request");
+            request.headers_mut().insert(
+                "Sec-WebSocket-Protocol",
+                HeaderValue::from_static(SUBPROTOCOL),
+            );
+            client_async_with_config(request, client_io, Some(Config::default().websocket_config()))
+                .await
+        });
+        assert!(matches!(server.await.expect("server task"), Err(Error::WebSocket(_))));
+        assert!(client.await.expect("client task").is_err());
+    }
+
+    #[tokio::test]
+    async fn successful_authorization_still_requires_the_transport_subprotocol() {
+        let (client_io, server_io) = duplex(1024 * 1024);
+        let server = tokio::spawn(async move {
+            accept_websocket_with_authorizer(server_io, Config::default(), |_request| Ok(())).await
+        });
+        let client = tokio::spawn(async move {
+            client_async_with_config(
+                "ws://localhost",
+                client_io,
+                Some(Config::default().websocket_config()),
+            )
+            .await
+        });
+        assert!(matches!(server.await.expect("server task"), Err(Error::WebSocket(_))));
+        assert!(client.await.expect("client task").is_err());
+    }
+
+    #[tokio::test]
+    async fn authorized_handshake_keeps_the_configured_websocket_limits() {
+        let config = Config {
+            max_message_size: 32,
+            max_frame_size: 16,
+            bridge_buffer_size: 16,
+            ..Config::default()
+        };
+        let (client_io, server_io) = duplex(1024 * 1024);
+        let server = tokio::spawn(async move {
+            accept_websocket_with_authorizer(server_io, config, |_request| Ok(())).await
+        });
+        let client = tokio::spawn(async move {
+            let mut request = "ws://localhost".into_client_request().expect("request");
+            request.headers_mut().insert(
+                "Sec-WebSocket-Protocol",
+                HeaderValue::from_static(SUBPROTOCOL),
+            );
+            client_async_with_config(request, client_io, Some(config.websocket_config()))
+                .await
+                .expect("client handshake")
+                .0
+        });
+        let server = server.await.expect("server task").expect("server handshake");
+        let client = client.await.expect("client task");
+        assert_eq!(server.get_config().max_message_size, Some(32));
+        assert_eq!(server.get_config().max_frame_size, Some(16));
+        drop(client);
+        drop(server);
     }
 
     #[tokio::test]

@@ -4,6 +4,17 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-journey-h2-duplex = { path = "../.." }
 journey-websocket = { path = "../../crates/journey-websocket" }
-tokio = { version = "1", features = ["io-util", "macros", "rt-multi-thread", "time"] }
+base64 = "0.22"
+bytes = "1"
+futures-util = "0.3"
+h2 = "0.4"
+http = "1"
+rustls = "0.23"
+rustls-native-certs = "0.8"
+rustls-pemfile = "2"
+rustls-pki-types = "1"
+serde_json = "1"
+sha2 = "0.10"
+tokio = { version = "1", features = ["fs", "io-util", "macros", "net", "rt-multi-thread", "sync", "time"] }
+tokio-tungstenite = { version = "0.27", features = ["rustls-tls-native-roots"] }

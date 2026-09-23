@@ -1,6 +1,9 @@
 services:
   gateway:
     build: .
+    env_file:
+      - path: .env.validation
+        required: true
     environment:
       GATEWAY_BIND: 0.0.0.0:8080
       GATEWAY_WEBSOCKET_BIND: 0.0.0.0:9000
@@ -14,5 +17,13 @@ services:
     command: ["/usr/local/bin/home"]
     depends_on:
       - gateway
+    env_file:
+      - path: .env.validation
+        required: true
     environment:
       HOME_WEBSOCKET_URL: ws://gateway:9000
+      HOME_FIXTURES_DIR: /var/lib/journey/fixtures
+      HOME_UPLOADS_DIR: /var/lib/journey/uploads
+    volumes:
+      - ./deploy/fixtures:/var/lib/journey/fixtures:ro
+      - ./deploy/uploads:/var/lib/journey/uploads:rw
