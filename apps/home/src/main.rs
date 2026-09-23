@@ -29,6 +29,7 @@ use tokio::{
 
 const MAX_UPLOAD_SIZE: u64 = 256 * 1024 * 1024;
 const FILE_CHUNK_SIZE: usize = 64 * 1024;
+const TRANSFER_LOG_INTERVAL: u64 = 100;
 static TEMP_FILE_COUNTER: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Clone)]
@@ -321,12 +322,27 @@ async fn serve_fixture(
         builder = builder.header(header::CONTENT_RANGE, content_range);
     }
     let response = builder.body(())?;
+    println!(
+        "home response: path={} method={} type={} size={} bytes range_start={}",
+        request.uri().path(),
+        request.method(),
+        fixture.content_type,
+        length,
+        start,
+    );
     if request.method() == Method::HEAD || length == 0 {
         respond.send_response(response, true)?;
         return Ok(());
     }
     let mut stream = respond.send_response(response, false)?;
-    stream_fixture(&mut stream, &fixture.path, start, length).await
+    stream_fixture(
+        &mut stream,
+        &fixture.path,
+        start,
+        length,
+        fixture.content_type,
+    )
+    .await
 }
 
 async fn stream_fixture(
@@ -334,10 +350,13 @@ async fn stream_fixture(
     path: &Path,
     start: u64,
     length: u64,
+    content_type: &str,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let mut file = File::open(path).await?;
     file.seek(std::io::SeekFrom::Start(start)).await?;
     let mut remaining = length;
+    let mut chunks = 0_u64;
+    let mut sent = 0_u64;
     while remaining > 0 {
         stream.reserve_capacity(FILE_CHUNK_SIZE.min(remaining as usize));
         let capacity = poll_fn(|context| stream.poll_capacity(context))
@@ -350,7 +369,19 @@ async fn stream_fixture(
             return Err("fixture ended before its advertised length".into());
         }
         remaining -= count as u64;
+        sent += count as u64;
+        chunks += 1;
         stream.send_data(Bytes::from(buffer[..count].to_vec()), remaining == 0)?;
+        if chunks % TRANSFER_LOG_INTERVAL == 0 || remaining == 0 {
+            println!(
+                "home upload: type={} message=HTTP/2 DATA chunk={} size={} bytes total={}/{} bytes",
+                content_type,
+                chunks,
+                count,
+                sent,
+                length,
+            );
+        }
     }
     Ok(())
 }
