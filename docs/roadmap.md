@@ -42,6 +42,21 @@ This keeps later extraction mechanical without delaying product work now.
 
 ## 3. Milestone 1: home object-storage service
 
+The current preliminary filesystem design is documented in
+[Home Object Storage Design](home-object-storage-design.md). It records the
+newer flat-store, embedded-header, and rebuildable-index direction while the
+remaining interface details are still being resolved.
+
+The agreed preliminary operation set, SQLite index role, JSON manifest, local
+maintenance commands, and read-only home-LAN administration surface are
+documented in
+[Home Object Storage Interface](home-object-storage-interface.md).
+
+Implementation begins with the narrower read-only slice in
+[Read-Only In-Memory HTTP/2 Server Implementation Plan](read-only-in-memory-http2-server-implementation-plan.md).
+It deliberately proves a reusable HTTP/2 `GET` service and h2c development
+host before adding filesystem storage or mutations.
+
 ### 3.1 Define the interface first
 
 Write an implementation-neutral object-storage interface document before

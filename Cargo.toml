@@ -4,6 +4,7 @@ members = [
     "apps/gateway",
     "apps/home",
     "crates/journey-websocket",
+    "crates/journey-storage",
 ]
 resolver = "2"
 

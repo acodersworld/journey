@@ -502,6 +502,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "journey-storage"
+version = "0.1.0"
+dependencies = [
+ "bytes",
+ "h2",
+ "http",
+ "tokio",
+]
+
+[[package]]
 name = "journey-websocket"
 version = "0.1.0"
 dependencies = [
