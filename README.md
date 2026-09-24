@@ -28,6 +28,53 @@ local development. The AWS bundle uses Nginx, TLS, HTTP/2, and WSS instead.
 Use credentials from the environment file when calling `/health` or the media
 routes.
 
+## In-memory HTTP/2 object storage
+
+Run the h2c example from the workspace root:
+
+```bash
+cargo run -p journey-storage --example h2c_get_server
+```
+
+In another terminal, upload the included image, download it, and compare the
+bytes:
+
+```bash
+curl --http2-prior-knowledge \
+  -X PUT \
+  -H 'Content-Type: image/jpeg' \
+  --data-binary @crates/journey-storage/examples/assets/image.jpg \
+  http://127.0.0.1:8081/objects/uploaded.jpg
+
+curl --http2-prior-knowledge \
+  http://127.0.0.1:8081/objects/uploaded.jpg \
+  --output downloaded.jpg
+
+cmp crates/journey-storage/examples/assets/image.jpg downloaded.jpg
+```
+
+Replace the same key with the included video and inspect the updated content
+type in the GET response headers:
+
+```bash
+curl --http2-prior-knowledge \
+  -X PUT \
+  -H 'Content-Type: video/mp4' \
+  --data-binary @crates/journey-storage/examples/assets/video.mp4 \
+  http://127.0.0.1:8081/objects/uploaded.jpg
+
+curl --http2-prior-knowledge \
+  -D - \
+  http://127.0.0.1:8081/objects/uploaded.jpg \
+  --output downloaded.mp4
+
+cmp crates/journey-storage/examples/assets/video.mp4 downloaded.mp4
+```
+
+The current implementation retains complete uploads and stored objects in
+process memory without size limits. Restrict access and upload sizes until
+explicit bounds are in place; untrusted uploads can exhaust available memory.
+
 ## Checks
 
 Do not run `cargo fmt`, `cargo fmt --check`, `rustfmt`, or another automated

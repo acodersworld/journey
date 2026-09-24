@@ -5,6 +5,8 @@ use std::{
 };
 
 use bytes::Bytes;
+use http::HeaderValue;
+use tokio::sync::RwLock;
 
 #[derive(Clone, Debug, Hash, PartialEq, Eq)]
 pub struct Key {
@@ -27,19 +29,19 @@ impl std::borrow::Borrow<str> for Key {
     }
 }
 
-/// One immutable object in a [`StaticStore`].
+/// One immutable object in a [`Store`].
 #[derive(Clone, Debug)]
 pub struct Object {
     key: Key,
-    content_type: String,
+    content_type: HeaderValue,
     contents: Bytes,
 }
 
 impl Object {
-    /// Creates an object after validating its key and content type.
+    /// Creates an object from a validated key and HTTP header value.
     pub fn new(
         key: Key,
-        content_type: String,
+        content_type: HeaderValue,
         contents: Bytes,
     ) -> Self {
         Self {
@@ -55,7 +57,7 @@ impl Object {
     }
 
     /// Returns the immutable content type.
-    pub fn content_type(&self) -> &str {
+    pub fn content_type(&self) -> &HeaderValue {
         &self.content_type
     }
 
@@ -65,10 +67,17 @@ impl Object {
     }
 }
 
-/// A complete, immutable catalogue of objects indexed by exact logical key.
+/// A mutable catalogue of complete objects indexed by exact logical key.
 #[derive(Clone, Debug, Default)]
 pub struct Store {
-    objects: Arc<HashMap<Key, Object>>,
+    objects: Arc<RwLock<HashMap<Key, Object>>>,
+}
+
+/// The result of atomically publishing an object into a [`Store`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PutOutcome {
+    Created,
+    Replaced,
 }
 
 impl Store {
@@ -84,24 +93,37 @@ impl Store {
             }
         }
         Ok(Self {
-            objects: Arc::new(catalogue),
+            objects: Arc::new(RwLock::new(catalogue)),
         })
     }
 
     /// Looks up an exact logical key and cheaply clones its metadata and payload handle.
-    pub fn get(&self, key: &str) -> Option<Object> {
-        self.objects.get(key).cloned()
+    pub async fn get(&self, key: &str) -> Option<Object> {
+        self.objects.read().await.get(key).cloned()
     }
 
     /// Returns the number of objects in the catalogue.
-    pub fn len(&self) -> usize {
-        self.objects.len()
+    pub async fn len(&self) -> usize {
+        self.objects.read().await.len()
     }
 
     /// Returns whether the catalogue contains no objects.
-    pub fn is_empty(&self) -> bool {
-        self.objects.is_empty()
+    pub async fn is_empty(&self) -> bool {
+        self.objects.read().await.is_empty()
+    }
+
+    /// Atomically inserts or replaces an object by its exact logical key.
+    pub async fn put(&self, object: Object) -> PutOutcome {
+        let mut objects = self.objects.write().await;
+        match objects.entry(object.key.clone()) {
+            std::collections::hash_map::Entry::Occupied(mut entry) => {
+                entry.insert(object);
+                PutOutcome::Replaced
+            }
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                entry.insert(object);
+                PutOutcome::Created
+            }
+        }
     }
 }
-
-

@@ -12,18 +12,21 @@ use http::{
     Method, Request, Response, StatusCode, Version,
 };
 
+use crate::storage::{Key, Object, PutOutcome};
+
 const MAX_DATA_SEGMENT_SIZE: usize = 64 * 1024;
 const NOT_FOUND_BODY: &[u8] = b"not found\n";
+const BAD_REQUEST_BODY: &[u8] = b"bad request\n";
 const METHOD_NOT_ALLOWED_BODY: &[u8] = b"method not allowed\n";
 
-/// Handles one already accepted HTTP/2 GET request against a shared catalogue.
+/// Handles one already accepted HTTP/2 request against a shared catalogue.
 #[derive(Clone, Debug)]
 pub struct Service {
     store: Store,
 }
 
 impl Service {
-    /// Creates a service backed by the supplied immutable catalogue.
+    /// Creates a service backed by the supplied mutable catalogue.
     pub fn new(store: Store) -> Self {
         Self { store }
     }
@@ -32,22 +35,82 @@ impl Service {
     pub async fn handle(
         &self,
         request: Request<h2::RecvStream>,
-        mut respond: h2::server::SendResponse<Bytes>,
+        respond: h2::server::SendResponse<Bytes>,
     ) -> Result<(), ServiceError> {
-        let method = request.method().clone();
-        let path = request.uri().path();
-
-        if method != Method::GET {
-            return send_text_response(
+        match *request.method() {
+            Method::PUT => self.handle_put(request, respond).await,
+            Method::GET => self.handle_get(request, respond).await,
+            _ => send_text_response(
                 respond,
                 StatusCode::METHOD_NOT_ALLOWED,
-                Some("GET"),
+                Some("GET, PUT"),
                 METHOD_NOT_ALLOWED_BODY,
+            )
+        }
+    }
+
+    fn get_key(request: &Request<h2::RecvStream>) -> &str {
+        let path = request.uri().path();
+        path.strip_prefix("/objects/").unwrap_or("")
+    }
+
+    async fn handle_put(&self, request: Request<h2::RecvStream>, mut respond: h2::server::SendResponse<Bytes>) -> Result<(), ServiceError> {
+        let key = match Key::new(Self::get_key(&request)) {
+            Ok(key) => key,
+            Err(_) => {
+                return send_text_response(
+                    respond,
+                    StatusCode::BAD_REQUEST,
+                    None,
+                    BAD_REQUEST_BODY,
+                );
+            }
+        };
+        let mut content_types = request.headers().get_all(header::CONTENT_TYPE).iter();
+        let Some(content_type) = content_types.next() else {
+            return send_text_response(
+                respond,
+                StatusCode::BAD_REQUEST,
+                None,
+                BAD_REQUEST_BODY,
+            );
+        };
+        if content_type.as_bytes().is_empty() || content_types.next().is_some() {
+            return send_text_response(
+                respond,
+                StatusCode::BAD_REQUEST,
+                None,
+                BAD_REQUEST_BODY,
             );
         }
+        let content_type = content_type.clone();
+        let mut body = request.into_body();
+        let mut contents = Vec::new();
+        while let Some(data) = body.data().await {
+            let data = data?;
+            let length = data.len();
+            contents.extend_from_slice(&data);
+            body.flow_control().release_capacity(length)?;
+        }
 
-        let key = path.strip_prefix("/objects/").unwrap_or("");
-        let Some(object) = self.store.get(key) else {
+        let object = Object::new(key, content_type, Bytes::from(contents));
+        let outcome = self.store.put(object).await;
+        let status = match outcome {
+            PutOutcome::Created => StatusCode::CREATED,
+            PutOutcome::Replaced => StatusCode::OK,
+        };
+        let response = Response::builder()
+            .version(Version::HTTP_2)
+            .status(status)
+            .header(header::CONTENT_LENGTH, 0)
+            .body(())?;
+        respond.send_response(response, true)?;
+        Ok(())
+    }
+
+    async fn handle_get(&self, request: Request<h2::RecvStream>, mut respond: h2::server::SendResponse<Bytes>) -> Result<(), ServiceError> {
+        let key = Self::get_key(&request);
+        let Some(object) = self.store.get(key).await else {
             return send_text_response(respond, StatusCode::NOT_FOUND, None, NOT_FOUND_BODY);
         };
 
@@ -169,7 +232,7 @@ mod tests {
     fn object(key: &str, content_type: &str, contents: Bytes) -> Object {
         Object::new(
             Key::new(key).unwrap(),
-            content_type.to_owned(),
+            content_type.parse().unwrap(),
             contents,
         )
     }
@@ -182,16 +245,16 @@ mod tests {
         .unwrap()
     }
 
-    #[test]
-    fn catalogue_constructs_and_looks_up_exact_keys() {
+    #[tokio::test]
+    async fn catalogue_constructs_and_looks_up_exact_keys() {
         let store = sample_store();
 
-        assert_eq!(store.len(), 2);
-        assert!(!store.is_empty());
-        assert_eq!(store.get("image.jpg").unwrap().contents(), IMAGE);
-        assert_eq!(store.get("video.mp4").unwrap().contents(), VIDEO);
-        assert!(store.get("IMAGE.jpg").is_none());
-        assert!(store.get("missing").is_none());
+        assert_eq!(store.len().await, 2);
+        assert!(!store.is_empty().await);
+        assert_eq!(store.get("image.jpg").await.unwrap().contents(), IMAGE);
+        assert_eq!(store.get("video.mp4").await.unwrap().contents(), VIDEO);
+        assert!(store.get("IMAGE.jpg").await.is_none());
+        assert!(store.get("missing").await.is_none());
     }
 
     #[test]
@@ -208,8 +271,8 @@ mod tests {
         assert_eq!(Store::new(objects).unwrap_err(), "Duplicate key: same");
     }
 
-    #[test]
-    fn catalogue_preserves_content_type_as_opaque_metadata() {
+    #[tokio::test]
+    async fn catalogue_preserves_content_type_as_opaque_metadata() {
         let store = Store::new([object(
             "custom",
             "vendor-specific-type",
@@ -217,17 +280,44 @@ mod tests {
         )])
         .unwrap();
 
-        assert_eq!(store.get("custom").unwrap().content_type(), "vendor-specific-type");
+        assert_eq!(
+            store.get("custom").await.unwrap().content_type().as_bytes(),
+            b"vendor-specific-type"
+        );
     }
 
-    #[test]
-    fn lookup_clone_shares_payload_allocation() {
+    #[tokio::test]
+    async fn lookup_clone_shares_payload_allocation() {
         let payload = Bytes::from(vec![7; 32]);
         let original_ptr = payload.as_ptr();
         let store = Store::new([object("payload", "application/octet-stream", payload)]).unwrap();
-        let cloned = store.get("payload").unwrap();
+        let cloned = store.get("payload").await.unwrap();
 
         assert_eq!(cloned.contents().as_ptr(), original_ptr);
+    }
+
+    #[tokio::test]
+    async fn store_clones_share_atomic_insertions_and_replacements() {
+        let store = sample_store();
+        let clone = store.clone();
+
+        assert_eq!(
+            store.put(object("new", "text/plain", Bytes::from_static(b"first"))).await,
+            PutOutcome::Created
+        );
+        assert_eq!(
+            clone.get("new").await.unwrap().contents().as_ref(),
+            b"first"
+        );
+        assert_eq!(
+            clone.put(object("new", "application/json", Bytes::from_static(b"second"))).await,
+            PutOutcome::Replaced
+        );
+
+        let replaced = store.get("new").await.unwrap();
+        assert_eq!(replaced.contents().as_ref(), b"second");
+        assert_eq!(replaced.content_type().as_bytes(), b"application/json");
+        assert_eq!(store.len().await, 3);
     }
 
     struct TestConnection {
@@ -268,7 +358,7 @@ mod tests {
                     Some(Ok((request, respond))) => {
                         let service = service.clone();
                         handlers.spawn(async move {
-                            service.handle(request, respond).await.unwrap();
+                            let _ = service.handle(request, respond).await;
                         });
                     }
                     Some(Err(_)) | None => break,
@@ -303,6 +393,77 @@ mod tests {
     ) -> Result<http::Response<h2::RecvStream>, h2::Error> {
         let request = Request::builder().method(method).uri(path).body(()).unwrap();
         let (response, _) = sender.send_request(request, true)?;
+        response.await
+    }
+
+    async fn send_body(
+        stream: &mut h2::SendStream<Bytes>,
+        payload: &[u8],
+    ) -> Result<(), h2::Error> {
+        if payload.is_empty() {
+            return send_frame(stream, payload, true).await;
+        }
+
+        let mut offset = 0;
+        while offset < payload.len() {
+            let requested = MAX_DATA_SEGMENT_SIZE.min(payload.len() - offset);
+            let end = offset + requested;
+            send_frame(stream, &payload[offset..end], end == payload.len()).await?;
+            offset = end;
+        }
+        Ok(())
+    }
+
+    async fn send_frame(
+        stream: &mut h2::SendStream<Bytes>,
+        payload: &[u8],
+        end_stream: bool,
+    ) -> Result<(), h2::Error> {
+        if payload.is_empty() {
+            return stream.send_data(Bytes::new(), end_stream);
+        }
+
+        let mut offset = 0;
+        while offset < payload.len() {
+            let requested = payload.len() - offset;
+            stream.reserve_capacity(requested);
+            let capacity = poll_fn(|context| match stream.poll_capacity(context) {
+                Poll::Ready(Some(Ok(capacity))) if capacity > 0 => Poll::Ready(Ok(capacity)),
+                Poll::Ready(Some(Ok(_))) | Poll::Pending => Poll::Pending,
+                Poll::Ready(Some(Err(error))) => Poll::Ready(Err(error)),
+                Poll::Ready(None) => panic!("request stream closed before body completed"),
+            })
+            .await?;
+            let amount = requested.min(capacity as usize);
+            let end = offset + amount;
+            stream.send_data(
+                Bytes::copy_from_slice(&payload[offset..end]),
+                end_stream && end == payload.len(),
+            )?;
+            offset = end;
+        }
+        Ok(())
+    }
+
+    async fn put(
+        sender: &mut client::SendRequest<Bytes>,
+        path: &str,
+        content_type: Option<&str>,
+        content_length: Option<&str>,
+        payload: &[u8],
+    ) -> Result<http::Response<h2::RecvStream>, h2::Error> {
+        let mut builder = Request::builder().method(Method::PUT).uri(path);
+        if let Some(content_type) = content_type {
+            builder = builder.header(header::CONTENT_TYPE, content_type);
+        }
+        if let Some(content_length) = content_length {
+            builder = builder.header(header::CONTENT_LENGTH, content_length);
+        }
+        let request = builder.body(()).unwrap();
+        let (response, mut stream) = sender.send_request(request, payload.is_empty())?;
+        if !payload.is_empty() {
+            send_body(&mut stream, payload).await?;
+        }
         response.await
     }
 
@@ -360,6 +521,298 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn put_creates_an_object_and_get_returns_it_immediately() {
+        let store = sample_store();
+        let mut connection = connection(store.clone(), None).await;
+        let uploaded = b"uploaded payload";
+        let response = put(
+            &mut connection.sender,
+            "/objects/uploaded.bin",
+            Some("application/octet-stream"),
+            None,
+            uploaded,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(response.status(), StatusCode::CREATED);
+        assert_eq!(response.headers()[header::CONTENT_LENGTH], "0");
+        assert!(collect(response.into_body()).await.unwrap().is_empty());
+
+        let response = get(&mut connection.sender, "/objects/uploaded.bin")
+            .await
+            .unwrap();
+        assert_success_headers(&response, "application/octet-stream", uploaded.len());
+        assert_eq!(collect(response.into_body()).await.unwrap(), uploaded);
+        assert_eq!(store.get("uploaded.bin").await.unwrap().contents().as_ref(), uploaded);
+    }
+
+    #[tokio::test]
+    async fn large_put_releases_receive_capacity_until_end_stream() {
+        let store = Store::default();
+        let mut connection = connection(store.clone(), None).await;
+        let payload = (0..180_000)
+            .map(|value| (value % 251) as u8)
+            .collect::<Vec<_>>();
+        let response = put(
+            &mut connection.sender,
+            "/objects/large-upload",
+            Some("application/octet-stream"),
+            None,
+            &payload,
+        )
+        .await
+        .unwrap();
+        assert_eq!(response.status(), StatusCode::CREATED);
+        assert!(collect(response.into_body()).await.unwrap().is_empty());
+
+        let response = get(&mut connection.sender, "/objects/large-upload")
+            .await
+            .unwrap();
+        assert_success_headers(&response, "application/octet-stream", payload.len());
+        assert_eq!(collect(response.into_body()).await.unwrap(), payload);
+    }
+
+    #[tokio::test]
+    async fn put_replaces_payload_and_content_type_together() {
+        let store = sample_store();
+        let mut connection = connection(store.clone(), None).await;
+        let response = put(
+            &mut connection.sender,
+            "/objects/image.jpg",
+            Some("image/png"),
+            Some("9"),
+            b"new image",
+        )
+        .await
+        .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.headers()[header::CONTENT_LENGTH], "0");
+        assert!(collect(response.into_body()).await.unwrap().is_empty());
+
+        let response = get(&mut connection.sender, "/objects/image.jpg")
+            .await
+            .unwrap();
+        assert_success_headers(&response, "image/png", b"new image".len());
+        assert_eq!(collect(response.into_body()).await.unwrap(), b"new image");
+        let object = store.get("image.jpg").await.unwrap();
+        assert_eq!(object.content_type().as_bytes(), b"image/png");
+        assert_eq!(object.contents().as_ref(), b"new image");
+    }
+
+    #[tokio::test]
+    async fn empty_put_body_publishes_an_empty_object() {
+        let mut connection = connection(Store::default(), None).await;
+        let response = put(
+            &mut connection.sender,
+            "/objects/empty",
+            Some("application/octet-stream"),
+            None,
+            b"",
+        )
+        .await
+        .unwrap();
+        assert_eq!(response.status(), StatusCode::CREATED);
+        assert!(collect(response.into_body()).await.unwrap().is_empty());
+
+        let response = get(&mut connection.sender, "/objects/empty")
+            .await
+            .unwrap();
+        assert_success_headers(&response, "application/octet-stream", 0);
+        assert!(response.body().is_end_stream());
+    }
+
+    #[tokio::test]
+    async fn invalid_put_metadata_and_empty_key_return_bad_request_without_mutation() {
+        let store = sample_store();
+        let mut connection = connection(store.clone(), None).await;
+
+        let missing_type = put(
+            &mut connection.sender,
+            "/objects/missing-type",
+            None,
+            None,
+            b"",
+        )
+        .await
+        .unwrap();
+        assert_eq!(missing_type.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(collect(missing_type.into_body()).await.unwrap(), BAD_REQUEST_BODY);
+
+        let empty_type = put(
+            &mut connection.sender,
+            "/objects/empty-type",
+            Some(""),
+            None,
+            b"",
+        )
+        .await
+        .unwrap();
+        assert_eq!(empty_type.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(collect(empty_type.into_body()).await.unwrap(), BAD_REQUEST_BODY);
+
+        let empty_key = put(
+            &mut connection.sender,
+            "/objects/",
+            Some("text/plain"),
+            None,
+            b"",
+        )
+        .await
+        .unwrap();
+        assert_eq!(empty_key.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(collect(empty_key.into_body()).await.unwrap(), BAD_REQUEST_BODY);
+
+        assert_eq!(store.len().await, 2);
+        assert!(store.get("missing-type").await.is_none());
+    }
+
+    #[tokio::test]
+    async fn duplicate_content_type_returns_bad_request_without_mutation() {
+        let store = sample_store();
+        let mut connection = connection(store.clone(), None).await;
+        let mut request = Request::builder()
+            .method(Method::PUT)
+            .uri("/objects/duplicate-type")
+            .body(())
+            .unwrap();
+        request.headers_mut().append(
+            header::CONTENT_TYPE,
+            "text/plain".parse().unwrap(),
+        );
+        request.headers_mut().append(
+            header::CONTENT_TYPE,
+            "application/json".parse().unwrap(),
+        );
+        let (response, _) = connection.sender.send_request(request, true).unwrap();
+        let response = response.await.unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(collect(response.into_body()).await.unwrap(), BAD_REQUEST_BODY);
+        assert_eq!(store.len().await, 2);
+        assert!(store.get("duplicate-type").await.is_none());
+    }
+
+    #[tokio::test]
+    async fn content_length_mismatch_fails_the_stream_without_replacing_object() {
+        let store = sample_store();
+        let mut connection = connection(store.clone(), None).await;
+        let request = Request::builder()
+            .method(Method::PUT)
+            .uri("/objects/image.jpg")
+            .header(header::CONTENT_TYPE, "image/png")
+            .header(header::CONTENT_LENGTH, "50")
+            .body(())
+            .unwrap();
+        let (response, mut stream) = connection.sender.send_request(request, false).unwrap();
+        let send_result = send_body(&mut stream, b"short body").await;
+        drop(stream);
+        let response_result = response.await;
+
+        assert!(send_result.is_err() || response_result.is_err());
+        if let Ok(response) = response_result {
+            assert!(!response.status().is_success());
+        }
+        let original = store.get("image.jpg").await.unwrap();
+        assert_eq!(original.content_type().as_bytes(), b"image/jpeg");
+        assert_eq!(original.contents().as_ref(), IMAGE);
+    }
+
+    #[tokio::test]
+    async fn reset_during_upload_leaves_existing_object_unchanged() {
+        let store = sample_store();
+        let mut connection = connection(store.clone(), None).await;
+        let request = Request::builder()
+            .method(Method::PUT)
+            .uri("/objects/image.jpg")
+            .header(header::CONTENT_TYPE, "image/png")
+            .body(())
+            .unwrap();
+        let (response, mut stream) = connection.sender.send_request(request, false).unwrap();
+        send_frame(&mut stream, b"partial upload", false).await.unwrap();
+        stream.send_reset(h2::Reason::CANCEL);
+        assert!(response.await.is_err());
+
+        let original = store.get("image.jpg").await.unwrap();
+        assert_eq!(original.content_type().as_bytes(), b"image/jpeg");
+        assert_eq!(original.contents().as_ref(), IMAGE);
+    }
+
+    #[tokio::test]
+    async fn get_completes_while_put_body_is_still_in_flight_on_same_connection() {
+        let store = sample_store();
+        let mut connection = connection(store.clone(), None).await;
+        let request = Request::builder()
+            .method(Method::PUT)
+            .uri("/objects/image.jpg")
+            .header(header::CONTENT_TYPE, "image/png")
+            .body(())
+            .unwrap();
+        let (put_response, mut put_stream) = connection.sender.send_request(request, false).unwrap();
+        send_frame(&mut put_stream, b"replacement ", false).await.unwrap();
+
+        let get_response = get(&mut connection.sender, "/objects/image.jpg")
+            .await
+            .unwrap();
+        assert_eq!(collect(get_response.into_body()).await.unwrap(), IMAGE);
+
+        send_frame(&mut put_stream, b"bytes", true).await.unwrap();
+        let put_response = put_response.await.unwrap();
+        assert_eq!(put_response.status(), StatusCode::OK);
+        assert!(collect(put_response.into_body()).await.unwrap().is_empty());
+        let replacement = store.get("image.jpg").await.unwrap();
+        assert_eq!(replacement.content_type().as_bytes(), b"image/png");
+        assert_eq!(replacement.contents().as_ref(), b"replacement bytes");
+    }
+
+    #[tokio::test]
+    async fn concurrent_puts_publish_one_complete_payload_with_matching_metadata() {
+        let store = Store::default();
+        let mut connection = connection(store.clone(), None).await;
+        let first_request = Request::builder()
+            .method(Method::PUT)
+            .uri("/objects/shared")
+            .header(header::CONTENT_TYPE, "text/plain")
+            .body(())
+            .unwrap();
+        let second_request = Request::builder()
+            .method(Method::PUT)
+            .uri("/objects/shared")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(())
+            .unwrap();
+        let (first_response, mut first_stream) = connection.sender.send_request(first_request, false).unwrap();
+        let (second_response, mut second_stream) = connection.sender.send_request(second_request, false).unwrap();
+
+        send_frame(&mut first_stream, b"first-", false).await.unwrap();
+        send_frame(&mut second_stream, b"second-", false).await.unwrap();
+        send_frame(&mut second_stream, b"candidate", true).await.unwrap();
+        send_frame(&mut first_stream, b"candidate", true).await.unwrap();
+
+        let first_response = first_response.await.unwrap();
+        let second_response = second_response.await.unwrap();
+        let created = [first_response.status(), second_response.status()]
+            .into_iter()
+            .filter(|status| *status == StatusCode::CREATED)
+            .count();
+        assert_eq!(created, 1);
+        assert!(
+            (first_response.status() == StatusCode::CREATED
+                && second_response.status() == StatusCode::OK)
+                || (first_response.status() == StatusCode::OK
+                    && second_response.status() == StatusCode::CREATED)
+        );
+        assert!(collect(first_response.into_body()).await.unwrap().is_empty());
+        assert!(collect(second_response.into_body()).await.unwrap().is_empty());
+
+        let final_object = store.get("shared").await.unwrap();
+        let is_first = final_object.contents().as_ref() == b"first-candidate"
+            && final_object.content_type().as_bytes() == b"text/plain";
+        let is_second = final_object.contents().as_ref() == b"second-candidate"
+            && final_object.content_type().as_bytes() == b"application/json";
+        assert!(is_first || is_second);
+    }
+
+    #[tokio::test]
     async fn unsupported_methods_return_method_not_allowed() {
         let mut connection = connection(sample_store(), None).await;
         let response = request(
@@ -371,7 +824,7 @@ mod tests {
         .unwrap();
 
         assert_eq!(response.status(), StatusCode::METHOD_NOT_ALLOWED);
-        assert_eq!(response.headers()[header::ALLOW], "GET");
+        assert_eq!(response.headers()[header::ALLOW], "GET, PUT");
         assert_eq!(
             collect(response.into_body()).await.unwrap(),
             METHOD_NOT_ALLOWED_BODY
@@ -476,4 +929,3 @@ mod tests {
         assert_eq!(collect(video.into_body()).await.unwrap(), VIDEO);
     }
 }
-

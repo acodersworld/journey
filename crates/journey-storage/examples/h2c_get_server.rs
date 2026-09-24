@@ -6,6 +6,7 @@ use std::{
 
 use bytes::Bytes;
 use h2::server;
+use http::HeaderValue;
 use journey_storage::{Service, Key, Object, Store};
 use tokio::{
     net::{TcpListener, TcpStream},
@@ -35,6 +36,14 @@ async fn main() -> Result<(), Box<dyn Error>> {
     println!("journey-storage listening on http://{bound_address}");
     println!("  http://{bound_address}/objects/image.jpg");
     println!("  http://{bound_address}/objects/video.mp4");
+    println!("Upload and download an object with:");
+    println!("  curl --http2-prior-knowledge -X PUT -H 'Content-Type: image/jpeg' --data-binary @crates/journey-storage/examples/assets/image.jpg http://{bound_address}/objects/uploaded.jpg");
+    println!("  curl --http2-prior-knowledge http://{bound_address}/objects/uploaded.jpg --output downloaded.jpg");
+    println!("  cmp crates/journey-storage/examples/assets/image.jpg downloaded.jpg");
+    println!("Replace it with a different type and verify the replacement with:");
+    println!("  curl --http2-prior-knowledge -X PUT -H 'Content-Type: video/mp4' --data-binary @crates/journey-storage/examples/assets/video.mp4 http://{bound_address}/objects/uploaded.jpg");
+    println!("  curl --http2-prior-knowledge -D - http://{bound_address}/objects/uploaded.jpg --output downloaded.mp4");
+    println!("  cmp crates/journey-storage/examples/assets/video.mp4 downloaded.mp4");
 
     let mut connections = JoinSet::new();
     loop {
@@ -67,7 +76,7 @@ fn object(
     let key = Key::new(key).map_err(std::io::Error::other)?;
     Ok(Object::new(
         key,
-        content_type.to_owned(),
+        content_type.parse::<HeaderValue>().map_err(std::io::Error::other)?,
         Bytes::from_static(contents),
     ))
 }

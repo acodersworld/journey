@@ -57,6 +57,11 @@ Implementation begins with the narrower read-only slice in
 It deliberately proves a reusable HTTP/2 `GET` service and h2c development
 host before adding filesystem storage or mutations.
 
+The next protocol slice is defined in
+[In-Memory HTTP/2 PUT Implementation Plan](in-memory-http2-put-implementation-plan.md).
+It adds unconditional create-or-replace PUT behavior and HTTP/2 request-body
+flow control while deliberately retaining process-local in-memory storage.
+
 ### 3.1 Define the interface first
 
 Write an implementation-neutral object-storage interface document before
