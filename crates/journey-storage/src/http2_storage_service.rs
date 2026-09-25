@@ -11,11 +11,12 @@ use http::{
 };
 
 use crate::storage_interface::{
-    ContentType, Key, ObjectInterface, PutContextInterface, StoreInterface,
+    ContentType, Key, ObjectInterface, PutContextInterface, StoreErrorKind, StoreInterface,
 };
 
 const MAX_DATA_SEGMENT_SIZE: usize = 64 * 1024;
 const NOT_FOUND_BODY: &[u8] = b"not found\n";
+const INVALID_KEY_BODY: &[u8] = b"invalid key\n";
 const BAD_REQUEST_BODY: &[u8] = b"bad request\n";
 const INVALID_CONTENT_TYPE: &[u8] = b"invalid content type\n";
 const STORAGE_ERROR_BODY: &[u8] = b"storage error\n";
@@ -149,11 +150,24 @@ impl<S: StoreInterface> Service<S> {
     }
 
     async fn handle_get(&self, request: Request<h2::RecvStream>, mut respond: h2::server::SendResponse<Bytes>) -> Result<(), ServiceError> {
-        let key = Self::get_key(&request);
-        let object = match self.store.get(key).await {
-            Ok(Some(object)) => object,
-            Ok(None) => return send_text_response(respond, StatusCode::NOT_FOUND, None, NOT_FOUND_BODY),
+        let key_text = Self::get_key(&request);
+        let key = match Key::new(key_text) {
+            Ok(key) => key,
+            Err(_) => {
+                return send_text_response(
+                    respond,
+                    StatusCode::BAD_REQUEST,
+                    None,
+                    INVALID_KEY_BODY,
+                );
+            }
+        };
+        let read_object = match self.store.get(&key).await {
+            Ok(read_object) => read_object,
             Err(error) => {
+                if error.kind() == StoreErrorKind::NotFound {
+                    return send_text_response(respond, StatusCode::NOT_FOUND, None, NOT_FOUND_BODY);
+                }
                 eprintln!("storage GET lookup failed for key {key:?}: {error}");
                 return send_text_response(
                     respond,
@@ -164,19 +178,21 @@ impl<S: StoreInterface> Service<S> {
             }
         };
 
+        let metadata = read_object.metadata();
+        let contents = read_object.object().contents();
         let response = Response::builder()
             .version(Version::HTTP_2)
             .status(StatusCode::OK)
-            .header(header::CONTENT_TYPE, object.content_type().as_header_value())
-            .header(header::CONTENT_LENGTH, object.contents().len())
+            .header(header::CONTENT_TYPE, metadata.content_type().as_header_value())
+            .header(header::CONTENT_LENGTH, metadata.payload_length())
             .body(())?;
-        if object.contents().is_empty() {
+        if contents.is_empty() {
             respond.send_response(response, true)?;
             return Ok(());
         }
 
         let mut stream = respond.send_response(response, false)?;
-        send_payload(&mut stream, object.contents()).await
+        send_payload(&mut stream, contents).await
     }
 }
 
@@ -269,9 +285,12 @@ async fn send_payload(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{ContentType, Key, Object, PutContextInterface, Store};
+    use crate::{
+        ContentType, Key, ListPage, ListRequest, Object, ObjectMetadata, PutContextInterface,
+        ReadObject, Store, StoreError,
+    };
     use h2::{client, server};
-    use std::{collections::HashMap, sync::Arc};
+    use std::{collections::HashMap, num::NonZeroUsize, sync::Arc};
     use tokio::{
         io::{duplex, DuplexStream},
         sync::RwLock,
@@ -300,6 +319,19 @@ mod tests {
         .unwrap()
     }
 
+    async fn stored_object(store: &Store, key: &str) -> ReadObject<Object> {
+        store.get(&Key::new(key).unwrap()).await.unwrap()
+    }
+
+    async fn object_count(store: &Store) -> usize {
+        store
+            .list(ListRequest::new("", None, NonZeroUsize::new(1_000).unwrap()))
+            .await
+            .unwrap()
+            .objects()
+            .len()
+    }
+
     const SECRET_STORAGE_ERROR: &str = "secret internal storage detail /private/path";
 
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -317,10 +349,6 @@ mod tests {
     }
 
     impl ObjectInterface for FailureObject {
-        fn content_type(&self) -> &ContentType {
-            &self.content_type
-        }
-
         fn contents(&self) -> &Bytes {
             &self.contents
         }
@@ -333,9 +361,12 @@ mod tests {
     }
 
     impl PutContextInterface for FailurePutContext {
-        async fn append(&mut self, bytes: &Bytes) -> Result<(), String> {
+        async fn append(&mut self, bytes: &Bytes) -> Result<(), StoreError> {
             if self.failure == FailureOperation::Append {
-                return Err(SECRET_STORAGE_ERROR.to_string());
+                return Err(StoreError::new(
+                    StoreErrorKind::Internal,
+                    SECRET_STORAGE_ERROR,
+                ));
             }
 
             self.contents.extend_from_slice(bytes);
@@ -369,28 +400,55 @@ mod tests {
         type Object = FailureObject;
         type PutContext = FailurePutContext;
 
-        async fn get(&self, key: &str) -> Result<Option<Self::Object>, String> {
+        async fn get(&self, key: &Key) -> Result<ReadObject<Self::Object>, StoreError> {
             if self.failure == FailureOperation::Get {
-                return Err(SECRET_STORAGE_ERROR.to_string());
+                return Err(StoreError::new(
+                    StoreErrorKind::Internal,
+                    SECRET_STORAGE_ERROR,
+                ));
             }
 
-            Ok(self.objects.read().await.get(key).cloned())
+            let object = self.objects.read().await.get(key).cloned().ok_or_else(|| {
+                StoreError::new(StoreErrorKind::NotFound, "missing test object")
+            })?;
+            let metadata = ObjectMetadata::new(
+                key.clone(),
+                object.content_type.clone(),
+                object.contents.len() as u64,
+            );
+            Ok(ReadObject::new(metadata, object))
         }
 
-        async fn len(&self) -> usize {
-            self.objects.read().await.len()
+        async fn stat(&self, key: &Key) -> Result<ObjectMetadata, StoreError> {
+            let objects = self.objects.read().await;
+            let object = objects.get(key).ok_or_else(|| {
+                StoreError::new(StoreErrorKind::NotFound, "missing test object")
+            })?;
+            Ok(ObjectMetadata::new(
+                key.clone(),
+                object.content_type.clone(),
+                object.contents.len() as u64,
+            ))
         }
 
-        async fn is_empty(&self) -> bool {
-            self.objects.read().await.is_empty()
+        async fn list(&self, _request: ListRequest) -> Result<ListPage, StoreError> {
+            Ok(ListPage::new(Vec::new(), None))
+        }
+
+        async fn delete(&self, key: &Key) -> Result<(), StoreError> {
+            self.objects.write().await.remove(key);
+            Ok(())
         }
 
         async fn put_context(
             &self,
             content_type: ContentType,
-        ) -> Result<Self::PutContext, String> {
+        ) -> Result<Self::PutContext, StoreError> {
             if self.failure == FailureOperation::PutContext {
-                return Err(SECRET_STORAGE_ERROR.to_string());
+                return Err(StoreError::new(
+                    StoreErrorKind::Internal,
+                    SECRET_STORAGE_ERROR,
+                ));
             }
 
             Ok(FailurePutContext {
@@ -400,9 +458,12 @@ mod tests {
             })
         }
 
-        async fn put(&self, key: &Key, put_context: Self::PutContext) -> Result<(), String> {
+        async fn put(&self, key: &Key, put_context: Self::PutContext) -> Result<(), StoreError> {
             if self.failure == FailureOperation::Commit {
-                return Err(SECRET_STORAGE_ERROR.to_string());
+                return Err(StoreError::new(
+                    StoreErrorKind::Internal,
+                    SECRET_STORAGE_ERROR,
+                ));
             }
 
             self.objects.write().await.insert(
@@ -439,12 +500,17 @@ mod tests {
     async fn catalogue_constructs_and_looks_up_exact_keys() {
         let store = sample_store();
 
-        assert_eq!(store.len().await, 2);
-        assert!(!store.is_empty().await);
-        assert_eq!(store.get("image.jpg").await.unwrap().unwrap().contents(), IMAGE);
-        assert_eq!(store.get("video.mp4").await.unwrap().unwrap().contents(), VIDEO);
-        assert!(store.get("IMAGE.jpg").await.unwrap().is_none());
-        assert!(store.get("missing").await.unwrap().is_none());
+        assert_eq!(object_count(&store).await, 2);
+        assert_eq!(stored_object(&store, "image.jpg").await.object().contents(), IMAGE);
+        assert_eq!(stored_object(&store, "video.mp4").await.object().contents(), VIDEO);
+        assert_eq!(
+            store.get(&Key::new("IMAGE.jpg").unwrap()).await.unwrap_err().kind(),
+            StoreErrorKind::NotFound
+        );
+        assert_eq!(
+            store.get(&Key::new("missing").unwrap()).await.unwrap_err().kind(),
+            StoreErrorKind::NotFound
+        );
     }
 
     #[test]
@@ -458,7 +524,10 @@ mod tests {
             object("same", "image/jpeg", Bytes::new()),
             object("same", "video/mp4", Bytes::new()),
         ];
-        assert_eq!(Store::new(objects).unwrap_err(), "Duplicate key: same");
+        assert_eq!(
+            Store::new(objects).unwrap_err().kind(),
+            StoreErrorKind::InvalidRequest
+        );
     }
 
     #[tokio::test]
@@ -471,7 +540,7 @@ mod tests {
         .unwrap();
 
         assert_eq!(
-            store.get("custom").await.unwrap().unwrap().content_type().as_header_value().as_bytes(),
+            stored_object(&store, "custom").await.metadata().content_type().as_header_value().as_bytes(),
             b"vendor-specific-type"
         );
     }
@@ -481,9 +550,9 @@ mod tests {
         let payload = Bytes::from(vec![7; 32]);
         let original_ptr = payload.as_ptr();
         let store = Store::new([object("payload", "application/octet-stream", payload)]).unwrap();
-        let cloned = store.get("payload").await.unwrap().unwrap();
+        let cloned = stored_object(&store, "payload").await;
 
-        assert_eq!(cloned.contents().as_ptr(), original_ptr);
+        assert_eq!(cloned.object().contents().as_ptr(), original_ptr);
     }
 
     #[tokio::test]
@@ -496,17 +565,17 @@ mod tests {
         first.append(&Bytes::from_static(b"first")).await.unwrap();
         store.put(&key, first).await.unwrap();
         assert_eq!(
-            clone.get("new").await.unwrap().unwrap().contents().as_ref(),
+            stored_object(&clone, "new").await.object().contents().as_ref(),
             b"first"
         );
         let mut second = clone.put_context(validated_content_type("application/json")).await.unwrap();
         second.append(&Bytes::from_static(b"second")).await.unwrap();
         clone.put(&key, second).await.unwrap();
 
-        let replaced = store.get("new").await.unwrap().unwrap();
-        assert_eq!(replaced.contents().as_ref(), b"second");
-        assert_eq!(replaced.content_type().as_header_value().as_bytes(), b"application/json");
-        assert_eq!(store.len().await, 3);
+        let replaced = stored_object(&store, "new").await;
+        assert_eq!(replaced.object().contents().as_ref(), b"second");
+        assert_eq!(replaced.metadata().content_type().as_header_value().as_bytes(), b"application/json");
+        assert_eq!(object_count(&store).await, 3);
     }
 
     struct TestConnection {
@@ -793,17 +862,28 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn unknown_and_empty_keys_return_not_found() {
+    async fn unknown_keys_return_not_found_and_empty_keys_return_invalid_key() {
         let mut connection = connection(sample_store(), None).await;
-        for path in ["/objects/missing", "/objects/"] {
-            let response = get(&mut connection.sender, path).await.unwrap();
-            assert_eq!(response.status(), StatusCode::NOT_FOUND);
-            assert_eq!(
-                response.headers()[header::CONTENT_LENGTH],
-                NOT_FOUND_BODY.len().to_string()
-            );
-            assert_eq!(collect(response.into_body()).await.unwrap(), NOT_FOUND_BODY);
-        }
+        let missing = get(&mut connection.sender, "/objects/missing")
+            .await
+            .unwrap();
+        assert_eq!(missing.status(), StatusCode::NOT_FOUND);
+        assert_eq!(
+            missing.headers()[header::CONTENT_LENGTH],
+            NOT_FOUND_BODY.len().to_string()
+        );
+        assert_eq!(collect(missing.into_body()).await.unwrap(), NOT_FOUND_BODY);
+
+        let invalid_key = get(&mut connection.sender, "/objects/").await.unwrap();
+        assert_eq!(invalid_key.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(
+            invalid_key.headers()[header::CONTENT_LENGTH],
+            INVALID_KEY_BODY.len().to_string()
+        );
+        assert_eq!(
+            collect(invalid_key.into_body()).await.unwrap(),
+            INVALID_KEY_BODY
+        );
     }
 
     #[tokio::test]
@@ -830,7 +910,7 @@ mod tests {
             .unwrap();
         assert_success_headers(&response, "application/octet-stream", uploaded.len());
         assert_eq!(collect(response.into_body()).await.unwrap(), uploaded);
-        assert_eq!(store.get("uploaded.bin").await.unwrap().unwrap().contents().as_ref(), uploaded);
+        assert_eq!(stored_object(&store, "uploaded.bin").await.object().contents().as_ref(), uploaded);
     }
 
     #[tokio::test]
@@ -881,9 +961,9 @@ mod tests {
             .unwrap();
         assert_success_headers(&response, "image/png", b"new image".len());
         assert_eq!(collect(response.into_body()).await.unwrap(), b"new image");
-        let object = store.get("image.jpg").await.unwrap().unwrap();
-        assert_eq!(object.content_type().as_header_value().as_bytes(), b"image/png");
-        assert_eq!(object.contents().as_ref(), b"new image");
+        let object = stored_object(&store, "image.jpg").await;
+        assert_eq!(object.metadata().content_type().as_header_value().as_bytes(), b"image/png");
+        assert_eq!(object.object().contents().as_ref(), b"new image");
     }
 
     #[tokio::test]
@@ -969,8 +1049,11 @@ mod tests {
         assert_eq!(empty_key.status(), StatusCode::BAD_REQUEST);
         assert_eq!(collect(empty_key.into_body()).await.unwrap(), BAD_REQUEST_BODY);
 
-        assert_eq!(store.len().await, 2);
-        assert!(store.get("missing-type").await.unwrap().is_none());
+        assert_eq!(object_count(&store).await, 2);
+        assert_eq!(
+            store.get(&Key::new("missing-type").unwrap()).await.unwrap_err().kind(),
+            StoreErrorKind::NotFound
+        );
     }
 
     #[tokio::test]
@@ -994,8 +1077,11 @@ mod tests {
         let response = response.await.unwrap();
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
         assert_eq!(collect(response.into_body()).await.unwrap(), BAD_REQUEST_BODY);
-        assert_eq!(store.len().await, 2);
-        assert!(store.get("duplicate-type").await.unwrap().is_none());
+        assert_eq!(object_count(&store).await, 2);
+        assert_eq!(
+            store.get(&Key::new("duplicate-type").unwrap()).await.unwrap_err().kind(),
+            StoreErrorKind::NotFound
+        );
     }
 
     #[tokio::test]
@@ -1018,9 +1104,9 @@ mod tests {
         if let Ok(response) = response_result {
             assert!(!response.status().is_success());
         }
-        let original = store.get("image.jpg").await.unwrap().unwrap();
-        assert_eq!(original.content_type().as_header_value().as_bytes(), b"image/jpeg");
-        assert_eq!(original.contents().as_ref(), IMAGE);
+        let original = stored_object(&store, "image.jpg").await;
+        assert_eq!(original.metadata().content_type().as_header_value().as_bytes(), b"image/jpeg");
+        assert_eq!(original.object().contents().as_ref(), IMAGE);
     }
 
     #[tokio::test]
@@ -1038,9 +1124,9 @@ mod tests {
         stream.send_reset(h2::Reason::CANCEL);
         assert!(response.await.is_err());
 
-        let original = store.get("image.jpg").await.unwrap().unwrap();
-        assert_eq!(original.content_type().as_header_value().as_bytes(), b"image/jpeg");
-        assert_eq!(original.contents().as_ref(), IMAGE);
+        let original = stored_object(&store, "image.jpg").await;
+        assert_eq!(original.metadata().content_type().as_header_value().as_bytes(), b"image/jpeg");
+        assert_eq!(original.object().contents().as_ref(), IMAGE);
     }
 
     #[tokio::test]
@@ -1065,9 +1151,9 @@ mod tests {
         let put_response = put_response.await.unwrap();
         assert_eq!(put_response.status(), StatusCode::OK);
         assert!(collect(put_response.into_body()).await.unwrap().is_empty());
-        let replacement = store.get("image.jpg").await.unwrap().unwrap();
-        assert_eq!(replacement.content_type().as_header_value().as_bytes(), b"image/png");
-        assert_eq!(replacement.contents().as_ref(), b"replacement bytes");
+        let replacement = stored_object(&store, "image.jpg").await;
+        assert_eq!(replacement.metadata().content_type().as_header_value().as_bytes(), b"image/png");
+        assert_eq!(replacement.object().contents().as_ref(), b"replacement bytes");
     }
 
     #[tokio::test]
@@ -1101,11 +1187,11 @@ mod tests {
         assert!(collect(first_response.into_body()).await.unwrap().is_empty());
         assert!(collect(second_response.into_body()).await.unwrap().is_empty());
 
-        let final_object = store.get("shared").await.unwrap().unwrap();
-        let is_first = final_object.contents().as_ref() == b"first-candidate"
-            && final_object.content_type().as_header_value().as_bytes() == b"text/plain";
-        let is_second = final_object.contents().as_ref() == b"second-candidate"
-            && final_object.content_type().as_header_value().as_bytes() == b"application/json";
+        let final_object = stored_object(&store, "shared").await;
+        let is_first = final_object.object().contents().as_ref() == b"first-candidate"
+            && final_object.metadata().content_type().as_header_value().as_bytes() == b"text/plain";
+        let is_second = final_object.object().contents().as_ref() == b"second-candidate"
+            && final_object.metadata().content_type().as_header_value().as_bytes() == b"application/json";
         assert!(is_first || is_second);
     }
 

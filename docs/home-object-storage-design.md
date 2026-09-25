@@ -326,23 +326,12 @@ The operational JSON manifest and read-only home-LAN administration page that
 query this index are specified in
 [Home Object Storage Interface](home-object-storage-interface.md).
 
-## 9. Rename and delete semantics
+## 9. Delete semantics
 
-The client owns the decision to rename or delete an object. The home service
-performs only the requested bounded storage operation after validating the
-logical key.
-
-S3 does not provide an atomic object rename; the equivalent is copy followed by
-delete. Journey initially follows the same simple model:
-
-1. Create and durably publish a container with the new logical key and header.
-2. Add the new index entry.
-3. Remove the old index entry and old container when instructed.
-
-This may copy the payload locally for a large object, but it preserves the
-immutable-header and database-rebuild guarantees. Renames are expected to be
-rare compared with reads. A future indirection or alias design may optimize
-renames only if measurement shows that it matters.
+DELETE removes the object at the requested logical key and succeeds if the key
+is already absent. Its result does not reveal whether an object existed before
+the operation. PUT atomically creates or replaces the complete object at its
+key; ordinary PUT does not return a conflict for an existing key.
 
 Deletion computes the server-derived physical filename, opens and validates
 the embedded logical key, removes the published file, and synchronizes the
@@ -375,7 +364,7 @@ Additional protections remain necessary:
 - use exclusive creation for temporary files;
 - reject symlinks and non-regular files when opening published objects;
 - do not follow client-provided redirects or alternate paths; and
-- validate both logical keys involved in copy/rename behavior.
+- validate the requested logical key before deriving its physical filename.
 
 Because only server-derived names are used, Journey does not need to reproduce
 the complex path sanitization of a filesystem-mapped S3 server.
@@ -386,7 +375,8 @@ The implementation must distinguish at least:
 
 - logical key not found;
 - invalid or ambiguous key;
-- existing-key conflict according to the selected write policy;
+- conflict for a future conditional operation; ordinary PUT unconditionally
+  replaces an existing object;
 - malformed or unsupported container header;
 - header or payload integrity failure;
 - insufficient storage space or quota;
@@ -418,8 +408,8 @@ The current direction is:
 - immutable published containers;
 - `.part`, file sync, same-filesystem rename, and directory sync publication;
 - SQLite as a derived, rebuildable index; and
-- client-directed copy/delete behavior for logical renames.
+- unconditional create-or-replace PUT with idempotent DELETE.
 
-Before implementation, the exact binary header fields, key grammar, existing-key
-policy, SQLite schema, late-error responses, and recovery command interface
-still need focused review and tests.
+Before implementation, the exact binary header fields, key grammar, SQLite
+schema, late-error responses, and recovery command interface still need focused
+review and tests.

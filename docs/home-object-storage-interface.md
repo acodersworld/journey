@@ -27,31 +27,33 @@ These surfaces must not accidentally grant one another's authority.
 
 ## 2. Object model
 
-An object has immutable storage metadata:
+The current Rust backend interface exposes the metadata needed by GET, STAT,
+and LIST:
 
 ```text
 logical_key
-object_id
 content_type
 payload_length
+```
+
+`ObjectMetadata` contains the validated key, content type, and payload length.
+GET returns this metadata with the complete payload; STAT and LIST return the
+metadata alone. Payload length always excludes any future Journey container
+header.
+
+A filesystem backend may later add recovery metadata that is not part of the
+current Rust value:
+
+```text
+object_id
 payload_sha256
 created_at
 ```
 
-The client supplies:
-
-- the logical key;
-- the content type;
-- the payload byte stream;
-- optionally, the expected payload length; and
-- optionally, the expected payload SHA-256.
-
-The home service generates the opaque object ID, calculates the actual length
-and SHA-256, and assigns the creation time.
-
+The client supplies the logical key, content type, and payload.
 Application metadata remains outside the home object interface:
 
-| Storage metadata | AWS application metadata |
+| Storage metadata (current or later) | AWS application metadata |
 | --- | --- |
 | Logical object key | Owning post |
 | Content type | Caption and alt text |
@@ -68,86 +70,84 @@ publication state.
 The preliminary private object interface contains:
 
 ```text
-CREATE
-READ
+PUT
+GET
 STAT
 LIST
-COPY
 DELETE
-HEALTH
+HEALTH (future)
 ```
 
-`CREATE`, `READ`, `STAT`, `LIST`, `COPY`, and `DELETE` operate on logical keys.
-`HEALTH` describes service readiness and capability, not individual objects.
+`PUT`, `GET`, `STAT`, `LIST`, and `DELETE` operate on logical keys. `HEALTH`
+remains a future operation that describes service readiness and capability,
+not individual objects.
 
-## 4. Create
+## 4. Put
 
 Conceptually:
 
 ```text
-create(
+put(
     logical_key,
     content_type,
-    expected_length?,
-    expected_sha256?,
     payload_stream
-) -> object_metadata
+) -> success
 ```
 
-### 4.1 Successful creation
+PUT unconditionally creates or replaces the value at the key. It does not
+return metadata; use STAT when authoritative metadata is required.
+
+### 4.1 Successful PUT
 
 A successful result means:
 
 - the complete payload has been consumed;
-- actual length and SHA-256 have been calculated;
-- declared length and SHA-256, when supplied, match;
-- the embedded header and payload have been durably published;
-- the live index contains the object; and
+- the object has been published according to the selected backend's
+  guarantees; and
 - a subsequent operation on the same ready home service can observe it.
 
 The client must not infer success merely because it finished transmitting the
-request body. The home response is the durability acknowledgement.
+request body. The home response acknowledges PUT completion.
 
 ### 4.2 Existing-key behavior
 
-Creation does not implicitly replace an existing object.
+PUT always replaces an existing object atomically with the complete new value.
 
 | Existing state | Result |
 | --- | --- |
-| Key absent | Create and return the new metadata |
-| Key present with identical immutable metadata and payload digest | Idempotent success returning the existing metadata |
-| Key present with different payload or immutable metadata | Conflict |
+| Key absent | Create and succeed |
+| Key present | Replace and succeed |
 
-This makes whole-operation retries safe while preventing accidental overwrite.
-An implementation may reject an obvious conflict before reading the complete
-body. If it must receive the body to establish identity, it still must not
-publish a second conflicting object.
+Conditional creation and replacement are deferred. `Conflict` is reserved for
+those future conditional operations.
 
 ### 4.3 Streaming and cancellation
 
-The home service writes the body incrementally and never collects a complete
-object in memory. It applies backpressure through HTTP/2 receive flow control.
+The eventual filesystem service writes the body incrementally and applies
+backpressure through HTTP/2 receive flow control. The current in-memory GET
+returns complete `Bytes`; streaming filesystem reads are future work.
 
-On cancellation, connection loss, timeout, length failure, digest failure, or
-storage failure:
+On cancellation, connection loss, timeout, or storage failure:
 
 - no final object becomes visible;
 - no index row is committed for the failed object; and
 - the temporary upload is removed immediately or left for conservative stale
   upload cleanup.
 
-## 5. Read
+## 5. Get
 
 Conceptually:
 
 ```text
-read(logical_key, range?) -> object_metadata + payload_stream
+get(logical_key) -> object_metadata + complete_payload
 ```
 
-The returned stream contains only original payload bytes. Physical container
-headers are never returned through the object interface.
+The current Rust interface returns metadata and the complete payload as
+`Bytes`. A future filesystem backend may return a payload reader. Physical
+container headers are never returned through the object interface.
 
-The initial range model supports one of:
+Position/size reads and byte ranges are deferred. When designed, a range model
+may support one of:
 
 ```text
 complete payload
@@ -214,57 +214,29 @@ There is no recursive flag or synthetic directory object initially. A client
 can infer a folder-like view by examining key prefixes and delimiters.
 
 A cursor is valid only for the listing contract and database generation rules
-defined by the eventual wire design. The first implementation need not promise
-a transactionally frozen snapshot across pages while concurrent mutations
-occur. It must not repeat or skip entries in an otherwise unchanged index.
+defined by the eventual wire design. In the current Rust interface it binds
+the prefix and last returned key; using it with another prefix is invalid.
+Continuation starts strictly after that key, even if the cursor key was
+deleted. The first implementation need not promise a transactionally frozen
+snapshot across pages while concurrent mutations occur. It must not repeat or
+skip entries in an otherwise unchanged index.
 
-## 8. Copy and logical rename
-
-Conceptually:
-
-```text
-copy(source_key, destination_key) -> destination_metadata
-```
-
-`COPY` performs a server-local payload copy. It avoids sending a large picture
-or video from home through AWS and back to home.
-
-Initial semantics are:
-
-- the source must exist and pass normal header validation;
-- the destination must not contain a conflicting object;
-- an identical existing destination is an idempotent success;
-- the destination receives a new object ID, creation time, logical key, and
-  embedded header;
-- payload length, content type, payload bytes, and payload SHA-256 are
-  preserved; and
-- failure leaves the source untouched and publishes no partial destination.
-
-Journey does not initially define an atomic rename operation. The client
-implements an S3-like rename as:
-
-```text
-COPY old_key new_key
-DELETE old_key
-```
-
-Both keys may exist between those operations. If deletion fails, retrying it
-is safe.
-
-## 9. Delete
+## 8. Delete
 
 Conceptually:
 
 ```text
-delete(logical_key) -> { removed: boolean }
+delete(logical_key) -> success
 ```
 
 Deletion is client-directed and idempotent:
 
 | Existing state | Result |
 | --- | --- |
-| Key present and durably removed | Success with `removed = true` |
-| Key absent | Success with `removed = false` |
+| Key present | Remove and succeed |
+| Key absent | Succeed |
+
+DELETE deliberately does not reveal whether an object existed.
 
 The client supplies only a logical key. The home service derives and validates
 the physical object; it never removes a client-supplied filesystem path.
@@ -278,7 +250,7 @@ changes.
 The first interface has no automatic retention, reference counting, garbage
 collection, or lifecycle policy. AWS decides when to request deletion.
 
-## 10. Health
+## 9. Health
 
 Conceptually:
 
@@ -302,46 +274,38 @@ available_bytes
 service does not report ready while mandatory startup reconciliation or schema
 migration prevents safe object operations.
 
-## 11. Error categories
+## 10. Error categories
 
-The semantic interface distinguishes at least:
+The current Rust interface exposes these stable storage error categories:
 
 | Category | Meaning |
 | --- | --- |
-| Invalid request | Malformed key, metadata, cursor, range, length, or digest |
-| Not found | Requested source object does not exist |
-| Conflict | A different immutable object already owns the key |
-| Range unsatisfiable | A valid range cannot select bytes from this payload |
-| Corrupt object | Header, filename, file length, or verified payload integrity failed |
-| Capacity rejected | Object size, quota, disk space, concurrency, or another configured limit was exceeded |
-| Cancelled | The caller or connection ended the operation |
-| Temporarily unavailable | Storage or index cannot safely serve the operation now |
-| Internal storage failure | An unexpected filesystem, SQLite, or durability operation failed |
+| Invalid request | A malformed key, cursor, or operation input |
+| Not found | The requested object does not exist |
+| Conflict | Reserved for future conditional operations |
+| Capacity | A configured storage limit was exceeded |
+| Corrupt | Stored data failed validation |
+| Unavailable | Storage cannot safely serve the operation now |
+| Internal | An unexpected storage failure occurred |
 
-The wire protocol will map these categories to bounded HTTP statuses and
-machine-readable response bodies later. Internal paths and sensitive operating
-system error details must not be returned to remote clients.
+HTTP behavior is selected from the category. Internal diagnostic details may
+be logged locally but must not be returned to remote clients. Range-unsatisfiable
+and cancelled categories are deferred until those storage contracts exist.
 
-## 12. Concurrency and consistency
+## 11. Concurrency and consistency
 
 Operations that can change the same logical key are serialized:
 
 ```text
-CREATE(key)
-COPY(_, key)
+PUT(key)
 DELETE(key)
 ```
-
-`COPY(source, destination)` participates in coordination for both keys so that
-the source cannot disappear midway through a successful copy and competing
-destination writes cannot both publish.
 
 Published containers are immutable, so concurrent reads of an existing object
 do not require exclusive access. Global and per-operation limits bound:
 
 - active uploads;
 - active downloads;
-- active copies;
 - open files;
 - HTTP/2 streams;
 - in-memory chunks;
@@ -357,7 +321,7 @@ query index. The service must reconcile an object published just before a crash
 but not yet indexed, and an interrupted deletion whose filesystem and database
 steps did not both complete.
 
-## 13. SQLite live index
+## 12. SQLite live index
 
 SQLite is the operational index for:
 
@@ -378,7 +342,7 @@ the asynchronous runtime's worker threads for unbounded periods.
 The final schema, journaling mode, busy policy, transaction ordering, and
 database task design are deferred implementation decisions.
 
-## 14. JSON manifest
+## 13. JSON manifest
 
 Journey provides a human-readable JSON snapshot of the SQLite index. The
 manifest is useful for inspection, backup checks, migrations, and recovery,
@@ -428,7 +392,7 @@ JSON manifest    -> human-readable point-in-time snapshot
 A single JSON document is sufficient for the anticipated scale. JSON Lines may
 be added later for very large or streaming exports without replacing SQLite.
 
-## 15. Local maintenance interface
+## 14. Local maintenance interface
 
 Recovery and expensive maintenance operations are local administrative
 commands, not remote object operations. The intended command set includes:
@@ -447,7 +411,7 @@ report damage before making destructive changes. Index rebuild should create a
 new database and install it only after successful validation rather than
 modifying a questionable index in place.
 
-## 16. Read-only home-LAN administration page
+## 15. Read-only home-LAN administration page
 
 The home service provides a small server-rendered HTML administration page on
 a separate listener reachable only from the trusted home network.
@@ -475,12 +439,12 @@ Possible internal pages are:
 
 These are illustrative page routes, not the final URL contract.
 
-### 16.1 Initial restrictions
+### 15.1 Initial restrictions
 
 The first page is strictly read-only. It provides:
 
 - no raw SQL input;
-- no object delete, copy, or rename controls;
+- no object mutation controls;
 - no metadata mutation;
 - no index rebuild button;
 - no arbitrary filesystem browser;
@@ -494,7 +458,7 @@ An unrestricted SQL textbox is intentionally excluded. Raw diagnostic SQL, if
 needed during development, is performed locally with standard SQLite tooling
 and direct host access.
 
-### 16.2 Network boundary
+### 15.2 Network boundary
 
 The administration listener is not carried through the AWS-to-home WebSocket,
 not routed by public AWS Nginx, and not exposed on the public Internet.
@@ -521,10 +485,12 @@ The administration handler accesses SQLite through normal application database
 connections. It never copies or parses the live database file behind SQLite's
 locking and transaction mechanisms.
 
-## 17. Interface boundaries
+## 16. Interface boundaries
 
-The private object interface may mutate storage but exposes only the approved
-object operations. It does not expose maintenance commands or the admin page.
+The private object interface may mutate storage but exposes PUT and GET in the
+current HTTP/2 service. STAT, LIST, and DELETE are backend operations without
+HTTP routes in this increment. The interface does not expose maintenance
+commands or the admin page.
 
 The local maintenance interface may perform expensive verification and index
 reconstruction but is not remotely routable.
@@ -535,7 +501,7 @@ not mutate either objects or the index.
 ```text
 AWS gateway
     -> WSS and inner HTTP/2
-    -> CREATE / READ / STAT / LIST / COPY / DELETE / HEALTH
+    -> PUT / GET
 
 home shell
     -> local maintenance commands
@@ -547,17 +513,18 @@ trusted home LAN
 This separation is part of the security design rather than only a deployment
 convenience.
 
-## 18. Deferred decisions
+STAT, LIST, DELETE, and HEALTH remain future HTTP work; HEALTH is also not part
+of the current Rust trait.
+
+## 17. Deferred decisions
 
 The following remain deliberately undecided until implementation planning:
 
 - exact HTTP methods, routes, request headers, and response bodies;
-- exact Rust traits and ownership types;
 - key transport encoding in HTTP paths or fields;
 - SQLite schema and journaling mode;
 - page cursor encoding and mutation behavior across paginated requests;
 - exact object-size, concurrency, timeout, and page-size limits;
-- detailed create conflict optimization when the request body has not arrived;
 - durable deletion implementation and restart reconciliation;
 - authentication configuration for the LAN administration listener; and
 - manifest scheduling and retention.

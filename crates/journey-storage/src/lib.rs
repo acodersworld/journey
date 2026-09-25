@@ -8,6 +8,10 @@ mod storage_interface;
 mod storage_in_memory;
 mod http2_storage_service;
 
-pub use storage_interface::{ContentType, ContentTypeError, Key, ObjectInterface, PutContextInterface, StoreInterface};
-pub use storage_in_memory::{Object, Store};
+pub use storage_interface::{
+    ContentType, ContentTypeError, Key, ListCursor, ListPage, ListRequest, ObjectInterface,
+    ObjectMetadata, PutContextInterface, ReadObject, StoreError, StoreErrorKind,
+    StoreInterface,
+};
+pub use storage_in_memory::{Object, PutContext, Store, StoreConfig};
 pub use http2_storage_service::Service;

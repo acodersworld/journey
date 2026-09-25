@@ -67,6 +67,11 @@ The final review hardening for that refactor is specified in
 It keeps internal storage failures behind bounded public responses and makes
 validated content type a storage-interface invariant.
 
+The next backend-only interface increment is specified in
+[In-Memory Object Management Interface Implementation Plan](in-memory-object-management-interface-implementation-plan.md).
+It adds shared object metadata, STAT, bounded prefix LIST, idempotent DELETE,
+and typed storage errors without adding new HTTP routes.
+
 ### 3.1 Define the interface first
 
 Write an implementation-neutral object-storage interface document before
