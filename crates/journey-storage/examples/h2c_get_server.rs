@@ -6,8 +6,7 @@ use std::{
 
 use bytes::Bytes;
 use h2::server;
-use http::HeaderValue;
-use journey_storage::{Service, Key, Object, Store};
+use journey_storage::{Service, Key, StoreInterface, ObjectInterface, Object, Store};
 use tokio::{
     net::{TcpListener, TcpStream},
     task::JoinSet,
@@ -76,14 +75,14 @@ fn object(
     let key = Key::new(key).map_err(std::io::Error::other)?;
     Ok(Object::new(
         key,
-        content_type.parse::<HeaderValue>().map_err(std::io::Error::other)?,
+        content_type.to_string(),
         Bytes::from_static(contents),
     ))
 }
 
-async fn serve_connection(
+async fn serve_connection<S: StoreInterface + Sync + Send>(
     stream: TcpStream,
-    service: Arc<Service>,
+    service: Arc<Service<S>>,
 ) -> Result<(), Box<dyn Error + Send + Sync>> {
     let mut builder = server::Builder::new();
     builder

@@ -1,5 +1,3 @@
-pub use crate::storage::Store;
-
 use std::{
     fmt,
     future::poll_fn,
@@ -12,22 +10,23 @@ use http::{
     Method, Request, Response, StatusCode, Version,
 };
 
-use crate::storage::{Key, Object, PutOutcome};
+use crate::storage_interface::{StoreInterface, ObjectInterface, Key, PutOutcome};
 
 const MAX_DATA_SEGMENT_SIZE: usize = 64 * 1024;
 const NOT_FOUND_BODY: &[u8] = b"not found\n";
 const BAD_REQUEST_BODY: &[u8] = b"bad request\n";
+const INVALID_CONTENT_TYPE: &[u8] = b"invalid content type\n";
 const METHOD_NOT_ALLOWED_BODY: &[u8] = b"method not allowed\n";
 
 /// Handles one already accepted HTTP/2 request against a shared catalogue.
 #[derive(Clone, Debug)]
-pub struct Service {
-    store: Store,
+pub struct Service<S: StoreInterface> {
+    store: S,
 }
 
-impl Service {
+impl<S: StoreInterface> Service<S> {
     /// Creates a service backed by the supplied mutable catalogue.
-    pub fn new(store: Store) -> Self {
+    pub fn new(store: S) -> Self {
         Self { store }
     }
 
@@ -83,7 +82,16 @@ impl Service {
                 BAD_REQUEST_BODY,
             );
         }
-        let content_type = content_type.clone();
+        let Ok(content_type) = content_type.to_str() else {
+            return send_text_response(
+                respond,
+                StatusCode::BAD_REQUEST,
+                None,
+                INVALID_CONTENT_TYPE,
+            );
+        };
+        let content_type = content_type.to_string();
+
         let mut body = request.into_body();
         let mut contents = Vec::new();
         while let Some(data) = body.data().await {
@@ -93,7 +101,7 @@ impl Service {
             body.flow_control().release_capacity(length)?;
         }
 
-        let object = Object::new(key, content_type, Bytes::from(contents));
+        let object = S::Object::new(key, content_type, Bytes::from(contents));
         let outcome = self.store.put(object).await;
         let status = match outcome {
             PutOutcome::Created => StatusCode::CREATED,
@@ -219,7 +227,7 @@ async fn send_payload(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::storage::{Key, Object, Store};
+    use crate::{Key, Object, Store};
     use h2::{client, server};
     use tokio::{
         io::{duplex, DuplexStream},
@@ -232,7 +240,7 @@ mod tests {
     fn object(key: &str, content_type: &str, contents: Bytes) -> Object {
         Object::new(
             Key::new(key).unwrap(),
-            content_type.parse().unwrap(),
+            content_type.to_string(),
             contents,
         )
     }
@@ -349,7 +357,7 @@ mod tests {
         }
     }
 
-    async fn run_test_server(io: DuplexStream, service: Service) {
+    async fn run_test_server(io: DuplexStream, service: Service<Store>) {
         let mut connection = server::handshake(io).await.unwrap();
         let mut handlers = JoinSet::new();
         loop {

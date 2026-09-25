@@ -4,8 +4,11 @@
 //! objects without upload or catalogue size limits. Restrict access and upload
 //! sizes until explicit bounds are in place; untrusted uploads can exhaust
 //! available memory.
-mod storage;
+mod storage_interface;
+mod storage_in_memory;
 mod http2_storage_service;
 
-pub use storage::{Key, Object, PutOutcome, Store};
+pub use storage_interface::{Key, PutOutcome};
+pub use storage_interface::{ObjectInterface, StoreInterface};
+pub use storage_in_memory::{Object, Store};
 pub use http2_storage_service::Service;
