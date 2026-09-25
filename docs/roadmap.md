@@ -72,6 +72,11 @@ The next backend-only interface increment is specified in
 It adds shared object metadata, STAT, bounded prefix LIST, idempotent DELETE,
 and typed storage errors without adding new HTTP routes.
 
+The implemented HTTP adapter increment is documented in
+[HTTP/2 Object Management Routes Implementation Plan](http2-object-management-routes-implementation-plan.md).
+It exposes metadata-only HEAD, repeatable DELETE, and prefix-paginated JSON LIST
+alongside the existing GET and PUT object routes.
+
 ### 3.1 Define the interface first
 
 Write an implementation-neutral object-storage interface document before

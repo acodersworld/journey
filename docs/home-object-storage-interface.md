@@ -7,8 +7,10 @@ the first Journey home object store
 
 ## 1. Purpose
 
-This document defines what the Journey home object store does without yet
-fixing its HTTP routes, HTTP header mapping, Rust traits, or SQLite schema.
+This document defines what the Journey home object store does independently
+from its physical layout and SQLite schema. The current HTTP/2 route contract
+is specified in the follow-up
+[HTTP/2 Object Management Routes Implementation Plan](http2-object-management-routes-implementation-plan.md).
 
 The interface sits above the physical container and index described in
 [Home Object Storage Design](home-object-storage-design.md). A caller works
@@ -487,10 +489,13 @@ locking and transaction mechanisms.
 
 ## 16. Interface boundaries
 
-The private object interface may mutate storage but exposes PUT and GET in the
-current HTTP/2 service. STAT, LIST, and DELETE are backend operations without
-HTTP routes in this increment. The interface does not expose maintenance
-commands or the admin page.
+The private object interface now exposes `GET`, `HEAD`, `PUT`, and `DELETE` on
+`/objects/<key>`, plus prefix-filtered, paginated `GET /objects` listing.
+HEAD uses STAT metadata, LIST serializes bounded pages as JSON, and DELETE
+returns idempotent `204 No Content`. The detailed validation and response
+contracts are in the HTTP/2 route plan. These routes remain an internal object
+service surface; a public website or gateway must not expose general listing
+or deletion unless a separate product decision authorizes it.
 
 The local maintenance interface may perform expensive verification and index
 reconstruction but is not remotely routable.
@@ -499,9 +504,9 @@ The LAN administration page initially observes SQLite and health state but may
 not mutate either objects or the index.
 
 ```text
-AWS gateway
-    -> WSS and inner HTTP/2
-    -> PUT / GET
+trusted object-service client
+    -> private HTTP/2 object adapter
+    -> GET / HEAD / PUT / DELETE and GET /objects (LIST)
 
 home shell
     -> local maintenance commands
@@ -513,17 +518,14 @@ trusted home LAN
 This separation is part of the security design rather than only a deployment
 convenience.
 
-STAT, LIST, DELETE, and HEALTH remain future HTTP work; HEALTH is also not part
-of the current Rust trait.
+HEALTH remains future HTTP work and is not part of the current Rust trait.
 
 ## 17. Deferred decisions
 
-The following remain deliberately undecided until implementation planning:
+The following remain deliberately undecided for the filesystem/SQLite
+implementation and the separate LAN administration interface:
 
-- exact HTTP methods, routes, request headers, and response bodies;
-- key transport encoding in HTTP paths or fields;
 - SQLite schema and journaling mode;
-- page cursor encoding and mutation behavior across paginated requests;
 - exact object-size, concurrency, timeout, and page-size limits;
 - durable deletion implementation and restart reconciliation;
 - authentication configuration for the LAN administration listener; and

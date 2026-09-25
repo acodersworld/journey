@@ -1,17 +1,22 @@
 use std::{
     fmt,
     future::poll_fn,
+    num::NonZeroUsize,
     task::Poll,
 };
 
+use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use bytes::Bytes;
 use http::{
     header,
     Method, Request, Response, StatusCode, Version,
 };
+use percent_encoding::percent_decode_str;
+use serde::Serialize;
 
 use crate::storage_interface::{
-    ContentType, Key, ObjectInterface, PutContextInterface, StoreErrorKind, StoreInterface,
+    ContentType, Key, ListCursor, ListRequest, ObjectInterface, ObjectMetadata,
+    PutContextInterface, StoreErrorKind, StoreInterface,
 };
 
 const MAX_DATA_SEGMENT_SIZE: usize = 64 * 1024;
@@ -21,6 +26,131 @@ const BAD_REQUEST_BODY: &[u8] = b"bad request\n";
 const INVALID_CONTENT_TYPE: &[u8] = b"invalid content type\n";
 const STORAGE_ERROR_BODY: &[u8] = b"storage error\n";
 const METHOD_NOT_ALLOWED_BODY: &[u8] = b"method not allowed\n";
+const DEFAULT_LIST_LIMIT: usize = 1_000;
+const COLLECTION_ALLOW: &str = "GET";
+const OBJECT_ALLOW: &str = "GET, HEAD, PUT, DELETE";
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum Route {
+    Collection,
+    Object(String),
+    EmptyKey,
+    Unknown,
+}
+
+fn classify_route(path: &str) -> Route {
+    if path == "/objects" {
+        Route::Collection
+    } else if path == "/objects/" {
+        Route::EmptyKey
+    } else if let Some(key) = path.strip_prefix("/objects/") {
+        Route::Object(key.to_owned())
+    } else {
+        Route::Unknown
+    }
+}
+
+#[derive(Debug)]
+struct ListQuery {
+    prefix: String,
+    cursor: Option<Key>,
+    requested_limit: NonZeroUsize,
+}
+
+#[derive(Debug, Serialize)]
+struct ListObjectResponse {
+    key: String,
+    content_type: String,
+    size: u64,
+}
+
+#[derive(Debug, Serialize)]
+struct ListResponse {
+    objects: Vec<ListObjectResponse>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    next_cursor: Option<String>,
+}
+
+fn has_valid_percent_escapes(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] == b'%' {
+            if index + 2 >= bytes.len()
+                || !bytes[index + 1].is_ascii_hexdigit()
+                || !bytes[index + 2].is_ascii_hexdigit()
+            {
+                return false;
+            }
+            index += 3;
+        } else {
+            index += 1;
+        }
+    }
+    true
+}
+
+fn decode_query_value(value: &str) -> Result<String, ()> {
+    if !has_valid_percent_escapes(value) {
+        return Err(());
+    }
+    percent_decode_str(value)
+        .decode_utf8()
+        .map(|value| value.into_owned())
+        .map_err(|_| ())
+}
+
+fn parse_list_query(raw_query: Option<&str>) -> Result<ListQuery, ()> {
+    let mut prefix = None;
+    let mut limit = None;
+    let mut cursor = None;
+
+    for parameter in raw_query.unwrap_or("").split('&') {
+        let (name, raw_value) = parameter.split_once('=').ok_or(())?;
+        if !has_valid_percent_escapes(name) {
+            return Err(());
+        }
+        let value = decode_query_value(raw_value)?;
+        match name {
+            "prefix" if prefix.is_none() => prefix = Some(value),
+            "limit" if limit.is_none() => limit = Some(value),
+            "cursor" if cursor.is_none() => cursor = Some(value),
+            "prefix" | "limit" | "cursor" => return Err(()),
+            _ => return Err(()),
+        }
+    }
+
+    let prefix = prefix.ok_or(())?;
+    let requested_limit = match limit {
+        Some(value) => {
+            if value.is_empty() || !value.bytes().all(|byte| byte.is_ascii_digit()) {
+                return Err(());
+            }
+            let value = value.parse::<usize>().map_err(|_| ())?;
+            NonZeroUsize::new(value).ok_or(())?
+        }
+        None => NonZeroUsize::new(DEFAULT_LIST_LIMIT).unwrap(),
+    };
+
+    let cursor = match cursor {
+        Some(token) => {
+            let decoded = URL_SAFE_NO_PAD.decode(token.as_bytes()).map_err(|_| ())?;
+            let key_text = String::from_utf8(decoded).map_err(|_| ())?;
+            let key = Key::new(&key_text).map_err(|_| ())?;
+            if !key.as_str().starts_with(&prefix) {
+                return Err(());
+            }
+            Some(key)
+        }
+        None => None,
+    };
+
+    Ok(ListQuery {
+        prefix,
+        cursor,
+        requested_limit,
+    })
+}
 
 /// Handles one already accepted HTTP/2 request against a shared catalogue.
 #[derive(Clone, Debug)]
@@ -40,25 +170,78 @@ impl<S: StoreInterface> Service<S> {
         request: Request<h2::RecvStream>,
         respond: h2::server::SendResponse<Bytes>,
     ) -> Result<(), ServiceError> {
-        match *request.method() {
-            Method::PUT => self.handle_put(request, respond).await,
-            Method::GET => self.handle_get(request, respond).await,
-            _ => send_text_response(
+        let route = classify_route(request.uri().path());
+        let method = request.method().clone();
+        match route {
+            Route::Collection => match method {
+                Method::GET => {
+                    let query = match parse_list_query(request.uri().query()) {
+                        Ok(query) => query,
+                        Err(()) => {
+                            return request_error(
+                                respond,
+                                false,
+                                StatusCode::BAD_REQUEST,
+                                None,
+                                BAD_REQUEST_BODY,
+                            );
+                        }
+                    };
+                    self.handle_list(query, respond).await
+                }
+                _ => request_error(
+                    respond,
+                    method == Method::HEAD,
+                    StatusCode::METHOD_NOT_ALLOWED,
+                    Some(COLLECTION_ALLOW),
+                    METHOD_NOT_ALLOWED_BODY,
+                ),
+            },
+            Route::Object(key) => match method {
+                Method::GET => self.handle_get(&key, respond).await,
+                Method::HEAD => self.handle_head(&key, respond).await,
+                Method::PUT => self.handle_put(request, &key, respond).await,
+                Method::DELETE => self.handle_delete(&key, respond).await,
+                _ => request_error(
+                    respond,
+                    false,
+                    StatusCode::METHOD_NOT_ALLOWED,
+                    Some(OBJECT_ALLOW),
+                    METHOD_NOT_ALLOWED_BODY,
+                ),
+            },
+            Route::EmptyKey => match method {
+                Method::GET => self.handle_get("", respond).await,
+                Method::HEAD => {
+                    send_empty_response(respond, StatusCode::BAD_REQUEST, None, None, None)
+                }
+                Method::PUT => self.handle_put(request, "", respond).await,
+                Method::DELETE => self.handle_delete("", respond).await,
+                _ => request_error(
+                    respond,
+                    false,
+                    StatusCode::BAD_REQUEST,
+                    None,
+                    INVALID_KEY_BODY,
+                ),
+            },
+            Route::Unknown => request_error(
                 respond,
-                StatusCode::METHOD_NOT_ALLOWED,
-                Some("GET, PUT"),
-                METHOD_NOT_ALLOWED_BODY,
-            )
+                method == Method::HEAD,
+                StatusCode::NOT_FOUND,
+                None,
+                NOT_FOUND_BODY,
+            ),
         }
     }
 
-    fn get_key(request: &Request<h2::RecvStream>) -> &str {
-        let path = request.uri().path();
-        path.strip_prefix("/objects/").unwrap_or("")
-    }
-
-    async fn handle_put(&self, request: Request<h2::RecvStream>, mut respond: h2::server::SendResponse<Bytes>) -> Result<(), ServiceError> {
-        let key = match Key::new(Self::get_key(&request)) {
+    async fn handle_put(
+        &self,
+        request: Request<h2::RecvStream>,
+        key_text: &str,
+        mut respond: h2::server::SendResponse<Bytes>,
+    ) -> Result<(), ServiceError> {
+        let key = match Key::new(key_text) {
             Ok(key) => key,
             Err(_) => {
                 return send_text_response(
@@ -149,8 +332,11 @@ impl<S: StoreInterface> Service<S> {
         Ok(())
     }
 
-    async fn handle_get(&self, request: Request<h2::RecvStream>, mut respond: h2::server::SendResponse<Bytes>) -> Result<(), ServiceError> {
-        let key_text = Self::get_key(&request);
+    async fn handle_get(
+        &self,
+        key_text: &str,
+        mut respond: h2::server::SendResponse<Bytes>,
+    ) -> Result<(), ServiceError> {
         let key = match Key::new(key_text) {
             Ok(key) => key,
             Err(_) => {
@@ -193,6 +379,140 @@ impl<S: StoreInterface> Service<S> {
 
         let mut stream = respond.send_response(response, false)?;
         send_payload(&mut stream, contents).await
+    }
+
+    async fn handle_head(
+        &self,
+        key_text: &str,
+        respond: h2::server::SendResponse<Bytes>,
+    ) -> Result<(), ServiceError> {
+        let key = match Key::new(key_text) {
+            Ok(key) => key,
+            Err(_) => {
+                return send_empty_response(respond, StatusCode::BAD_REQUEST, None, None, None);
+            }
+        };
+        let metadata = match self.store.stat(&key).await {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == StoreErrorKind::NotFound => {
+                return send_empty_response(respond, StatusCode::NOT_FOUND, None, None, None);
+            }
+            Err(error) => {
+                eprintln!("storage HEAD lookup failed for key {key:?}: {error}");
+                return send_empty_response(
+                    respond,
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    None,
+                    None,
+                    None,
+                );
+            }
+        };
+
+        send_empty_response(
+            respond,
+            StatusCode::OK,
+            None,
+            Some(metadata.content_type().as_header_value()),
+            Some(metadata.payload_length()),
+        )
+    }
+
+    async fn handle_delete(
+        &self,
+        key_text: &str,
+        respond: h2::server::SendResponse<Bytes>,
+    ) -> Result<(), ServiceError> {
+        let key = match Key::new(key_text) {
+            Ok(key) => key,
+            Err(_) => {
+                return send_text_response(
+                    respond,
+                    StatusCode::BAD_REQUEST,
+                    None,
+                    INVALID_KEY_BODY,
+                );
+            }
+        };
+        if let Err(error) = self.store.delete(&key).await {
+            eprintln!("storage DELETE failed for key {key:?}: {error}");
+            return send_text_response(
+                respond,
+                StatusCode::INTERNAL_SERVER_ERROR,
+                None,
+                STORAGE_ERROR_BODY,
+            );
+        }
+        send_empty_response(respond, StatusCode::NO_CONTENT, None, None, None)
+    }
+
+    async fn handle_list(
+        &self,
+        query: ListQuery,
+        respond: h2::server::SendResponse<Bytes>,
+    ) -> Result<(), ServiceError> {
+        let cursor = query
+            .cursor
+            .map(|last_key| ListCursor::new(query.prefix.clone(), last_key));
+        let request = ListRequest::new(query.prefix, cursor, query.requested_limit);
+        let page = match self.store.list(request).await {
+            Ok(page) => page,
+            Err(error) => {
+                eprintln!("storage LIST failed: {error}");
+                return send_text_response(
+                    respond,
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    None,
+                    STORAGE_ERROR_BODY,
+                );
+            }
+        };
+        let (objects, next_cursor) = page.into_parts();
+        let objects = objects
+            .into_iter()
+            .map(|metadata: ObjectMetadata| {
+                let content_type = metadata
+                    .content_type()
+                    .as_header_value()
+                    .to_str()
+                    .map_err(|error| error.to_string())?;
+                Ok(ListObjectResponse {
+                    key: metadata.key().as_str().to_owned(),
+                    content_type: content_type.to_owned(),
+                    size: metadata.payload_length(),
+                })
+            })
+            .collect::<Result<Vec<_>, String>>();
+        let objects = match objects {
+            Ok(objects) => objects,
+            Err(error) => {
+                eprintln!("storage LIST returned invalid content type metadata: {error}");
+                return send_text_response(
+                    respond,
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    None,
+                    STORAGE_ERROR_BODY,
+                );
+            }
+        };
+        let response = ListResponse {
+            objects,
+            next_cursor: next_cursor
+                .map(|cursor| URL_SAFE_NO_PAD.encode(cursor.last_key().as_str())),
+        };
+        let payload = match serde_json::to_vec(&response) {
+            Ok(payload) => Bytes::from(payload),
+            Err(error) => {
+                eprintln!("HTTP LIST response serialization failed: {error}");
+                return send_text_response(
+                    respond,
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    None,
+                    STORAGE_ERROR_BODY,
+                );
+            }
+        };
+        send_json_response(respond, payload).await
     }
 }
 
@@ -237,6 +557,58 @@ impl From<http::Error> for ServiceError {
     fn from(error: http::Error) -> Self {
         Self::Http(error)
     }
+}
+
+fn request_error(
+    respond: h2::server::SendResponse<Bytes>,
+    is_head: bool,
+    status: StatusCode,
+    allow: Option<&'static str>,
+    body: &'static [u8],
+) -> Result<(), ServiceError> {
+    if is_head {
+        send_empty_response(respond, status, allow, None, None)
+    } else {
+        send_text_response(respond, status, allow, body)
+    }
+}
+
+fn send_empty_response(
+    mut respond: h2::server::SendResponse<Bytes>,
+    status: StatusCode,
+    allow: Option<&'static str>,
+    content_type: Option<&http::HeaderValue>,
+    content_length: Option<u64>,
+) -> Result<(), ServiceError> {
+    let mut builder = Response::builder()
+        .version(Version::HTTP_2)
+        .status(status);
+    if let Some(allow) = allow {
+        builder = builder.header(header::ALLOW, allow);
+    }
+    if let Some(content_type) = content_type {
+        builder = builder.header(header::CONTENT_TYPE, content_type);
+    }
+    if let Some(content_length) = content_length {
+        builder = builder.header(header::CONTENT_LENGTH, content_length);
+    }
+    let response = builder.body(())?;
+    respond.send_response(response, true)?;
+    Ok(())
+}
+
+async fn send_json_response(
+    mut respond: h2::server::SendResponse<Bytes>,
+    payload: Bytes,
+) -> Result<(), ServiceError> {
+    let response = Response::builder()
+        .version(Version::HTTP_2)
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, "application/json")
+        .header(header::CONTENT_LENGTH, payload.len())
+        .body(())?;
+    let mut stream = respond.send_response(response, false)?;
+    send_payload(&mut stream, &payload).await
 }
 
 fn send_text_response(
@@ -340,6 +712,9 @@ mod tests {
         Append,
         Commit,
         Get,
+        Stat,
+        List,
+        Delete,
     }
 
     #[derive(Clone, Debug)]
@@ -420,6 +795,12 @@ mod tests {
         }
 
         async fn stat(&self, key: &Key) -> Result<ObjectMetadata, StoreError> {
+            if self.failure == FailureOperation::Stat {
+                return Err(StoreError::new(
+                    StoreErrorKind::Internal,
+                    SECRET_STORAGE_ERROR,
+                ));
+            }
             let objects = self.objects.read().await;
             let object = objects.get(key).ok_or_else(|| {
                 StoreError::new(StoreErrorKind::NotFound, "missing test object")
@@ -432,10 +813,22 @@ mod tests {
         }
 
         async fn list(&self, _request: ListRequest) -> Result<ListPage, StoreError> {
+            if self.failure == FailureOperation::List {
+                return Err(StoreError::new(
+                    StoreErrorKind::Internal,
+                    SECRET_STORAGE_ERROR,
+                ));
+            }
             Ok(ListPage::new(Vec::new(), None))
         }
 
         async fn delete(&self, key: &Key) -> Result<(), StoreError> {
+            if self.failure == FailureOperation::Delete {
+                return Err(StoreError::new(
+                    StoreErrorKind::Internal,
+                    SECRET_STORAGE_ERROR,
+                ));
+            }
             self.objects.write().await.remove(key);
             Ok(())
         }
@@ -494,6 +887,69 @@ mod tests {
         assert!(!body
             .windows(SECRET_STORAGE_ERROR.len())
             .any(|window| window == SECRET_STORAGE_ERROR.as_bytes()));
+    }
+
+    async fn assert_empty_response(response: http::Response<h2::RecvStream>, status: StatusCode) {
+        assert_eq!(response.status(), status);
+        assert!(response.body().is_end_stream());
+        assert!(collect(response.into_body()).await.unwrap().is_empty());
+    }
+
+    #[test]
+    fn route_classification_uses_the_exact_collection_path() {
+        assert_eq!(classify_route("/objects"), Route::Collection);
+        assert_eq!(classify_route("/objects/"), Route::EmptyKey);
+        assert_eq!(classify_route("/objects/a/b"), Route::Object("a/b".to_owned()));
+        assert_eq!(classify_route("/other"), Route::Unknown);
+    }
+
+    #[test]
+    fn list_query_decodes_values_once_and_keeps_plus_literal() {
+        let query = parse_list_query(Some("prefix=photos%2Fsummer+trip%20%2B%25")).unwrap();
+        assert_eq!(query.prefix, "photos/summer+trip +%");
+        assert_eq!(query.requested_limit.get(), DEFAULT_LIST_LIMIT);
+        assert!(query.cursor.is_none());
+    }
+
+    #[test]
+    fn list_query_rejects_invalid_and_ambiguous_parameters() {
+        let valid_cursor = URL_SAFE_NO_PAD.encode("photos/a.jpg");
+        let invalid_utf8_cursor = URL_SAFE_NO_PAD.encode([0xff]);
+        let cases = [
+            None,
+            Some(""),
+            Some("limit=1"),
+            Some("prefix=a&prefix=b"),
+            Some("prefix=a&limit=1&limit=2"),
+            Some("prefix=a&cursor=x&cursor=y"),
+            Some("prefix=a&other=b"),
+            Some("prefix=%"),
+            Some("prefix=%2"),
+            Some("prefix=%GG"),
+            Some("prefix=%FF"),
+            Some("prefix=a&limit=0"),
+            Some("prefix=a&limit=-1"),
+            Some("prefix=a&limit=+1"),
+            Some("prefix=a&limit=one"),
+            Some("prefix=a&limit=184467440737095516160000"),
+            Some("prefix=a&cursor=YWJj="),
+            Some("prefix=a&cursor=ab+c"),
+            Some("prefix=a&cursor=ab/c"),
+            Some("prefix=a&cursor=%%%"),
+        ];
+        for query in cases {
+            assert!(parse_list_query(query).is_err(), "accepted {query:?}");
+        }
+        assert!(parse_list_query(Some("prefix=a&cursor=")).is_err());
+        assert!(
+            parse_list_query(Some(&format!("prefix=a&cursor={invalid_utf8_cursor}"))).is_err()
+        );
+        assert!(
+            parse_list_query(Some(&format!("prefix=photos/&cursor={valid_cursor}"))).is_ok()
+        );
+        assert!(
+            parse_list_query(Some(&format!("prefix=videos/&cursor={valid_cursor}"))).is_err()
+        );
     }
 
     #[tokio::test]
@@ -862,6 +1318,218 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn head_uses_stat_and_returns_metadata_without_a_body() {
+        let store = Store::new([
+            object("image.jpg", "image/jpeg", Bytes::from_static(IMAGE)),
+            object("empty", "application/octet-stream", Bytes::new()),
+        ])
+        .unwrap();
+        let mut connection = connection(store, None).await;
+
+        let response = request(&mut connection.sender, Method::HEAD, "/objects/image.jpg")
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.headers()[header::CONTENT_TYPE], "image/jpeg");
+        assert_eq!(response.headers()[header::CONTENT_LENGTH], IMAGE.len().to_string());
+        assert!(response.body().is_end_stream());
+        assert!(collect(response.into_body()).await.unwrap().is_empty());
+
+        let response = request(&mut connection.sender, Method::HEAD, "/objects/empty")
+            .await
+            .unwrap();
+        assert_eq!(response.headers()[header::CONTENT_LENGTH], "0");
+        assert_empty_response(response, StatusCode::OK).await;
+
+        let response = request(&mut connection.sender, Method::HEAD, "/objects/missing")
+            .await
+            .unwrap();
+        assert!(!response.headers().contains_key(header::CONTENT_TYPE));
+        assert!(!response.headers().contains_key(header::CONTENT_LENGTH));
+        assert_empty_response(response, StatusCode::NOT_FOUND).await;
+
+        let response = request(&mut connection.sender, Method::HEAD, "/objects/")
+            .await
+            .unwrap();
+        assert!(!response.headers().contains_key(header::CONTENT_TYPE));
+        assert!(!response.headers().contains_key(header::CONTENT_LENGTH));
+        assert_empty_response(response, StatusCode::BAD_REQUEST).await;
+    }
+
+    #[tokio::test]
+    async fn head_does_not_call_get_and_redacts_stat_failures() {
+        let store = FailureStore::with_existing_object(FailureOperation::Get);
+        let mut get_failure_connection = connection(store, None).await;
+        let response = request(&mut get_failure_connection.sender, Method::HEAD, "/objects/target")
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.headers()[header::CONTENT_TYPE], "image/jpeg");
+        assert_eq!(response.headers()[header::CONTENT_LENGTH], "15");
+        assert_empty_response(response, StatusCode::OK).await;
+
+        let store = FailureStore::with_existing_object(FailureOperation::Stat);
+        let mut connection = connection(store, None).await;
+        let response = request(&mut connection.sender, Method::HEAD, "/objects/target")
+            .await
+            .unwrap();
+        assert!(!response.headers().contains_key(header::CONTENT_LENGTH));
+        assert_empty_response(response, StatusCode::INTERNAL_SERVER_ERROR).await;
+    }
+
+    #[tokio::test]
+    async fn delete_is_idempotent_and_returns_no_content_without_length() {
+        let store = sample_store();
+        let mut connection = connection(store.clone(), None).await;
+
+        let response = request(&mut connection.sender, Method::DELETE, "/objects/image.jpg")
+            .await
+            .unwrap();
+        assert!(!response.headers().contains_key(header::CONTENT_LENGTH));
+        assert_empty_response(response, StatusCode::NO_CONTENT).await;
+        assert_eq!(
+            get(&mut connection.sender, "/objects/image.jpg")
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::NOT_FOUND
+        );
+
+        for _ in 0..2 {
+            let response = request(&mut connection.sender, Method::DELETE, "/objects/image.jpg")
+                .await
+                .unwrap();
+            assert!(!response.headers().contains_key(header::CONTENT_LENGTH));
+            assert_empty_response(response, StatusCode::NO_CONTENT).await;
+        }
+
+        let response = request(&mut connection.sender, Method::DELETE, "/objects/")
+            .await
+            .unwrap();
+        assert_eq!(collect(response.into_body()).await.unwrap(), INVALID_KEY_BODY);
+    }
+
+    #[tokio::test]
+    async fn delete_failure_is_bounded_and_preserves_the_object() {
+        let store = FailureStore::with_existing_object(FailureOperation::Delete);
+        let before = store.objects.read().await.get("target").unwrap().clone();
+        let mut connection = connection(store.clone(), None).await;
+        let response = request(&mut connection.sender, Method::DELETE, "/objects/target")
+            .await
+            .unwrap();
+        assert_storage_error_response(response).await;
+        let after = store.objects.read().await.get("target").unwrap().clone();
+        assert_eq!(after.contents, before.contents);
+        assert_eq!(after.content_type, before.content_type);
+    }
+
+    #[tokio::test]
+    async fn list_returns_json_pages_and_continues_after_cursor_key_deletion() {
+        let store = Store::new([
+            object("photos/a.jpg", "image/jpeg", Bytes::from_static(b"a")),
+            object("photos/b plus +.jpg", "image/jpeg", Bytes::from_static(b"bb")),
+            object("photos/éété.jpg", "image/jpeg", Bytes::from_static(b"ccc")),
+            object("videos/c.mp4", "video/mp4", Bytes::from_static(b"dddd")),
+        ])
+        .unwrap();
+        let mut connection = connection(store.clone(), None).await;
+
+        let first = get(&mut connection.sender, "/objects?prefix=photos%2F&limit=1")
+            .await
+            .unwrap();
+        assert_eq!(first.status(), StatusCode::OK);
+        assert_eq!(first.headers()[header::CONTENT_TYPE], "application/json");
+        let first_length = first.headers()[header::CONTENT_LENGTH].clone();
+        let first_body = collect(first.into_body()).await.unwrap();
+        let first_json: serde_json::Value = serde_json::from_slice(&first_body).unwrap();
+        assert_eq!(first_json["objects"][0]["key"], "photos/a.jpg");
+        assert_eq!(first_json["objects"][0]["size"], 1);
+        let cursor = first_json["next_cursor"].as_str().unwrap().to_owned();
+        assert_eq!(
+            first_length,
+            first_body.len().to_string()
+        );
+
+        store.delete(&Key::new("photos/a.jpg").unwrap()).await.unwrap();
+        let second_path = format!("/objects?prefix=photos%2F&limit=1&cursor={cursor}");
+        let second = get(&mut connection.sender, &second_path).await.unwrap();
+        let second_body = collect(second.into_body()).await.unwrap();
+        let second_json: serde_json::Value = serde_json::from_slice(&second_body).unwrap();
+        assert_eq!(second_json["objects"][0]["key"], "photos/b plus +.jpg");
+        let second_cursor = second_json["next_cursor"].as_str().unwrap().to_owned();
+
+        let third_path = format!("/objects?prefix=photos%2F&limit=1&cursor={second_cursor}");
+        let third = get(&mut connection.sender, &third_path).await.unwrap();
+        let third_body = collect(third.into_body()).await.unwrap();
+        let third_json: serde_json::Value = serde_json::from_slice(&third_body).unwrap();
+        assert_eq!(third_json["objects"][0]["key"], "photos/éété.jpg");
+        assert!(third_json.get("next_cursor").is_none());
+
+        let empty = get(&mut connection.sender, "/objects?prefix=absent%2F")
+            .await
+            .unwrap();
+        let empty_json: serde_json::Value = serde_json::from_slice(
+            &collect(empty.into_body()).await.unwrap(),
+        )
+        .unwrap();
+        assert_eq!(empty_json, serde_json::json!({"objects": []}));
+
+        let all = get(&mut connection.sender, "/objects?prefix=")
+            .await
+            .unwrap();
+        let all_json: serde_json::Value = serde_json::from_slice(
+            &collect(all.into_body()).await.unwrap(),
+        )
+        .unwrap();
+        assert_eq!(all_json["objects"].as_array().unwrap().len(), 3);
+    }
+
+    #[tokio::test]
+    async fn list_storage_failure_is_bounded_and_redacted() {
+        let store = FailureStore::with_existing_object(FailureOperation::List);
+        let mut connection = connection(store, None).await;
+        let response = get(&mut connection.sender, "/objects?prefix=")
+            .await
+            .unwrap();
+        assert_storage_error_response(response).await;
+    }
+
+    #[tokio::test]
+    async fn routing_errors_use_resource_specific_allow_and_head_is_bodyless() {
+        let mut connection = connection(sample_store(), None).await;
+        let collection = request(&mut connection.sender, Method::POST, "/objects")
+            .await
+            .unwrap();
+        assert_eq!(collection.status(), StatusCode::METHOD_NOT_ALLOWED);
+        assert_eq!(collection.headers()[header::ALLOW], "GET");
+        assert_eq!(collect(collection.into_body()).await.unwrap(), METHOD_NOT_ALLOWED_BODY);
+
+        let object = request(&mut connection.sender, Method::POST, "/objects/image.jpg")
+            .await
+            .unwrap();
+        assert_eq!(object.status(), StatusCode::METHOD_NOT_ALLOWED);
+        assert_eq!(object.headers()[header::ALLOW], "GET, HEAD, PUT, DELETE");
+        assert_eq!(collect(object.into_body()).await.unwrap(), METHOD_NOT_ALLOWED_BODY);
+
+        let collection_head = request(&mut connection.sender, Method::HEAD, "/objects")
+            .await
+            .unwrap();
+        assert_eq!(collection_head.headers()[header::ALLOW], "GET");
+        assert_empty_response(collection_head, StatusCode::METHOD_NOT_ALLOWED).await;
+
+        let object_head = request(&mut connection.sender, Method::HEAD, "/elsewhere")
+            .await
+            .unwrap();
+        assert_empty_response(object_head, StatusCode::NOT_FOUND).await;
+
+        let unknown = get(&mut connection.sender, "/elsewhere")
+            .await
+            .unwrap();
+        assert_eq!(unknown.status(), StatusCode::NOT_FOUND);
+        assert_eq!(collect(unknown.into_body()).await.unwrap(), NOT_FOUND_BODY);
+    }
+
+    #[tokio::test]
     async fn unknown_keys_return_not_found_and_empty_keys_return_invalid_key() {
         let mut connection = connection(sample_store(), None).await;
         let missing = get(&mut connection.sender, "/objects/missing")
@@ -1207,7 +1875,7 @@ mod tests {
         .unwrap();
 
         assert_eq!(response.status(), StatusCode::METHOD_NOT_ALLOWED);
-        assert_eq!(response.headers()[header::ALLOW], "GET, PUT");
+        assert_eq!(response.headers()[header::ALLOW], OBJECT_ALLOW);
         assert_eq!(
             collect(response.into_body()).await.unwrap(),
             METHOD_NOT_ALLOWED_BODY
@@ -1310,5 +1978,85 @@ mod tests {
         let video = video_future.await.unwrap();
         assert_eq!(collect(image.into_body()).await.unwrap(), IMAGE);
         assert_eq!(collect(video.into_body()).await.unwrap(), VIDEO);
+    }
+
+    #[tokio::test]
+    async fn management_and_payload_streams_share_one_connection() {
+        let mut connection = connection(sample_store(), None).await;
+        let (get_future, _) = connection
+            .sender
+            .send_request(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri("/objects/image.jpg")
+                    .body(())
+                    .unwrap(),
+                true,
+            )
+            .unwrap();
+        let (head_future, _) = connection
+            .sender
+            .send_request(
+                Request::builder()
+                    .method(Method::HEAD)
+                    .uri("/objects/image.jpg")
+                    .body(())
+                    .unwrap(),
+                true,
+            )
+            .unwrap();
+        let (list_future, _) = connection
+            .sender
+            .send_request(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri("/objects?prefix=")
+                    .body(())
+                    .unwrap(),
+                true,
+            )
+            .unwrap();
+        let (delete_future, _) = connection
+            .sender
+            .send_request(
+                Request::builder()
+                    .method(Method::DELETE)
+                    .uri("/objects/video.mp4")
+                    .body(())
+                    .unwrap(),
+                true,
+            )
+            .unwrap();
+        let put_response = put(
+            &mut connection.sender,
+            "/objects/new.txt",
+            Some("text/plain"),
+            None,
+            b"new object",
+        )
+        .await
+        .unwrap();
+
+        let get_response = get_future.await.unwrap();
+        assert_eq!(get_response.status(), StatusCode::OK);
+        assert_eq!(collect(get_response.into_body()).await.unwrap(), IMAGE);
+
+        let head_response = head_future.await.unwrap();
+        assert_eq!(head_response.status(), StatusCode::OK);
+        assert_eq!(head_response.headers()[header::CONTENT_TYPE], "image/jpeg");
+        assert_empty_response(head_response, StatusCode::OK).await;
+
+        let list_response = list_future.await.unwrap();
+        assert_eq!(list_response.status(), StatusCode::OK);
+        let list_json: serde_json::Value = serde_json::from_slice(
+            &collect(list_response.into_body()).await.unwrap(),
+        )
+        .unwrap();
+        assert!(list_json["objects"].is_array());
+
+        assert_eq!(put_response.status(), StatusCode::OK);
+        assert!(collect(put_response.into_body()).await.unwrap().is_empty());
+        let delete_response = delete_future.await.unwrap();
+        assert_empty_response(delete_response, StatusCode::NO_CONTENT).await;
     }
 }

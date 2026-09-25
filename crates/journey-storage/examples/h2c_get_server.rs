@@ -36,6 +36,10 @@ async fn main() -> Result<(), Box<dyn Error>> {
     println!("journey-storage listening on http://{bound_address}");
     println!("  http://{bound_address}/objects/image.jpg");
     println!("  http://{bound_address}/objects/video.mp4");
+    println!("List stored objects:");
+    println!("  curl --http2-prior-knowledge --get --data-urlencode 'prefix=' http://{bound_address}/objects");
+    println!("Inspect object metadata:");
+    println!("  curl --http2-prior-knowledge --head http://{bound_address}/objects/image.jpg");
     println!("Upload and download an object with:");
     println!("  curl --http2-prior-knowledge -X PUT -H 'Content-Type: image/jpeg' --data-binary @crates/journey-storage/examples/assets/image.jpg http://{bound_address}/objects/uploaded.jpg");
     println!("  curl --http2-prior-knowledge http://{bound_address}/objects/uploaded.jpg --output downloaded.jpg");
@@ -44,6 +48,8 @@ async fn main() -> Result<(), Box<dyn Error>> {
     println!("  curl --http2-prior-knowledge -X PUT -H 'Content-Type: video/mp4' --data-binary @crates/journey-storage/examples/assets/video.mp4 http://{bound_address}/objects/uploaded.jpg");
     println!("  curl --http2-prior-knowledge -D - http://{bound_address}/objects/uploaded.jpg --output downloaded.mp4");
     println!("  cmp crates/journey-storage/examples/assets/video.mp4 downloaded.mp4");
+    println!("Delete it with:");
+    println!("  curl --http2-prior-knowledge -X DELETE http://{bound_address}/objects/uploaded.jpg");
 
     let mut connections = JoinSet::new();
     loop {

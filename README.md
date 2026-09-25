@@ -36,6 +36,13 @@ Run the h2c example from the workspace root:
 cargo run -p journey-storage --example h2c_get_server
 ```
 
+The service exposes `GET`, `HEAD`, `PUT`, and `DELETE` on `/objects/<key>`,
+plus `GET /objects?prefix=<prefix>&limit=<n>&cursor=<token>` for listing. LIST
+requires `prefix` (use `prefix=` for all keys); it returns lexicographically
+ordered JSON pages and an unpadded Base64URL continuation token. Repeat the
+same prefix when following a token. Listing is not a snapshot, so concurrent
+inserts and deletes can affect later pages.
+
 In another terminal, upload the included image, download it, and compare the
 bytes:
 
@@ -51,6 +58,27 @@ curl --http2-prior-knowledge \
   --output downloaded.jpg
 
 cmp crates/journey-storage/examples/assets/image.jpg downloaded.jpg
+```
+
+Inspect metadata and list the catalogue:
+
+```bash
+curl --http2-prior-knowledge --head \
+  http://127.0.0.1:8081/objects/uploaded.jpg
+
+curl --http2-prior-knowledge --get \
+  --data-urlencode 'prefix=' \
+  --data-urlencode 'limit=100' \
+  http://127.0.0.1:8081/objects
+```
+
+Delete is idempotent and returns `204 No Content`, including when the key is
+already absent:
+
+```bash
+curl --http2-prior-knowledge \
+  -X DELETE \
+  http://127.0.0.1:8081/objects/uploaded.jpg
 ```
 
 Replace the same key with the included video and inspect the updated content
