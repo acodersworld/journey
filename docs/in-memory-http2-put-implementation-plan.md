@@ -94,10 +94,11 @@ h2 parsing already reject values that cannot be represented as an HTTP header.
 The service rejects a missing, duplicated, or empty value with `400 Bad
 Request` before reading or publishing the object.
 
-Change `Object` to store the content type as `http::HeaderValue`, and return
-`&HeaderValue` from its accessor. This preserves the already validated value
-without converting it through an unrestricted string. Update the constructor,
-fixtures, example helper, and tests to supply a `HeaderValue`.
+Store the header through the validated `ContentType` value type and return
+`&ContentType` from the object accessor. `ContentType` owns the
+`http::HeaderValue`, prevents construction from an empty or non-visible value,
+and lets GET reuse the validated header without converting it through an
+unrestricted string.
 
 `Content-Length` is optional. HTTP/2 does not use HTTP/1.1
 `Transfer-Encoding: chunked`; request bodies arrive as DATA frames and finish
@@ -118,8 +119,13 @@ An ordinary PUT is unconditional:
 
 | State at publication | Result |
 | --- | --- |
-| Key absent | Insert the object and return `201 Created` |
+| Key absent | Insert the object and return `200 OK` |
 | Key present | Replace the complete object and return `200 OK` |
+
+This intentionally follows
+[Amazon S3 `PutObject`](https://docs.aws.amazon.com/AmazonS3/latest/API/API_PutObject.html):
+a successful PUT returns `200 OK` whether it created a new key or replaced an
+existing object. The HTTP response does not distinguish those cases.
 
 Replacement changes both payload and content type. It does not merge metadata
 or preserve any part of the previous object.
@@ -179,24 +185,24 @@ request tasks.
 
 ### 4.2 Publication operation
 
-Add this public result type and store operation:
+Add a store publication operation that accepts the logical key and its
+completed PUT context:
 
 ```rust
-pub enum PutOutcome {
-    Created,
-    Replaced,
-}
-
-pub async fn put(&self, object: Object) -> PutOutcome
+pub async fn put(
+    &self,
+    key: &Key,
+    put_context: PutContext,
+) -> Result<(), String>
 ```
 
-While holding write access, `put`:
+For the in-memory implementation, while holding write access, `put`:
 
 1. inserts it when the key is absent;
 2. replaces the existing map entry when the key is present; and
-3. returns an outcome distinguishing `Created` from `Replaced`.
+3. reports whether publication succeeded or failed.
 
-The HTTP service uses this outcome to choose `201` or `200`.
+The HTTP service returns `200 OK` after successful publication in either case.
 
 The operation must not expose the map or its lock publicly. Keep synchronization
 and replacement semantics inside `Store` so later storage backends can change
@@ -217,25 +223,25 @@ new contents paired with the old content type.
 The service handles a valid PUT in this order:
 
 1. Extract and validate the logical key.
-2. Read and validate the required `Content-Type` header.
-3. Retain the `RecvStream` from the request body.
-4. Create an empty request-local mutable byte buffer.
+2. Read the required `Content-Type` header and convert it to `ContentType`.
+3. Ask the store to create a PUT context for that content type.
+4. Retain the `RecvStream` from the request body.
 5. Await each DATA frame from `RecvStream::data()`.
-6. Append that frame to the request-local buffer.
-7. Release exactly that frame's receive-window capacity only after the append
+6. Append that frame through the PUT context.
+7. Release exactly that frame's receive-window capacity only after append
    succeeds.
 8. Continue until the peer sends `END_STREAM`.
-9. Freeze the complete buffer into `Bytes` and construct the new `Object`.
-10. Atomically upsert it into `Store`.
-11. Send `201 Created` or `200 OK` according to the store outcome.
+9. Give the completed PUT context and logical key back to the store for atomic
+   publication.
+10. Send `200 OK` after successful publication.
 
 Although the service receives the body incrementally, the complete payload is
-retained in RAM because this slice uses an in-memory store. HTTP/2 flow control
-limits bytes still owned by the transport; it does not limit the growing
-application buffer or the retained store.
+retained in RAM by the in-memory PUT context. HTTP/2 flow control limits bytes
+still owned by the transport; it does not limit the growing context or the
+retained store.
 
 If DATA receipt fails, the peer resets the stream, or the HTTP/2 connection
-fails, discard the local buffer and return a typed service error. Do not
+fails, discard the PUT context and return a typed service error. Do not
 modify the existing object for that key and do not attempt to send a success
 response.
 
@@ -252,7 +258,7 @@ The initial response table is:
 
 | Condition | Status | Store changed |
 | --- | ---: | --- |
-| New key and complete valid body | `201` | Yes |
+| New key and complete valid body | `200` | Yes |
 | Existing key and complete valid body | `200` | Yes |
 | Empty or invalid key | `400` | No |
 | Missing or invalid `Content-Type` | `400` | No |
@@ -305,8 +311,8 @@ Cover:
 
 - constructing the initial catalogue;
 - asynchronous exact-key lookup;
-- inserting a new object and receiving `Created`;
-- replacing an object and receiving `Replaced`;
+- inserting a new object successfully;
+- replacing an object successfully;
 - replacement changing payload and content type together; and
 - clones observing the same mutations.
 
@@ -314,7 +320,7 @@ Cover:
 
 Cover:
 
-- PUT of a new key returning `201` and an empty response body;
+- PUT of a new key returning `200` and an empty response body;
 - GET immediately returning the uploaded bytes, content type, and length;
 - PUT of an existing key returning `200`;
 - GET returning only the replacement object;
@@ -361,7 +367,7 @@ This slice is complete when:
    each frame has been copied successfully.
 3. No object becomes visible before its complete request body reaches
    `END_STREAM`.
-4. A new key returns `201`; replacement returns `200`.
+4. Both creation and replacement return `200`, matching S3 `PutObject`.
 5. Replacement atomically changes payload and content type.
 6. Failed or interrupted uploads leave the prior store state unchanged.
 7. GET and PUT operate concurrently on a single HTTP/2 connection.

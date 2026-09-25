@@ -62,6 +62,11 @@ The next protocol slice is defined in
 It adds unconditional create-or-replace PUT behavior and HTTP/2 request-body
 flow control while deliberately retaining process-local in-memory storage.
 
+The final review hardening for that refactor is specified in
+[Storage Interface Review Follow-Up Implementation Plan](storage-interface-review-follow-up-implementation-plan.md).
+It keeps internal storage failures behind bounded public responses and makes
+validated content type a storage-interface invariant.
+
 ### 3.1 Define the interface first
 
 Write an implementation-neutral object-storage interface document before

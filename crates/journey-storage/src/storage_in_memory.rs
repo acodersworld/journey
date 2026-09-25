@@ -6,37 +6,33 @@ use std::{
 use bytes::Bytes;
 use tokio::sync::RwLock;
 
-use crate::storage_interface::{StoreInterface, ObjectInterface, Key, PutOutcome};
+use crate::storage_interface::{
+    ContentType, Key, ObjectInterface, PutContextInterface, StoreInterface,
+};
 
 /// One immutable object in a [`Store`].
 #[derive(Clone, Debug)]
 pub struct Object {
-    key: Key,
-    content_type: String,
+    content_type: ContentType,
     contents: Bytes,
 }
 
-impl ObjectInterface for Object {
-    /// Creates an object from a validated key and HTTP header value.
-    fn new(
-        key: Key,
-        content_type: String,
+impl Object {
+    /// Creates an object from a validated content type.
+    pub fn new(
+        content_type: ContentType,
         contents: Bytes,
     ) -> Self {
         Self {
-            key,
             content_type,
             contents,
         }
     }
+}
 
-    /// Returns the object's exact logical key.
-    fn key(&self) -> &Key {
-        &self.key
-    }
-
+impl ObjectInterface for Object {
     /// Returns the immutable content type.
-    fn content_type(&self) -> &str {
+    fn content_type(&self) -> &ContentType {
         &self.content_type
     }
 
@@ -46,34 +42,48 @@ impl ObjectInterface for Object {
     }
 }
 
+pub struct PutContext {
+    content_type: ContentType,
+    bytes: Vec<u8>,
+}
+
+impl PutContextInterface for PutContext {
+    async fn append(&mut self, bytes: &Bytes) -> Result<(), String> {
+        self.bytes.extend_from_slice(bytes);
+        Ok(())
+    }
+}
+
 /// A mutable catalogue of complete objects indexed by exact logical key.
 #[derive(Clone, Debug, Default)]
 pub struct Store {
     objects: Arc<RwLock<HashMap<Key, Object>>>,
 }
 
-impl StoreInterface for Store {
-    type Object = Object;
-
-    /// Builds a catalogue, rejecting any invalid object definition.
-    fn new(
-        objects: impl IntoIterator<Item = Object>,
+impl Store {
+    /// Builds a catalogue from validated keys and objects, rejecting duplicates.
+    pub fn new(
+        objects: impl IntoIterator<Item = (Key, Object)>,
     ) -> Result<Self, String> {
         let mut catalogue = HashMap::new();
-        for object in objects {
-            let key = object.key.clone();
+        for (key, object) in objects {
             if catalogue.insert(key.clone(), object).is_some() {
-                return Err(format!("Duplicate key: {}", key.to_string()));
+                return Err(format!("Duplicate key: {key}"));
             }
         }
         Ok(Self {
             objects: Arc::new(RwLock::new(catalogue)),
         })
     }
+}
+
+impl StoreInterface for Store {
+    type Object = Object;
+    type PutContext = PutContext;
 
     /// Looks up an exact logical key and cheaply clones its metadata and payload handle.
-    async fn get(&self, key: &str) -> Option<Object> {
-        self.objects.read().await.get(key).cloned()
+    async fn get(&self, key: &str) -> Result<Option<Object>, String> {
+        Ok(self.objects.read().await.get(key).cloned())
     }
 
     /// Returns the number of objects in the catalogue.
@@ -86,18 +96,30 @@ impl StoreInterface for Store {
         self.objects.read().await.is_empty()
     }
 
+    async fn put_context(&self, content_type: ContentType) -> Result<PutContext, String> {
+        Ok(PutContext {
+            content_type,
+            bytes: vec![],
+        })
+    }
+
     /// Atomically inserts or replaces an object by its exact logical key.
-    async fn put(&self, object: Object) -> PutOutcome {
+    async fn put(&self, key: &Key, put_context: PutContext) -> Result<(), String> {
+        let object = Object {
+            content_type: put_context.content_type,
+            contents: put_context.bytes.into(),
+        };
+
         let mut objects = self.objects.write().await;
-        match objects.entry(object.key.clone()) {
+        match objects.entry(key.clone()) {
             std::collections::hash_map::Entry::Occupied(mut entry) => {
                 entry.insert(object);
-                PutOutcome::Replaced
             }
             std::collections::hash_map::Entry::Vacant(entry) => {
                 entry.insert(object);
-                PutOutcome::Created
             }
         }
+
+        Ok(())
     }
 }

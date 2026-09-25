@@ -6,7 +6,8 @@ use std::{
 
 use bytes::Bytes;
 use h2::server;
-use journey_storage::{Service, Key, StoreInterface, ObjectInterface, Object, Store};
+use journey_storage::{ContentType, Service, Key, StoreInterface, Object, Store};
+use http::HeaderValue;
 use tokio::{
     net::{TcpListener, TcpStream},
     task::JoinSet,
@@ -26,8 +27,8 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let listener = TcpListener::bind(address).await?;
     let bound_address = listener.local_addr()?;
     let store = Store::new([
-        object("image.jpg", "image/jpeg", IMAGE)?,
-        object("video.mp4", "video/mp4", VIDEO)?,
+        (Key::new("image.jpg").unwrap(), object("image/jpeg", IMAGE)?),
+        (Key::new("video.mp4").unwrap(), object("video/mp4", VIDEO)?),
     ])
     .map_err(std::io::Error::other)?;
     let service = Arc::new(Service::new(store));
@@ -68,14 +69,16 @@ async fn main() -> Result<(), Box<dyn Error>> {
 }
 
 fn object(
-    key: &str,
     content_type: &str,
     contents: &'static [u8],
 ) -> Result<Object, std::io::Error> {
-    let key = Key::new(key).map_err(std::io::Error::other)?;
+    let content_type = content_type
+        .parse::<HeaderValue>()
+        .map_err(std::io::Error::other)?;
+    let content_type = ContentType::try_from_header(&content_type)
+        .map_err(std::io::Error::other)?;
     Ok(Object::new(
-        key,
-        content_type.to_string(),
+        content_type,
         Bytes::from_static(contents),
     ))
 }
