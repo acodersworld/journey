@@ -102,6 +102,14 @@ fn decode_query_value(value: &str) -> Result<String, ()> {
         .map_err(|_| ())
 }
 
+fn decode_object_key(value: &str) -> Result<Key, ()> {
+    if !has_valid_percent_escapes(value) {
+        return Err(());
+    }
+    let decoded = percent_decode_str(value).decode_utf8().map_err(|_| ())?;
+    Key::new(&decoded).map_err(|_| ())
+}
+
 fn parse_list_query(raw_query: Option<&str>) -> Result<ListQuery, ()> {
     let mut prefix = None;
     let mut limit = None;
@@ -265,26 +273,49 @@ impl<S: StoreInterface> Service<S> {
                     METHOD_NOT_ALLOWED_BODY,
                 ),
             },
-            Route::Object(key) => match method {
-                Method::GET => self.handle_get(&key, request.headers(), respond).await,
-                Method::HEAD => self.handle_head(&key, respond).await,
-                Method::PUT => self.handle_put(request, &key, respond).await,
-                Method::DELETE => self.handle_delete(&key, respond).await,
-                _ => request_error(
-                    respond,
-                    false,
-                    StatusCode::METHOD_NOT_ALLOWED,
-                    Some(OBJECT_ALLOW),
-                    METHOD_NOT_ALLOWED_BODY,
-                ),
-            },
+            Route::Object(raw_key) => {
+                let key = match decode_object_key(&raw_key) {
+                    Ok(key) => key,
+                    Err(()) => {
+                        return if method == Method::HEAD {
+                            send_empty_response(respond, StatusCode::BAD_REQUEST, None, None, None)
+                        } else {
+                            send_text_response(
+                                respond,
+                                StatusCode::BAD_REQUEST,
+                                None,
+                                BAD_REQUEST_BODY,
+                            )
+                        };
+                    }
+                };
+                match method {
+                    Method::GET => self.handle_get(&key, request.headers(), respond).await,
+                    Method::HEAD => self.handle_head(&key, respond).await,
+                    Method::PUT => self.handle_put(request, &key, respond).await,
+                    Method::DELETE => self.handle_delete(&key, respond).await,
+                    _ => request_error(
+                        respond,
+                        false,
+                        StatusCode::METHOD_NOT_ALLOWED,
+                        Some(OBJECT_ALLOW),
+                        METHOD_NOT_ALLOWED_BODY,
+                    ),
+                }
+            }
             Route::EmptyKey => match method {
-                Method::GET => self.handle_get("", request.headers(), respond).await,
+                Method::GET => {
+                    send_text_response(respond, StatusCode::BAD_REQUEST, None, INVALID_KEY_BODY)
+                }
                 Method::HEAD => {
                     send_empty_response(respond, StatusCode::BAD_REQUEST, None, None, None)
                 }
-                Method::PUT => self.handle_put(request, "", respond).await,
-                Method::DELETE => self.handle_delete("", respond).await,
+                Method::PUT => {
+                    send_text_response(respond, StatusCode::BAD_REQUEST, None, BAD_REQUEST_BODY)
+                }
+                Method::DELETE => {
+                    send_text_response(respond, StatusCode::BAD_REQUEST, None, INVALID_KEY_BODY)
+                }
                 _ => request_error(
                     respond,
                     false,
@@ -306,20 +337,9 @@ impl<S: StoreInterface> Service<S> {
     async fn handle_put(
         &self,
         request: Request<h2::RecvStream>,
-        key_text: &str,
+        key: &Key,
         mut respond: h2::server::SendResponse<Bytes>,
     ) -> Result<(), ServiceError> {
-        let key = match Key::new(key_text) {
-            Ok(key) => key,
-            Err(_) => {
-                return send_text_response(
-                    respond,
-                    StatusCode::BAD_REQUEST,
-                    None,
-                    BAD_REQUEST_BODY,
-                );
-            }
-        };
         let condition = match parse_put_condition(request.headers()) {
             Ok(condition) => condition,
             Err(()) => {
@@ -360,7 +380,11 @@ impl<S: StoreInterface> Service<S> {
             }
         };
 
-        let mut put_context = match self.store.put_context(key, content_type, condition).await {
+        let mut put_context = match self
+            .store
+            .put_context((*key).clone(), content_type, condition)
+            .await
+        {
             Ok(ctx) => ctx,
             Err(error) => {
                 eprintln!("storage PUT context creation failed: {error}");
@@ -420,21 +444,10 @@ impl<S: StoreInterface> Service<S> {
 
     async fn handle_get(
         &self,
-        key_text: &str,
+        key: &Key,
         headers: &http::HeaderMap,
         mut respond: h2::server::SendResponse<Bytes>,
     ) -> Result<(), ServiceError> {
-        let key = match Key::new(key_text) {
-            Ok(key) => key,
-            Err(_) => {
-                return send_text_response(
-                    respond,
-                    StatusCode::BAD_REQUEST,
-                    None,
-                    INVALID_KEY_BODY,
-                );
-            }
-        };
         let range = match parse_range_header(headers) {
             Ok(range) => range,
             Err(()) => {
@@ -446,7 +459,7 @@ impl<S: StoreInterface> Service<S> {
                 );
             }
         };
-        let get_result = match self.store.get(&key, range).await {
+        let get_result = match self.store.get(key, range).await {
             Ok(get_result) => get_result,
             Err(error) => {
                 if error.kind() == StoreErrorKind::NotFound {
@@ -522,16 +535,10 @@ impl<S: StoreInterface> Service<S> {
 
     async fn handle_head(
         &self,
-        key_text: &str,
+        key: &Key,
         respond: h2::server::SendResponse<Bytes>,
     ) -> Result<(), ServiceError> {
-        let key = match Key::new(key_text) {
-            Ok(key) => key,
-            Err(_) => {
-                return send_empty_response(respond, StatusCode::BAD_REQUEST, None, None, None);
-            }
-        };
-        let metadata = match self.store.stat(&key).await {
+        let metadata = match self.store.stat(key).await {
             Ok(metadata) => metadata,
             Err(error) if error.kind() == StoreErrorKind::NotFound => {
                 return send_empty_response(respond, StatusCode::NOT_FOUND, None, None, None);
@@ -562,21 +569,10 @@ impl<S: StoreInterface> Service<S> {
 
     async fn handle_delete(
         &self,
-        key_text: &str,
+        key: &Key,
         respond: h2::server::SendResponse<Bytes>,
     ) -> Result<(), ServiceError> {
-        let key = match Key::new(key_text) {
-            Ok(key) => key,
-            Err(_) => {
-                return send_text_response(
-                    respond,
-                    StatusCode::BAD_REQUEST,
-                    None,
-                    INVALID_KEY_BODY,
-                );
-            }
-        };
-        if let Err(error) = self.store.delete(&key).await {
+        if let Err(error) = self.store.delete(key).await {
             eprintln!("storage DELETE failed for key {key:?}: {error}");
             return send_text_response(
                 respond,
@@ -1249,12 +1245,39 @@ mod tests {
         assert!(collect(response.into_body()).await.unwrap().is_empty());
     }
 
+    fn encode_query_component(value: &str) -> String {
+        let mut encoded = String::new();
+        for byte in value.bytes() {
+            if byte.is_ascii_alphanumeric() || b"-_.~".contains(&byte) {
+                encoded.push(byte as char);
+            } else {
+                encoded.push_str(&format!("%{byte:02X}"));
+            }
+        }
+        encoded
+    }
+
     #[test]
     fn route_classification_uses_the_exact_collection_path() {
         assert_eq!(classify_route("/objects"), Route::Collection);
         assert_eq!(classify_route("/objects/"), Route::EmptyKey);
         assert_eq!(classify_route("/objects/a/b"), Route::Object("a/b".to_owned()));
         assert_eq!(classify_route("/other"), Route::Unknown);
+        assert_eq!(classify_route("/objects%2Fkey"), Route::Unknown);
+    }
+
+    #[test]
+    fn object_key_decoding_is_single_pass_and_validates_utf8_and_length() {
+        assert_eq!(decode_object_key("a%20b").unwrap().as_str(), "a b");
+        assert_eq!(decode_object_key("a%2Fb").unwrap().as_str(), "a/b");
+        assert_eq!(decode_object_key("a+b").unwrap().as_str(), "a+b");
+        assert_eq!(decode_object_key("a%252Fb").unwrap().as_str(), "a%2Fb");
+        assert_eq!(decode_object_key("%E7%8C%AB").unwrap().as_str(), "猫");
+
+        for value in ["%", "%2", "%GG", "%FF"] {
+            assert!(decode_object_key(value).is_err(), "accepted {value:?}");
+        }
+        assert!(decode_object_key(&"x".repeat(1_025)).is_err());
     }
 
     #[test]
@@ -2258,6 +2281,137 @@ mod tests {
         assert_success_headers(&response, "application/octet-stream", uploaded.len());
         assert_eq!(collect(response.into_body()).await.unwrap(), uploaded);
         assert_eq!(collect_stored_object(&store, "uploaded.bin").await.as_ref(), uploaded);
+    }
+
+    #[tokio::test]
+    async fn object_paths_decode_logical_keys_for_every_object_method_and_list_prefix() {
+        let store = Store::default();
+        let mut connection = connection(store.clone(), None).await;
+        let cases = [
+            ("space key", "space%20key"),
+            ("literal%percent", "literal%25percent"),
+            ("slash/key", "slash%2Fkey"),
+            ("plus+key", "plus+key"),
+            ("repeat//slashes", "repeat%2F%2Fslashes"),
+            ("猫/雪", "%E7%8C%AB%2F%E9%9B%AA"),
+        ];
+
+        for (logical_key, encoded_key) in cases {
+            let path = format!("/objects/{encoded_key}");
+            let response = put(
+                &mut connection.sender,
+                &path,
+                Some("text/plain"),
+                None,
+                logical_key.as_bytes(),
+            )
+            .await
+            .unwrap();
+            assert_eq!(response.status(), StatusCode::OK, "PUT {logical_key:?}");
+            assert!(collect(response.into_body()).await.unwrap().is_empty());
+
+            let response = get(&mut connection.sender, &path).await.unwrap();
+            assert_eq!(response.status(), StatusCode::OK, "GET {logical_key:?}");
+            assert_eq!(collect(response.into_body()).await.unwrap(), logical_key.as_bytes());
+
+            let queried_path = format!("{path}?version=ignored");
+            let response = get(&mut connection.sender, &queried_path).await.unwrap();
+            assert_eq!(response.status(), StatusCode::OK, "GET {queried_path}");
+            assert_eq!(collect(response.into_body()).await.unwrap(), logical_key.as_bytes());
+
+            let response = request(&mut connection.sender, Method::HEAD, &path)
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK, "HEAD {logical_key:?}");
+            assert_eq!(response.headers()[header::CONTENT_LENGTH], logical_key.len().to_string());
+            assert_empty_response(response, StatusCode::OK).await;
+
+            let prefix = encode_query_component(logical_key);
+            let response = get(
+                &mut connection.sender,
+                &format!("/objects?prefix={prefix}"),
+            )
+            .await
+            .unwrap();
+            let page: serde_json::Value = serde_json::from_slice(
+                &collect(response.into_body()).await.unwrap(),
+            )
+            .unwrap();
+            assert_eq!(page["objects"].as_array().unwrap().len(), 1);
+            assert_eq!(page["objects"][0]["key"], logical_key);
+
+            let response = request(&mut connection.sender, Method::DELETE, &path)
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::NO_CONTENT, "DELETE {logical_key:?}");
+            assert_empty_response(response, StatusCode::NO_CONTENT).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn percent_escaped_keys_are_distinct_and_invalid_object_paths_return_400() {
+        let store = Store::default();
+        let mut connection = connection(store.clone(), None).await;
+        for (path, logical_key, payload) in [
+            ("/objects/a%20b", "a b", b"space".as_slice()),
+            ("/objects/a%2520b", "a%20b", b"literal percent".as_slice()),
+            ("/objects/literal%2Fpart", "literal/part", b"slash".as_slice()),
+            ("/objects/literal%252Fpart", "literal%2Fpart", b"literal escape".as_slice()),
+        ] {
+            let response = put(
+                &mut connection.sender,
+                path,
+                Some("text/plain"),
+                None,
+                payload,
+            )
+            .await
+            .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            collect(response.into_body()).await.unwrap();
+            assert_eq!(collect_stored_object(&store, logical_key).await.as_ref(), payload);
+            let response = get(&mut connection.sender, path).await.unwrap();
+            assert_eq!(collect(response.into_body()).await.unwrap(), payload);
+        }
+
+        let invalid_paths = [
+            "/objects/%".to_owned(),
+            "/objects/%2".to_owned(),
+            "/objects/%GG".to_owned(),
+            "/objects/%FF".to_owned(),
+            format!("/objects/{}", "x".repeat(1_025)),
+            format!("/objects/{}", encode_query_component(&"é".repeat(513))),
+        ];
+        for path in &invalid_paths {
+            for method in [Method::GET, Method::HEAD, Method::PUT, Method::DELETE] {
+                let response = request(&mut connection.sender, method.clone(), path)
+                    .await
+                    .unwrap();
+                assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{method} {path}");
+                if method == Method::HEAD {
+                    assert_empty_response(response, StatusCode::BAD_REQUEST).await;
+                } else {
+                    assert_eq!(collect(response.into_body()).await.unwrap(), BAD_REQUEST_BODY);
+                }
+            }
+        }
+
+        for method in [Method::GET, Method::HEAD, Method::PUT, Method::DELETE] {
+            let response = request(&mut connection.sender, method.clone(), "/objects/")
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+            if method == Method::HEAD {
+                assert_empty_response(response, StatusCode::BAD_REQUEST).await;
+            } else {
+                let expected_body = if method == Method::PUT {
+                    BAD_REQUEST_BODY
+                } else {
+                    INVALID_KEY_BODY
+                };
+                assert_eq!(collect(response.into_body()).await.unwrap(), expected_body);
+            }
+        }
     }
 
     #[tokio::test]

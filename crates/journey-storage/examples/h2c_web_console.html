@@ -53,9 +53,9 @@
       </div>
 
       <div id="object-fields" class="hidden">
-        <label for="key">Object key (URI path suffix)</label>
+        <label for="key">Object key</label>
         <input id="key" value="image.jpg" autocomplete="off">
-        <p class="hint">Use the path exactly as it appears after /objects/. Slashes are allowed; use percent escapes for special characters.</p>
+        <p class="hint">Enter the logical key. The console encodes it for the URL; slashes and special characters are supported.</p>
         <div id="range-fields" class="hidden">
           <label for="range">Range</label>
           <input id="range" autocomplete="off" placeholder="bytes=0-99">
@@ -135,7 +135,7 @@
         status.textContent = 'Enter an object key.';
         return;
       }
-      if (action === 'DELETE' && !window.confirm(`Delete /objects/${key}?`)) return;
+      if (action === 'DELETE' && !window.confirm(`Delete object key “${key}”?`)) return;
 
       clearResult();
       submit.disabled = true;
@@ -153,7 +153,7 @@
         } else if (action === 'POST_LIST') {
           path = '/api/objects';
         } else {
-          path = '/api/objects/' + key;
+          path = '/api/objects/' + encodeURIComponent(key);
         }
         if (action === 'GET') {
           const range = document.querySelector('#range').value.trim();

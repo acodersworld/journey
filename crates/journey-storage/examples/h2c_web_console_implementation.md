@@ -36,12 +36,14 @@ does not need h2c support or cross-origin access.
 | `POST /api/objects` | `POST /objects` | Exercise the service's `405 Method Not Allowed` response. |
 
 The proxy fixes the upstream origin at process startup. It passes through the
-object path suffix and listing query, and never accepts an upstream URL from a
-browser request. In the key field, enter the URI path suffix exactly as it
-should appear after `/objects/`; use percent escapes for special characters.
-The listing controls encode query values with percent escapes, including spaces
-and literal plus signs. The `prefix` parameter is always present, even when it
-is empty; `limit` and `cursor` are omitted when their fields are empty.
+encoded object path and listing query, and never accepts an upstream URL from a
+browser request. Enter the logical key in the key field; the console percent-
+encodes it as one URL path component, including `/` and `%`. The storage service
+decodes that component once, so a listed logical key can be used directly in the
+key field. The listing controls encode query values with percent escapes,
+including spaces and literal plus signs. The `prefix` parameter is always
+present, even when it is empty; `limit` and `cursor` are omitted when their
+fields are empty.
 
 PUT sends the selected file's bytes, or UTF-8 text when no file is selected,
 as the entire request body. It does not use multipart encoding. The editable
@@ -128,6 +130,9 @@ Python script. Stop each process with Ctrl-C.
 8. Clear the PUT content type and confirm the upstream `400` is visible.
    Select the POST collection check and confirm `405` and `Allow: GET`.
    Stop the Rust server and confirm the console reports `502` without exiting.
+9. List keys containing spaces, `/`, `+`, non-ASCII characters, and a literal
+   `%`; use each returned key as-is in the key field and confirm GET, HEAD, PUT,
+   and DELETE reach that exact logical key through the proxy.
 
 For automated checks, run the Python script against a separately launched
 Rust example and request the proxy routes with an HTTP/1 client. Assert the
