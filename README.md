@@ -28,12 +28,21 @@ local development. The AWS bundle uses Nginx, TLS, HTTP/2, and WSS instead.
 Use credentials from the environment file when calling `/health` or the media
 routes.
 
-## In-memory HTTP/2 object storage
+## HTTP/2 object storage
 
-Run the h2c example from the workspace root:
+Run the h2c example from the workspace root. With no arguments, it uses an
+in-memory store seeded with the included image and video:
 
 ```bash
 cargo run -p journey-storage --example h2c_get_server
+```
+
+To use persistent filesystem storage instead, specify a directory. The server
+creates it if needed and loads its existing objects on startup; it does not
+seed the example image and video in this mode:
+
+```bash
+cargo run -p journey-storage --example h2c_get_server -- --storage-dir ./storage-data
 ```
 
 The service exposes `GET`, `HEAD`, `PUT`, and `DELETE` on `/objects/<key>`,

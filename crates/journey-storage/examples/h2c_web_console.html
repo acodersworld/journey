@@ -71,12 +71,13 @@
           <option value="replace-only">Replace only</option>
         </select>
         <label for="content-type">Content-Type</label>
-        <input id="content-type" value="application/octet-stream" autocomplete="off">
+        <input id="content-type" value="text/plain" autocomplete="off">
         <label for="file">Upload file</label>
         <input id="file" type="file">
+        <button id="clear-file" type="button" class="secondary hidden">Clear file</button>
         <label for="text-body">Or text body</label>
         <textarea id="text-body" placeholder="Used when no file is selected"></textarea>
-        <p class="hint">The file takes precedence. An empty body is allowed.</p>
+        <p class="hint">The file takes precedence until you edit the text body or clear the file. Its browser-reported type fills Content-Type; you can edit it. Text defaults to text/plain. An empty body is allowed.</p>
       </div>
     </fieldset>
     <button id="submit" type="submit">Send request</button>
@@ -98,6 +99,10 @@
     const objectFields = document.querySelector('#object-fields');
     const rangeFields = document.querySelector('#range-fields');
     const putFields = document.querySelector('#put-fields');
+    const contentTypeField = document.querySelector('#content-type');
+    const fileField = document.querySelector('#file');
+    const clearFile = document.querySelector('#clear-file');
+    const textBodyField = document.querySelector('#text-body');
     const status = document.querySelector('#status');
     const headers = document.querySelector('#headers');
     const body = document.querySelector('#body');
@@ -154,10 +159,10 @@
           const range = document.querySelector('#range').value.trim();
           if (range) options.headers = { Range: range };
         } else if (action === 'PUT') {
-          const contentType = document.querySelector('#content-type').value;
+          const contentType = contentTypeField.value;
           const condition = document.querySelector('#put-condition').value;
-          const file = document.querySelector('#file').files[0];
-          const text = document.querySelector('#text-body').value;
+          const file = fileField.files[0];
+          const text = textBodyField.value;
           options.body = file ? new Blob([file]) : new TextEncoder().encode(text);
           options.headers = {};
           if (contentType) options.headers['Content-Type'] = contentType;
@@ -200,7 +205,21 @@
       }
     }
 
+    function clearSelectedFile() {
+      if (!fileField.files.length) return;
+      fileField.value = '';
+      clearFile.classList.add('hidden');
+      contentTypeField.value = 'text/plain';
+    }
+
     method.addEventListener('change', updateFields);
+    fileField.addEventListener('change', () => {
+      const file = fileField.files[0];
+      clearFile.classList.toggle('hidden', !file);
+      contentTypeField.value = file ? (file.type || 'application/octet-stream') : 'text/plain';
+    });
+    clearFile.addEventListener('click', clearSelectedFile);
+    textBodyField.addEventListener('input', clearSelectedFile);
     form.addEventListener('submit', sendRequest);
     nextPage.addEventListener('click', () => {
       document.querySelector('#cursor').value = nextPage.dataset.cursor;

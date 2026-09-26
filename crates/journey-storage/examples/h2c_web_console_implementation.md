@@ -5,9 +5,9 @@
 The h2c example accepts HTTP/2 prior-knowledge connections, which browsers do
 not initiate over plain HTTP. This example adds a loopback-only HTTP/1 browser
 server that serves a request console and forwards storage requests to the
-existing h2c listener. The Rust storage service, its routes, and its in-memory
-state are unchanged. Run both processes; stopping the Rust process loses
-uploaded objects.
+existing h2c listener. The console does not change the Rust storage routes.
+Run both processes; in-memory mode loses uploaded objects when the Rust
+process stops, while filesystem mode keeps them in the selected directory.
 
 ## Files and dependencies
 
@@ -44,12 +44,17 @@ and literal plus signs. The `prefix` parameter is always present, even when it
 is empty; `limit` and `cursor` are omitted when their fields are empty.
 
 PUT sends the selected file's bytes, or UTF-8 text when no file is selected,
-as the entire request body. It does not use multipart encoding. Clearing the
-content-type field sends no `Content-Type`, allowing the storage service to
-return its normal validation error. Empty uploads are supported. The PUT
-condition selector sends no condition for **Unconditional**, `If-None-Match: *`
-for **Create only**, or `If-Match: *` for **Replace only**. A failed condition
-shows the upstream `412 Precondition Failed` response.
+as the entire request body. It does not use multipart encoding. The editable
+Content-Type field defaults to `text/plain` for a text body. Selecting a file
+fills it from the browser-reported file type, or `application/octet-stream`
+when the browser has no type for that file; clearing the file selection restores
+`text/plain`. Typing in the text body or clicking **Clear file** clears a
+selected file and restores the text default. Clearing the content-type field
+sends no `Content-Type`, allowing the storage service to return its normal
+validation error. Empty uploads are supported. The PUT condition selector
+sends no condition for **Unconditional**,
+`If-None-Match: *` for **Create only**, or `If-Match: *` for **Replace only**.
+A failed condition shows the upstream `412 Precondition Failed` response.
 
 The response viewer shows status, upstream HTTP version, response headers,
 and text or JSON bodies. It offers binary GET responses as downloads and
@@ -63,8 +68,8 @@ while retaining upstream error statuses and bodies. A connection failure
 becomes `502`; an upstream timeout becomes `504`. Neither condition stops the
 browser server.
 
-This is a local development tool. It has no authentication, upload quota, or
-persistence; the underlying example also retains entire uploads in memory.
+This is a local development tool. It has no authentication or upload quota;
+persistence depends on the selected storage backend.
 Keep both listeners bound to loopback unless those limits are addressed.
 
 ## Run
@@ -74,6 +79,16 @@ From the workspace root, start the storage example:
 ```bash
 cargo run -p journey-storage --example h2c_get_server
 ```
+
+This default uses seeded in-memory objects. For persistent filesystem storage,
+pass a directory instead:
+
+```bash
+cargo run -p journey-storage --example h2c_get_server -- --storage-dir ./storage-data
+```
+
+The filesystem mode starts with the objects already in that directory and does
+not seed `image.jpg` or `video.mp4`; upload through the console to add objects.
 
 In another terminal, install the Python dependency in a virtual environment
 and start the console:

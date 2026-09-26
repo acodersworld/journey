@@ -1,12 +1,16 @@
 use std::{
     error::Error,
     net::SocketAddr,
+    path::PathBuf,
     sync::Arc,
 };
 
 use bytes::Bytes;
 use h2::server;
-use journey_storage::{ContentType, Service, Key, StoreInterface, Object, Store};
+use journey_storage::{
+    ContentType, FilesystemStore, FilesystemStoreConfig, Key, Object, Service, Store,
+    StoreInterface,
+};
 use http::HeaderValue;
 use tokio::{
     net::{TcpListener, TcpStream},
@@ -20,33 +24,81 @@ const MAX_HEADER_LIST_SIZE: u32 = 16 * 1024;
 const IMAGE: &[u8] = include_bytes!("assets/image.jpg");
 const VIDEO: &[u8] = include_bytes!("assets/video.mp4");
 
+enum StorageSelection {
+    Help,
+    InMemory,
+    Filesystem(PathBuf),
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
+    match storage_selection()? {
+        StorageSelection::Help => Ok(()),
+        StorageSelection::Filesystem(root) => {
+            let store = FilesystemStore::open(FilesystemStoreConfig::new(&root)).await?;
+            println!("filesystem storage root: {}", root.display());
+            run_server(store, false).await
+        }
+        StorageSelection::InMemory => {
+            let store = Store::new([
+                (Key::new("image.jpg").unwrap(), object("image/jpeg", IMAGE)?),
+                (Key::new("video.mp4").unwrap(), object("video/mp4", VIDEO)?),
+            ])
+            .map_err(std::io::Error::other)?;
+            run_server(store, true).await
+        }
+    }
+}
+
+fn storage_selection() -> Result<StorageSelection, Box<dyn Error>> {
+    let mut args = std::env::args_os().skip(1);
+    let Some(option) = args.next() else {
+        return Ok(StorageSelection::InMemory);
+    };
+    if option == "--help" && args.next().is_none() {
+        println!("Usage: h2c_get_server [--storage-dir PATH]");
+        return Ok(StorageSelection::Help);
+    }
+    if option != "--storage-dir" {
+        return Err("Usage: h2c_get_server [--storage-dir PATH]".into());
+    }
+    let root = args.next().ok_or("--storage-dir requires a path")?;
+    if args.next().is_some() {
+        return Err("Usage: h2c_get_server [--storage-dir PATH]".into());
+    }
+    Ok(StorageSelection::Filesystem(root.into()))
+}
+
+async fn run_server<S: StoreInterface + Sync + Send>(
+    store: S,
+    seeded_fixtures: bool,
+) -> Result<(), Box<dyn Error>> {
     let bind = std::env::var("JOURNEY_STORAGE_BIND").unwrap_or_else(|_| DEFAULT_BIND.to_owned());
     let address: SocketAddr = bind.parse()?;
     let listener = TcpListener::bind(address).await?;
     let bound_address = listener.local_addr()?;
-    let store = Store::new([
-        (Key::new("image.jpg").unwrap(), object("image/jpeg", IMAGE)?),
-        (Key::new("video.mp4").unwrap(), object("video/mp4", VIDEO)?),
-    ])
-    .map_err(std::io::Error::other)?;
     let service = Arc::new(Service::new(store));
 
     println!("journey-storage listening on http://{bound_address}");
-    println!("  http://{bound_address}/objects/image.jpg");
-    println!("  http://{bound_address}/objects/video.mp4");
+    if seeded_fixtures {
+        println!("  http://{bound_address}/objects/image.jpg");
+        println!("  http://{bound_address}/objects/video.mp4");
+    }
     println!("List stored objects:");
     println!("  curl --http2-prior-knowledge --get --data-urlencode 'prefix=' http://{bound_address}/objects");
-    println!("Inspect object metadata:");
-    println!("  curl --http2-prior-knowledge --head http://{bound_address}/objects/image.jpg");
+    if seeded_fixtures {
+        println!("Inspect object metadata:");
+        println!("  curl --http2-prior-knowledge --head http://{bound_address}/objects/image.jpg");
+    }
     println!("Upload and download an object with:");
     println!("  curl --http2-prior-knowledge -X PUT -H 'Content-Type: image/jpeg' --data-binary @crates/journey-storage/examples/assets/image.jpg http://{bound_address}/objects/uploaded.jpg");
     println!("  curl --http2-prior-knowledge http://{bound_address}/objects/uploaded.jpg --output downloaded.jpg");
     println!("  cmp crates/journey-storage/examples/assets/image.jpg downloaded.jpg");
-    println!("Get the first 100 bytes of image.jpg:");
-    println!("  curl --http2-prior-knowledge -H 'Range: bytes=0-99' -D - http://{bound_address}/objects/image.jpg --output first-100-bytes.bin");
-    println!("  expected: HTTP/2 206, Content-Range: bytes 0-99/{}, 100-byte payload", IMAGE.len());
+    if seeded_fixtures {
+        println!("Get the first 100 bytes of image.jpg:");
+        println!("  curl --http2-prior-knowledge -H 'Range: bytes=0-99' -D - http://{bound_address}/objects/image.jpg --output first-100-bytes.bin");
+        println!("  expected: HTTP/2 206, Content-Range: bytes 0-99/{}, 100-byte payload", IMAGE.len());
+    }
     println!("Replace it with a different type and verify the replacement with:");
     println!("  curl --http2-prior-knowledge -X PUT -H 'Content-Type: video/mp4' --data-binary @crates/journey-storage/examples/assets/video.mp4 http://{bound_address}/objects/uploaded.jpg");
     println!("  curl --http2-prior-knowledge -D - http://{bound_address}/objects/uploaded.jpg --output downloaded.mp4");
