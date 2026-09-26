@@ -44,6 +44,26 @@ Start it with:
     docker compose -f home-compose.yml up -d
     docker compose -f home-compose.yml logs -f home
 
+## Filesystem object-store journal
+
+When the filesystem store is configured, its JSON Lines event journal defaults
+to `journal` under the storage root. Set a different journal path with
+`FilesystemStoreConfig::with_journal_path`. Install a host `logrotate` stanza
+for that path and adjust its size and retention values as needed; the defaults
+below rotate at 10 MiB and keep five numbered files:
+
+    /var/lib/journey/storage/journal {
+        size 10M
+        rotate 5
+        missingok
+        notifempty
+    }
+
+Use rename based rotation and omit `copytruncate`. The store opens the current
+journal path for every event, so later events append to the newly created
+`journal` after rotation. Logrotate keeps numbered files such as `journal.1`
+and `journal.2`.
+
 ## Private test CA
 
 Generate the CA and domain certificate on the development machine. Keep the CA

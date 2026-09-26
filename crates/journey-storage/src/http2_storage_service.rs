@@ -139,9 +139,6 @@ fn parse_list_query(raw_query: Option<&str>) -> Result<ListQuery, ()> {
             let decoded = URL_SAFE_NO_PAD.decode(token.as_bytes()).map_err(|_| ())?;
             let key_text = String::from_utf8(decoded).map_err(|_| ())?;
             let key = Key::new(&key_text).map_err(|_| ())?;
-            if !key.as_str().starts_with(&prefix) {
-                return Err(());
-            }
             Some(key)
         }
         None => None,
@@ -598,7 +595,7 @@ impl<S: StoreInterface> Service<S> {
     ) -> Result<(), ServiceError> {
         let cursor = query
             .cursor
-            .map(|last_key| ListCursor::new(query.prefix.clone(), last_key));
+            .map(ListCursor::new);
         let request = ListRequest::new(query.prefix, cursor, query.requested_limit);
         let page = match self.store.list(request).await {
             Ok(page) => page,
@@ -643,7 +640,7 @@ impl<S: StoreInterface> Service<S> {
         let response = ListResponse {
             objects,
             next_cursor: next_cursor
-                .map(|cursor| URL_SAFE_NO_PAD.encode(cursor.last_key().as_str())),
+                .map(|cursor| URL_SAFE_NO_PAD.encode(cursor.start_key().as_str())),
         };
         let payload = match serde_json::to_vec(&response) {
             Ok(payload) => Bytes::from(payload),
@@ -1305,7 +1302,7 @@ mod tests {
             parse_list_query(Some(&format!("prefix=photos/&cursor={valid_cursor}"))).is_ok()
         );
         assert!(
-            parse_list_query(Some(&format!("prefix=videos/&cursor={valid_cursor}"))).is_err()
+            parse_list_query(Some(&format!("prefix=videos/&cursor={valid_cursor}"))).is_ok()
         );
     }
 
@@ -2530,6 +2527,55 @@ mod tests {
             store.get(&Key::new("missing-type").unwrap(), None).await.unwrap_err().kind(),
             StoreErrorKind::NotFound
         );
+    }
+
+    #[tokio::test]
+    async fn object_metadata_limits_are_enforced_by_http_put_routes() {
+        let store = Store::default();
+        let mut connection = connection(store.clone(), None).await;
+        let maximum_key = format!("/objects/{}", "k".repeat(1_024));
+        let maximum_content_type = "x".repeat(128);
+        let accepted = put(
+            &mut connection.sender,
+            &maximum_key,
+            Some(&maximum_content_type),
+            None,
+            b"ok",
+        )
+        .await
+        .unwrap();
+        assert_eq!(accepted.status(), StatusCode::OK);
+        let _ = collect(accepted.into_body()).await.unwrap();
+
+        let oversized_key = format!("/objects/{}", "k".repeat(1_025));
+        let rejected_key = put(
+            &mut connection.sender,
+            &oversized_key,
+            Some("text/plain"),
+            None,
+            b"",
+        )
+        .await
+        .unwrap();
+        assert_eq!(rejected_key.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(collect(rejected_key.into_body()).await.unwrap(), BAD_REQUEST_BODY);
+
+        let oversized_content_type = "x".repeat(129);
+        let rejected_content_type = put(
+            &mut connection.sender,
+            "/objects/oversized-content-type",
+            Some(&oversized_content_type),
+            None,
+            b"",
+        )
+        .await
+        .unwrap();
+        assert_eq!(rejected_content_type.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(
+            collect(rejected_content_type.into_body()).await.unwrap(),
+            INVALID_CONTENT_TYPE
+        );
+        assert_eq!(object_count(&store).await, 1);
     }
 
     #[tokio::test]

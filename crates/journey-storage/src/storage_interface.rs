@@ -12,7 +12,7 @@ pub struct ContentType(HeaderValue);
 
 impl ContentType {
     pub fn try_from_header(value: &HeaderValue) -> Result<Self, ContentTypeError> {
-        if value.is_empty() || value.to_str().is_err() {
+        if value.is_empty() || value.as_bytes().len() > 128 || value.to_str().is_err() {
             return Err(ContentTypeError);
         }
 
@@ -44,6 +44,9 @@ impl Key {
     pub fn new(key: &str) -> Result<Self, String> {
         if key.is_empty() {
             return Err("Empty key".to_string());
+        }
+        if key.len() > 1_024 {
+            return Err("Key exceeds 1024 UTF-8 bytes".to_string());
         }
 
         Ok(Key { key: key.to_string() })
@@ -223,21 +226,16 @@ pub enum GetResult<O> {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ListCursor {
-    prefix: String,
-    last_key: Key,
+    start_key: Key,
 }
 
 impl ListCursor {
-    pub(crate) fn new(prefix: String, last_key: Key) -> Self {
-        Self { prefix, last_key }
+    pub(crate) fn new(start_key: Key) -> Self {
+        Self { start_key }
     }
 
-    pub(crate) fn prefix(&self) -> &str {
-        &self.prefix
-    }
-
-    pub(crate) fn last_key(&self) -> &Key {
-        &self.last_key
+    pub(crate) fn start_key(&self) -> &Key {
+        &self.start_key
     }
 }
 

@@ -3,7 +3,7 @@ use std::{
     future::Future,
     num::NonZeroUsize,
     ops::Range,
-    ops::Bound::{Excluded, Included, Unbounded},
+    ops::Bound::{Included, Unbounded},
     sync::Arc,
 };
 
@@ -258,44 +258,30 @@ impl StoreInterface for Store {
 
     async fn list(&self, request: ListRequest) -> Result<ListPage, StoreError> {
         let objects = self.objects.read().await;
-        if request
-            .cursor()
-            .is_some_and(|cursor| cursor.prefix() != request.prefix())
-        {
-            return Err(StoreError::new(
-                StoreErrorKind::InvalidRequest,
-                "List cursor prefix does not match request prefix",
-            ));
-        }
-
         let effective_limit = self
             .config
             .max_list_page_size
             .min(request.requested_limit());
         let lower_bound = match request.cursor() {
-            Some(cursor) => Excluded(cursor.last_key().as_str()),
-            None => Included(request.prefix()),
+            Some(cursor) if cursor.start_key().as_str() > request.prefix() => {
+                Included(cursor.start_key().as_str())
+            }
+            Some(_) | None => Included(request.prefix()),
         };
         let mut metadata = Vec::new();
-        let mut last_key = None;
-        let mut has_more = false;
+        let mut next_page_key = None;
         for (key, object) in objects.range::<str, _>((lower_bound, Unbounded)) {
             if !key.as_str().starts_with(request.prefix()) {
                 break;
             }
             if metadata.len() == effective_limit.get() {
-                has_more = true;
+                next_page_key = Some(key.clone());
                 break;
             }
             metadata.push(Self::metadata_for(key, object)?);
-            last_key = Some(key.clone());
         }
 
-        let next_cursor = if has_more {
-            last_key.map(|last_key| ListCursor::new(request.prefix().to_string(), last_key))
-        } else {
-            None
-        };
+        let next_cursor = next_page_key.map(ListCursor::new);
 
         Ok(ListPage::new(metadata, next_cursor))
     }
@@ -746,7 +732,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn continuation_survives_deleting_the_cursor_key() {
+    async fn continuation_starts_at_the_next_key_even_if_it_was_deleted() {
         let store = Store::new([
             object("a", b"1"),
             object("b", b"2"),
@@ -756,27 +742,34 @@ mod tests {
         .unwrap();
         let first = store.list(list_request("", 2)).await.unwrap();
         let cursor = first.next_cursor().unwrap().clone();
-        store.delete(&Key::new("b").unwrap()).await.unwrap();
+        store.delete(&Key::new("c").unwrap()).await.unwrap();
 
         let next = store
             .list(ListRequest::new("", Some(cursor), NonZeroUsize::new(2).unwrap()))
             .await
             .unwrap();
-        assert_eq!(names(&next), ["c", "d"]);
+        assert_eq!(names(&next), ["d"]);
         assert!(next.next_cursor().is_none());
     }
 
     #[tokio::test]
-    async fn cursor_prefix_mismatch_is_invalid_request() {
-        let store = Store::new([object("a/1", b"1"), object("a/2", b"2"), object("b/1", b"3")]).unwrap();
+    async fn cursor_is_a_global_start_key_independent_of_prefix() {
+        let store = Store::new([
+            object("a/1", b"1"),
+            object("a/2", b"2"),
+            object("b/1", b"3"),
+            object("b/2", b"4"),
+        ])
+        .unwrap();
         let first = store.list(list_request("a/", 1)).await.unwrap();
         let cursor = first.next_cursor().unwrap().clone();
 
-        let error = store
+        let next = store
             .list(ListRequest::new("b/", Some(cursor), NonZeroUsize::new(1).unwrap()))
             .await
-            .unwrap_err();
-        assert_eq!(error.kind(), StoreErrorKind::InvalidRequest);
+            .unwrap();
+        assert_eq!(names(&next), ["b/1"]);
+        assert_eq!(next.next_cursor().unwrap().start_key().as_str(), "b/2");
     }
 
     #[tokio::test]

@@ -39,8 +39,9 @@ cargo run -p journey-storage --example h2c_get_server
 The service exposes `GET`, `HEAD`, `PUT`, and `DELETE` on `/objects/<key>`,
 plus `GET /objects?prefix=<prefix>&limit=<n>&cursor=<token>` for listing. LIST
 requires `prefix` (use `prefix=` for all keys); it returns lexicographically
-ordered JSON pages and an unpadded Base64URL continuation token. Repeat the
-same prefix when following a token. Listing is not a snapshot, so concurrent
+ordered JSON pages and an unpadded Base64URL continuation token. The token
+marks the inclusive next key position and can be combined with any prefix;
+prefix filtering remains independent. Listing is not a snapshot, so concurrent
 inserts and deletes can affect later pages.
 
 In another terminal, upload the included image, download it, and compare the
@@ -72,6 +73,21 @@ curl --http2-prior-knowledge \
 
 The response is `206 Partial Content` with `Content-Range: bytes 0-99/1222`
 and a 100-byte payload.
+
+`journey-storage` also exports a filesystem-backed `StoreInterface`
+implementation. Create it asynchronously and pass it to the same generic HTTP
+service:
+
+```rust,ignore
+let store = FilesystemStore::open(FilesystemStoreConfig::new(
+    "/var/lib/journey/object-store",
+)).await?;
+let service = Service::new(store);
+```
+
+The filesystem store uses `objects/` and `part/` beneath that root, rebuilds
+its ordered index at startup, and defaults its abnormal-event journal to
+`journal` there. See [the deployment log rotation example](deploy/README.md#filesystem-object-store-journal).
 
 Inspect metadata and list the catalogue:
 

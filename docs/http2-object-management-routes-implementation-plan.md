@@ -206,7 +206,7 @@ After validation, build the existing storage request without moving `prefix`
 before it is cloned into the storage cursor:
 
 ```rust
-let cursor = cursor.map(|last_key| ListCursor::new(prefix.clone(), last_key));
+let cursor = cursor.map(ListCursor::new);
 let request = ListRequest::new(prefix, cursor, requested_limit);
 ```
 
@@ -263,14 +263,16 @@ an internal `500`, with details logged only locally.
 
 ### 6.3 Pagination behavior
 
-The token identifies a lexicographic start-after position, not an object that
-must still exist. If the referenced object is deleted between requests, the
-next page still starts after its key.
+The token identifies an inclusive lexicographic start position, not an object
+that must still exist. If the referenced object is deleted between requests,
+the next page starts at the first key after its position. The token is global
+and can be combined with a different prefix on the next request.
 
 LIST does not provide a snapshot. Concurrent changes have ordinary
-start-after behavior:
+start-position behavior:
 
 - an object inserted before the cursor will not appear in later pages;
+- an object inserted at the cursor position may appear in the next page;
 - an object inserted after the cursor may appear in a later page; and
 - an object deleted before its later page is read will not appear.
 
@@ -357,7 +359,8 @@ Return `400` for:
 - zero, negative, non-numeric, or overflowing limit values;
 - standard/padded or otherwise malformed Base64 cursor input;
 - a cursor that decodes to invalid UTF-8 or an empty key; and
-- a decoded cursor key outside the supplied prefix.
+- reuse of a cursor with a different prefix, preserving the cursor's global
+  key position while filtering by the newly supplied prefix.
 
 Also verify that a literal `+` remains `+` while `%20` becomes a space.
 

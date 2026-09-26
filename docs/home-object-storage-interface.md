@@ -226,13 +226,13 @@ Initial semantics are:
 There is no recursive flag or synthetic directory object initially. A client
 can infer a folder-like view by examining key prefixes and delimiters.
 
-A cursor is valid only for the listing contract and database generation rules
-defined by the eventual wire design. In the current Rust interface it binds
-the prefix and last returned key; using it with another prefix is invalid.
-Continuation starts strictly after that key, even if the cursor key was
-deleted. The first implementation need not promise a transactionally frozen
-snapshot across pages while concurrent mutations occur. It must not repeat or
-skip entries in an otherwise unchanged index.
+A cursor identifies the inclusive global key position where the next page
+starts; it does not bind a prefix. The requested prefix remains an independent
+filter, so a cursor can be reused with a different prefix. When the cursor key
+was deleted, continuation starts at the first key after that position. The
+first implementation need not promise a transactionally frozen snapshot
+across pages while concurrent mutations occur. It must not repeat or skip
+entries in an otherwise unchanged index.
 
 ## 8. Delete
 

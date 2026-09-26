@@ -18,9 +18,9 @@ DELETE
 ```
 
 This increment adds shared key/type/size metadata, typed storage errors,
-bounded start-after pagination, and the corresponding in-memory behavior. It
-does not add new HTTP routes; existing GET and PUT are adapted only as required
-by the revised backend interface.
+bounded pagination from an inclusive global key position, and the
+corresponding in-memory behavior. It does not add new HTTP routes; existing GET
+and PUT are adapted only as required by the revised backend interface.
 
 COPY and logical rename are removed from Journey's planned operation set. The
 project does not expect to need optimized server-local copy in the foreseeable
@@ -33,7 +33,7 @@ Implement:
 - `ObjectMetadata` containing key, content type, and payload length;
 - GET returning metadata and a backend-specific payload object;
 - metadata-only STAT;
-- prefix-filtered, bounded LIST with an opaque start-after cursor;
+- prefix-filtered, bounded LIST with an opaque inclusive start-key cursor;
 - idempotent DELETE;
 - typed storage errors;
 - configurable in-memory maximum list-page size;
@@ -230,9 +230,9 @@ Semantics:
 - empty prefix matches all keys;
 - other prefixes match from the beginning of the logical key;
 - results use binary lexicographic ordering of key UTF-8 bytes;
-- a cursor resumes at the first key strictly greater than its last key;
-- deleting the cursor key does not invalidate continuation;
-- a cursor used with another prefix returns `InvalidRequest`;
+- a cursor identifies the inclusive global key position where listing starts;
+- the prefix is an independent filter and does not bind the cursor;
+- deleting the cursor key continues at the first key after that position;
 - LIST returns metadata only and never clones payload bytes;
 - pagination is not a frozen snapshot across mutations; and
 - an unchanged store never repeats or skips entries.
@@ -279,9 +279,9 @@ Implement operations as follows:
   metadata, and return `ReadObject`; absence is `NotFound`.
 - STAT: under a read lock, construct matching metadata without returning a
   payload handle; absence is `NotFound`.
-- LIST: under one read lock, validate cursor prefix, filter by prefix and
-  start-after key, sort keys, clamp the limit, inspect at most one extra match,
-  and construct metadata for returned entries only.
+- LIST: under one read lock, start at the later of the requested prefix and
+  cursor position, filter by prefix, clamp the limit, inspect at most one extra
+  match, and construct metadata for returned entries only.
 - PUT: retain the current request-local context and atomically create or replace
   under one write lock.
 - DELETE: remove under one write lock and ignore whether an entry existed.
@@ -350,8 +350,8 @@ Listing:
 - requested limits below and above the backend cap;
 - a full final page without a cursor;
 - complete unchanged-store traversal without repeats or omissions;
-- continuation after deleting the prior cursor key;
-- cursor/prefix mismatch returning `InvalidRequest`; and
+- continuation after deleting the cursor start key;
+- reuse of a cursor with a different prefix; and
 - empty pages without cursors.
 
 Mutation and errors:
@@ -378,12 +378,11 @@ formatter.
 
 1. The trait supports PUT, GET, STAT, LIST, and DELETE with typed errors.
 2. GET returns metadata and payload; STAT returns identical metadata alone.
-3. LIST is bounded by backend configuration and uses an opaque start-after
-   cursor.
+3. LIST is bounded by backend configuration and uses an opaque global start
+   key that is independent of the requested prefix.
 4. DELETE is idempotent and does not reveal prior existence.
 5. PUT remains atomic unconditional create-or-replace.
 6. COPY and logical rename are absent from the planned interface and design.
 7. No new HTTP routes are added.
 8. Existing HTTP GET and PUT behavior remains compatible.
 9. Focused checks and tests pass without automated formatting.
-
