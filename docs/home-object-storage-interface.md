@@ -1,9 +1,17 @@
 # Home Object Storage Interface
 
-**Status:** Preliminary interface agreement  
+**Status:** Historical interface design; SQLite and administration sections superseded
+
 **Created:** 24 September 2026  
 **Scope:** Semantic client, recovery, and local administration interfaces for
 the first Journey home object store
+
+This document records earlier interface and SQLite assumptions. Use the
+[filesystem implementation plan](filesystem-object-store-in-memory-index-implementation-plan.md)
+for the current storage contract and
+[deferred diagnostics and administration](storage-diagnostics-and-administration-deferred.md)
+for later maintenance and LAN admin work. The implemented Rust interfaces and
+HTTP/2 routes are authoritative for current client behavior.
 
 ## 1. Purpose
 

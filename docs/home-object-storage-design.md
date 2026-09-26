@@ -1,8 +1,14 @@
 # Home Object Storage Design
 
-**Status:** Preliminary design for discussion and implementation planning  
+**Status:** Historical design; superseded for implementation
+
 **Created:** 24 September 2026  
 **Scope:** The first filesystem-backed Journey object store on the home server
+
+This document records an earlier SQLite-based proposal. The current
+[filesystem implementation plan](filesystem-object-store-in-memory-index-implementation-plan.md)
+uses a startup-built in-memory index with no SQLite database and is
+authoritative for file layout, publication, and recovery behavior.
 
 The semantic client and administration surfaces are defined separately in
 [Home Object Storage Interface](home-object-storage-interface.md).
