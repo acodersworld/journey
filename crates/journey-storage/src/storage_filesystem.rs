@@ -246,20 +246,36 @@ impl StoreInterface for FilesystemStore {
         let mut entries = self.index.write().await;
         let previous = entries.get(key).cloned();
         let path = self.object_path(key);
-        if let Err(error) = fs::remove_file(path) && error.kind() != std::io::ErrorKind::NotFound {
-            return Err(io_error("delete object file", error));
-        }
+        let removed_file = match fs::remove_file(&path) {
+            Ok(()) => true,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+            Err(error) => return Err(io_error("delete object file", error)),
+        };
         entries.remove(key);
         drop(entries);
-        if let Some(IndexEntry::Corrupt { physical_name, reason, object_id }) = previous {
-            emit_event(
-                &self.config.journal_path,
-                "corrupt_object_deleted",
-                Some(key.as_str()),
-                Some(&physical_name),
-                &reason,
-                object_id.as_deref(),
-            );
+        match previous {
+            Some(IndexEntry::Corrupt { physical_name, reason, object_id }) => {
+                emit_event(
+                    &self.config.journal_path,
+                    "corrupt_object_deleted",
+                    Some(key.as_str()),
+                    Some(&physical_name),
+                    &reason,
+                    object_id.as_deref(),
+                );
+            }
+            None if removed_file => {
+                let physical_name = format!("{}.obj", key_digest(key.as_str()));
+                emit_event(
+                    &self.config.journal_path,
+                    "unindexed_file_deleted",
+                    Some(key.as_str()),
+                    Some(&physical_name),
+                    "deleted file at key-derived path without a validated index entry",
+                    None,
+                );
+            }
+            _ => {}
         }
         Ok(())
     }
@@ -1409,6 +1425,29 @@ mod tests {
         assert!(!path.exists());
         let journal = fs::read_to_string(root.0.join("journal")).unwrap();
         assert!(journal.lines().any(|line| line.contains("corrupt_object_deleted")));
+    }
+
+    #[tokio::test]
+    async fn deleting_unindexed_file_journals_the_event_once() {
+        let root = TestRoot::new();
+        let store = FilesystemStore::open(root.config()).await.unwrap();
+        let key = Key::new("unindexed-delete").unwrap();
+        let path = store.object_path(&key);
+        fs::write(&path, b"unkeyable external file").unwrap();
+        drop(store);
+
+        let store = FilesystemStore::open(root.config()).await.unwrap();
+        store.delete(&key).await.unwrap();
+        store.delete(&key).await.unwrap();
+        assert!(!path.exists());
+        let journal = fs::read_to_string(root.0.join("journal")).unwrap();
+        let deleted: Vec<Value> = journal.lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .filter(|event: &Value| event["event"] == "unindexed_file_deleted")
+            .collect();
+        assert_eq!(deleted.len(), 1);
+        assert_eq!(deleted[0]["key"], "unindexed-delete");
+        assert_eq!(deleted[0]["file"], format!("{}.obj", key_digest(key.as_str())));
     }
 
     #[tokio::test]

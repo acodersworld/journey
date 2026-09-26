@@ -244,6 +244,8 @@ restart; this is the same accepted durability tradeoff. A keyed corrupt entry
 follows the same DELETE behavior as a healthy entry: remove its published file
 and index entry, then report success. Record the abnormal deletion in the local
 event journal.
+If a file exists at the key-derived path without an index entry, DELETE also
+removes it and records that abnormal deletion in the journal.
 
 ## 6. Abnormal-event journal
 
@@ -251,7 +253,7 @@ Keep a local journal of abnormal storage events so they remain visible after
 the affected object is repaired or deleted. At minimum, record startup
 corruption findings, including unkeyable files identified by physical
 filename and reason; GET or HEAD attempts against a corrupt entry; deletion
-of a corrupt entry.
+of a corrupt entry or an unindexed file at a key-derived path.
 
 Write each event as one UTF-8 JSON Lines object with a UTC RFC 3339 `time`, a
 stable `event` name, the logical `key` or physical `file` when available, and
