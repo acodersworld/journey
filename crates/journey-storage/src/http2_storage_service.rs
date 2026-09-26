@@ -16,13 +16,14 @@ use serde::Serialize;
 
 use crate::storage_interface::{
     ContentType, GetResult, Key, ListCursor, ListRequest, ObjectInterface, ObjectMetadata,
-    PutContextInterface, ReadRange, StoreErrorKind, StoreInterface,
+    PutCondition, PutContextInterface, ReadRange, StoreErrorKind, StoreInterface,
 };
 
 const MAX_DATA_SEGMENT_SIZE: usize = 64 * 1024;
 const NOT_FOUND_BODY: &[u8] = b"not found\n";
 const INVALID_KEY_BODY: &[u8] = b"invalid key\n";
 const BAD_REQUEST_BODY: &[u8] = b"bad request\n";
+const PRECONDITION_FAILED_BODY: &[u8] = b"precondition failed\n";
 const RANGE_NOT_SATISFIABLE_BODY: &[u8] = b"range not satisfiable\n";
 const INVALID_CONTENT_TYPE: &[u8] = b"invalid content type\n";
 const STORAGE_ERROR_BODY: &[u8] = b"storage error\n";
@@ -198,6 +199,30 @@ fn parse_range_position(value: &str) -> Result<u64, ()> {
     value.parse::<u64>().map_err(|_| ())
 }
 
+fn parse_put_condition(headers: &http::HeaderMap) -> Result<PutCondition, ()> {
+    let mut if_match_values = headers.get_all(header::IF_MATCH).iter();
+    let if_match = if_match_values.next();
+    if if_match_values.next().is_some() {
+        return Err(());
+    }
+
+    let mut if_none_match_values = headers.get_all(header::IF_NONE_MATCH).iter();
+    let if_none_match = if_none_match_values.next();
+    if if_none_match_values.next().is_some() || (if_match.is_some() && if_none_match.is_some()) {
+        return Err(());
+    }
+
+    let Some(value) = if_match.or(if_none_match) else {
+        return Ok(PutCondition::Unconditional);
+    };
+    let value = value.to_str().map_err(|_| ())?.trim_matches([' ', '\t']);
+    match (if_match.is_some(), value) {
+        (true, "*") => Ok(PutCondition::ReplaceOnly),
+        (false, "*") => Ok(PutCondition::CreateOnly),
+        _ => Err(()),
+    }
+}
+
 /// Handles one already accepted HTTP/2 request against a shared catalogue.
 #[derive(Clone, Debug)]
 pub struct Service<S: StoreInterface> {
@@ -298,6 +323,17 @@ impl<S: StoreInterface> Service<S> {
                 );
             }
         };
+        let condition = match parse_put_condition(request.headers()) {
+            Ok(condition) => condition,
+            Err(()) => {
+                return send_text_response(
+                    respond,
+                    StatusCode::BAD_REQUEST,
+                    None,
+                    BAD_REQUEST_BODY,
+                );
+            }
+        };
         let mut content_types = request.headers().get_all(header::CONTENT_TYPE).iter();
         let Some(content_type) = content_types.next() else {
             return send_text_response(
@@ -327,9 +363,7 @@ impl<S: StoreInterface> Service<S> {
             }
         };
 
-        let mut body = request.into_body();
-
-        let mut put_context = match self.store.put_context(content_type).await {
+        let mut put_context = match self.store.put_context(key, content_type, condition).await {
             Ok(ctx) => ctx,
             Err(error) => {
                 eprintln!("storage PUT context creation failed: {error}");
@@ -341,6 +375,7 @@ impl<S: StoreInterface> Service<S> {
                 );
             }
         };
+        let mut body = request.into_body();
 
         while let Some(data) = body.data().await {
             let data = data?;
@@ -359,8 +394,16 @@ impl<S: StoreInterface> Service<S> {
             body.flow_control().release_capacity(length)?;
         }
 
-        if let Err(error) = self.store.put(&key, put_context).await {
-            eprintln!("storage PUT commit failed for key {key:?}: {error}");
+        if let Err(error) = self.store.put(put_context).await {
+            if error.kind() == StoreErrorKind::PreconditionFailed {
+                return send_text_response(
+                    respond,
+                    StatusCode::PRECONDITION_FAILED,
+                    None,
+                    PRECONDITION_FAILED_BODY,
+                );
+            }
+            eprintln!("storage PUT commit failed: {error}");
             return send_text_response(
                 respond,
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -785,7 +828,7 @@ mod tests {
     use super::*;
     use crate::{
         ContentType, GetResult, Key, ListPage, ListRequest, Object, ObjectMetadata,
-        PutContextInterface, ReadObject, ReadRange, Store, StoreError,
+        PutCondition, PutContextInterface, ReadObject, ReadRange, Store, StoreError,
     };
     use h2::{client, server};
     use std::{collections::HashMap, num::NonZeroUsize, sync::Arc};
@@ -840,6 +883,7 @@ mod tests {
         PutContext,
         Append,
         Commit,
+        PreconditionFailed,
         Get,
         Stat,
         List,
@@ -859,8 +903,10 @@ mod tests {
     }
 
     struct FailurePutContext {
+        key: Key,
         failure: FailureOperation,
         content_type: ContentType,
+        condition: PutCondition,
         contents: Vec<u8>,
     }
 
@@ -968,7 +1014,9 @@ mod tests {
 
         async fn put_context(
             &self,
+            key: Key,
             content_type: ContentType,
+            condition: PutCondition,
         ) -> Result<Self::PutContext, StoreError> {
             if self.failure == FailureOperation::PutContext {
                 return Err(StoreError::new(
@@ -978,22 +1026,45 @@ mod tests {
             }
 
             Ok(FailurePutContext {
+                key,
                 failure: self.failure,
                 content_type,
+                condition,
                 contents: Vec::new(),
             })
         }
 
-        async fn put(&self, key: &Key, put_context: Self::PutContext) -> Result<(), StoreError> {
+        async fn put(&self, put_context: Self::PutContext) -> Result<(), StoreError> {
             if self.failure == FailureOperation::Commit {
                 return Err(StoreError::new(
                     StoreErrorKind::Internal,
                     SECRET_STORAGE_ERROR,
                 ));
             }
+            if self.failure == FailureOperation::PreconditionFailed {
+                return Err(StoreError::new(
+                    StoreErrorKind::PreconditionFailed,
+                    SECRET_STORAGE_ERROR,
+                ));
+            }
 
-            self.objects.write().await.insert(
-                key.clone(),
+            let key = put_context.key;
+            let mut objects = self.objects.write().await;
+            let key_is_present = objects.contains_key(&key);
+            let condition_satisfied = match put_context.condition {
+                PutCondition::Unconditional => true,
+                PutCondition::CreateOnly => !key_is_present,
+                PutCondition::ReplaceOnly => key_is_present,
+            };
+            if !condition_satisfied {
+                return Err(StoreError::new(
+                    StoreErrorKind::PreconditionFailed,
+                    "test PUT condition failed",
+                ));
+            }
+
+            objects.insert(
+                key,
                 FailureObject {
                     content_type: put_context.content_type,
                     contents: put_context.contents.into(),
@@ -1125,6 +1196,32 @@ mod tests {
         assert!(parse_range_header(&headers).is_err());
     }
 
+    #[test]
+    fn put_condition_parser_accepts_only_one_wildcard_condition() {
+        let mut headers = http::HeaderMap::new();
+        assert_eq!(parse_put_condition(&headers).unwrap(), PutCondition::Unconditional);
+
+        headers.insert(header::IF_NONE_MATCH, " \t*\t ".parse().unwrap());
+        assert_eq!(parse_put_condition(&headers).unwrap(), PutCondition::CreateOnly);
+        headers.remove(header::IF_NONE_MATCH);
+
+        headers.insert(header::IF_MATCH, "*".parse().unwrap());
+        assert_eq!(parse_put_condition(&headers).unwrap(), PutCondition::ReplaceOnly);
+        headers.append(header::IF_MATCH, "*".parse().unwrap());
+        assert!(parse_put_condition(&headers).is_err());
+
+        headers.remove(header::IF_MATCH);
+        headers.insert(header::IF_NONE_MATCH, "*".parse().unwrap());
+        headers.insert(header::IF_MATCH, "*".parse().unwrap());
+        assert!(parse_put_condition(&headers).is_err());
+
+        headers.remove(header::IF_MATCH);
+        for value in ["", "\"tag\"", "*, \"tag\""] {
+            headers.insert(header::IF_NONE_MATCH, value.parse().unwrap());
+            assert!(parse_put_condition(&headers).is_err(), "accepted {value:?}");
+        }
+    }
+
     #[tokio::test]
     async fn catalogue_constructs_and_looks_up_exact_keys() {
         let store = sample_store();
@@ -1190,16 +1287,30 @@ mod tests {
         let clone = store.clone();
 
         let key = Key::new("new").unwrap();
-        let mut first = store.put_context(validated_content_type("text/plain")).await.unwrap();
+        let mut first = store
+            .put_context(
+                key.clone(),
+                validated_content_type("text/plain"),
+                PutCondition::Unconditional,
+            )
+            .await
+            .unwrap();
         first.append(&Bytes::from_static(b"first")).await.unwrap();
-        store.put(&key, first).await.unwrap();
+        store.put(first).await.unwrap();
         assert_eq!(
             stored_object(&clone, "new").await.object().contents().as_ref(),
             b"first"
         );
-        let mut second = clone.put_context(validated_content_type("application/json")).await.unwrap();
+        let mut second = clone
+            .put_context(
+                key.clone(),
+                validated_content_type("application/json"),
+                PutCondition::Unconditional,
+            )
+            .await
+            .unwrap();
         second.append(&Bytes::from_static(b"second")).await.unwrap();
-        clone.put(&key, second).await.unwrap();
+        clone.put(second).await.unwrap();
 
         let replaced = stored_object(&store, "new").await;
         assert_eq!(replaced.object().contents().as_ref(), b"second");
@@ -1346,12 +1457,26 @@ mod tests {
         content_length: Option<&str>,
         payload: &[u8],
     ) -> Result<http::Response<h2::RecvStream>, h2::Error> {
+        put_with_headers(sender, path, content_type, content_length, &[], payload).await
+    }
+
+    async fn put_with_headers(
+        sender: &mut client::SendRequest<Bytes>,
+        path: &str,
+        content_type: Option<&str>,
+        content_length: Option<&str>,
+        extra_headers: &[(&str, &str)],
+        payload: &[u8],
+    ) -> Result<http::Response<h2::RecvStream>, h2::Error> {
         let mut builder = Request::builder().method(Method::PUT).uri(path);
         if let Some(content_type) = content_type {
             builder = builder.header(header::CONTENT_TYPE, content_type);
         }
         if let Some(content_length) = content_length {
             builder = builder.header(header::CONTENT_LENGTH, content_length);
+        }
+        for (name, value) in extra_headers {
+            builder = builder.header(*name, *value);
         }
         let request = builder.body(()).unwrap();
         let (response, mut stream) = sender.send_request(request, payload.is_empty())?;
@@ -1985,6 +2110,132 @@ mod tests {
         let object = stored_object(&store, "image.jpg").await;
         assert_eq!(object.metadata().content_type().as_header_value().as_bytes(), b"image/png");
         assert_eq!(object.object().contents().as_ref(), b"new image");
+    }
+
+    #[tokio::test]
+    async fn conditional_puts_create_replace_and_preserve_failed_preconditions() {
+        let store = sample_store();
+        let mut connection = connection(store.clone(), None).await;
+
+        let created = put_with_headers(
+            &mut connection.sender,
+            "/objects/conditional-new",
+            Some("text/plain"),
+            None,
+            &[("if-none-match", "*")],
+            b"created",
+        )
+        .await
+        .unwrap();
+        assert_eq!(created.status(), StatusCode::OK);
+        assert_eq!(created.headers()[header::CONTENT_LENGTH], "0");
+        assert!(collect(created.into_body()).await.unwrap().is_empty());
+
+        let create_conflict = put_with_headers(
+            &mut connection.sender,
+            "/objects/image.jpg",
+            Some("image/png"),
+            None,
+            &[("if-none-match", "*")],
+            b"",
+        )
+        .await
+        .unwrap();
+        assert_eq!(create_conflict.status(), StatusCode::PRECONDITION_FAILED);
+        assert_eq!(
+            create_conflict.headers()[header::CONTENT_LENGTH],
+            PRECONDITION_FAILED_BODY.len().to_string()
+        );
+        let failure_body = collect(create_conflict.into_body()).await.unwrap();
+        assert_eq!(failure_body, PRECONDITION_FAILED_BODY);
+        assert!(!failure_body.windows(b"private".len()).any(|part| part == b"private"));
+        let unchanged = stored_object(&store, "image.jpg").await;
+        assert_eq!(unchanged.object().contents().as_ref(), IMAGE);
+        assert_eq!(unchanged.metadata().content_type().as_header_value().as_bytes(), b"image/jpeg");
+
+        let replace_conflict = put_with_headers(
+            &mut connection.sender,
+            "/objects/conditional-missing",
+            Some("application/json"),
+            None,
+            &[("if-match", "*")],
+            b"replacement",
+        )
+        .await
+        .unwrap();
+        assert_eq!(replace_conflict.status(), StatusCode::PRECONDITION_FAILED);
+        assert_eq!(collect(replace_conflict.into_body()).await.unwrap(), PRECONDITION_FAILED_BODY);
+
+        let replaced = put_with_headers(
+            &mut connection.sender,
+            "/objects/image.jpg",
+            Some("image/png"),
+            None,
+            &[("if-match", "*")],
+            b"replacement",
+        )
+        .await
+        .unwrap();
+        assert_eq!(replaced.status(), StatusCode::OK);
+        assert!(collect(replaced.into_body()).await.unwrap().is_empty());
+        let current = stored_object(&store, "image.jpg").await;
+        assert_eq!(current.object().contents().as_ref(), b"replacement");
+        assert_eq!(current.metadata().content_type().as_header_value().as_bytes(), b"image/png");
+    }
+
+    #[tokio::test]
+    async fn precondition_failure_redacts_private_store_detail() {
+        let store = FailureStore::with_existing_object(FailureOperation::PreconditionFailed);
+        let mut connection = connection(store, None).await;
+        let response = put(
+            &mut connection.sender,
+            "/objects/target",
+            Some("text/plain"),
+            None,
+            b"replacement",
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(response.status(), StatusCode::PRECONDITION_FAILED);
+        assert_eq!(
+            response.headers()[header::CONTENT_LENGTH],
+            PRECONDITION_FAILED_BODY.len().to_string()
+        );
+        assert_eq!(collect(response.into_body()).await.unwrap(), PRECONDITION_FAILED_BODY);
+    }
+
+    #[tokio::test]
+    async fn invalid_conditional_put_headers_return_bad_request_before_context_creation() {
+        let store = FailureStore::with_existing_object(FailureOperation::PutContext);
+        let mut connection = connection(store, None).await;
+        let cases: &[&[(&str, &str)]] = &[
+            &[("if-match", "*"), ("if-match", "*")],
+            &[("if-none-match", "*"), ("if-none-match", "*")],
+            &[("if-match", "*"), ("if-none-match", "*")],
+            &[("if-match", "\"tag\"")],
+            &[("if-none-match", "")],
+            &[("if-none-match", "*, \"tag\"")],
+        ];
+
+        for extra_headers in cases {
+            let mut request = Request::builder()
+                .method(Method::PUT)
+                .uri("/objects/target")
+                .header(header::CONTENT_TYPE, "text/plain")
+                .body(())
+                .unwrap();
+            for (name, value) in *extra_headers {
+                request.headers_mut().append(
+                    http::HeaderName::from_bytes(name.as_bytes()).unwrap(),
+                    http::HeaderValue::from_str(value).unwrap(),
+                );
+            }
+            let (response, _) = connection.sender.send_request(request, true).unwrap();
+            let response = response.await.unwrap();
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+            assert_eq!(collect(response.into_body()).await.unwrap(), BAD_REQUEST_BODY);
+        }
     }
 
     #[tokio::test]

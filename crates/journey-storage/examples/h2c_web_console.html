@@ -64,6 +64,12 @@
       </div>
 
       <div id="put-fields" class="hidden">
+        <label for="put-condition">PUT condition</label>
+        <select id="put-condition">
+          <option value="unconditional">Unconditional</option>
+          <option value="create-only">Create only</option>
+          <option value="replace-only">Replace only</option>
+        </select>
         <label for="content-type">Content-Type</label>
         <input id="content-type" value="application/octet-stream" autocomplete="off">
         <label for="file">Upload file</label>
@@ -149,10 +155,14 @@
           if (range) options.headers = { Range: range };
         } else if (action === 'PUT') {
           const contentType = document.querySelector('#content-type').value;
+          const condition = document.querySelector('#put-condition').value;
           const file = document.querySelector('#file').files[0];
           const text = document.querySelector('#text-body').value;
           options.body = file ? new Blob([file]) : new TextEncoder().encode(text);
-          options.headers = contentType ? { 'Content-Type': contentType } : {};
+          options.headers = {};
+          if (contentType) options.headers['Content-Type'] = contentType;
+          if (condition === 'create-only') options.headers['If-None-Match'] = '*';
+          if (condition === 'replace-only') options.headers['If-Match'] = '*';
         }
 
         const response = await fetch(path, options);

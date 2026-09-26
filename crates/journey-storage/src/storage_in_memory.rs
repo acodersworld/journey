@@ -10,7 +10,7 @@ use bytes::Bytes;
 use tokio::sync::RwLock;
 
 use crate::storage_interface::{
-    ContentType, Key, ListCursor, ListPage, ListRequest, ObjectMetadata, ObjectInterface,
+    ContentType, Key, ListCursor, ListPage, ListRequest, ObjectMetadata, ObjectInterface, PutCondition,
     GetResult, PutContextInterface, ReadObject, ReadRange, ReadSpan, StoreError, StoreErrorKind,
     StoreInterface,
 };
@@ -42,7 +42,9 @@ impl ObjectInterface for Object {
 }
 
 pub struct PutContext {
+    key: Key,
     content_type: ContentType,
+    condition: PutCondition,
     bytes: Vec<u8>,
 }
 
@@ -278,21 +280,43 @@ impl StoreInterface for Store {
         Ok(())
     }
 
-    async fn put_context(&self, content_type: ContentType) -> Result<PutContext, StoreError> {
+    async fn put_context(
+        &self,
+        key: Key,
+        content_type: ContentType,
+        condition: PutCondition,
+    ) -> Result<PutContext, StoreError> {
         Ok(PutContext {
+            key,
             content_type,
+            condition,
             bytes: vec![],
         })
     }
 
-    /// Atomically inserts or replaces an object by its exact logical key.
-    async fn put(&self, key: &Key, put_context: PutContext) -> Result<(), StoreError> {
+    /// Atomically inserts or replaces an object by the key owned by its context.
+    async fn put(&self, put_context: PutContext) -> Result<(), StoreError> {
+        let key = put_context.key;
+        let mut objects = self.objects.write().await;
+        let key_is_present = objects.contains_key(&key);
+        let condition_satisfied = match put_context.condition {
+            PutCondition::Unconditional => true,
+            PutCondition::CreateOnly => !key_is_present,
+            PutCondition::ReplaceOnly => key_is_present,
+        };
+        if !condition_satisfied {
+            return Err(StoreError::new(
+                StoreErrorKind::PreconditionFailed,
+                format!("PUT condition failed for key: {key}"),
+            ));
+        }
+
         let object = Object {
             content_type: put_context.content_type,
             contents: put_context.bytes.into(),
         };
 
-        self.objects.write().await.insert(key.clone(), object);
+        objects.insert(key, object);
         Ok(())
     }
 }
@@ -434,9 +458,12 @@ mod tests {
             GetResult::Unsatisfiable { .. } => panic!("valid range was unsatisfiable"),
         };
 
-        let mut context = store.put_context(content_type("text/plain")).await.unwrap();
+        let mut context = store
+            .put_context(key.clone(), content_type("text/plain"), PutCondition::Unconditional)
+            .await
+            .unwrap();
         context.append(&Bytes::from_static(b"new and longer version")).await.unwrap();
-        store.put(&key, context).await.unwrap();
+        store.put(context).await.unwrap();
 
         assert_eq!(captured.metadata().payload_length(), 11);
         assert_eq!(captured.metadata().content_type().as_header_value(), "application/octet-stream");
@@ -461,14 +488,114 @@ mod tests {
     async fn replacement_updates_metadata_and_payload_together() {
         let store = Store::new([object("item", b"old")]).unwrap();
         let key = Key::new("item").unwrap();
-        let mut context = store.put_context(content_type("text/plain")).await.unwrap();
+        let mut context = store
+            .put_context(key.clone(), content_type("text/plain"), PutCondition::Unconditional)
+            .await
+            .unwrap();
         context.append(&Bytes::from_static(b"replacement")).await.unwrap();
-        store.put(&key, context).await.unwrap();
+        store.put(context).await.unwrap();
 
         let read = found(store.get(&key, None).await.unwrap());
         assert_eq!(read.metadata().payload_length(), 11);
         assert_eq!(read.metadata().content_type().as_header_value(), "text/plain");
         assert_eq!(read.object().contents().as_ref(), b"replacement");
+    }
+
+    #[tokio::test]
+    async fn put_conditions_check_presence_atomically_and_preserve_failed_objects() {
+        let store = Store::new([object("present", b"original")]).unwrap();
+        let present = Key::new("present").unwrap();
+        let absent = Key::new("absent").unwrap();
+        let missing = Key::new("missing").unwrap();
+
+        let mut create = store
+            .put_context(absent.clone(), content_type("text/plain"), PutCondition::CreateOnly)
+            .await
+            .unwrap();
+        create.append(&Bytes::from_static(b"created")).await.unwrap();
+        store.put(create).await.unwrap();
+        assert_eq!(found(store.get(&absent, None).await.unwrap()).object().contents().as_ref(), b"created");
+
+        let empty_create = store
+            .put_context(present.clone(), content_type("application/json"), PutCondition::CreateOnly)
+            .await
+            .unwrap();
+        let error = store.put(empty_create).await.unwrap_err();
+        assert_eq!(error.kind(), StoreErrorKind::PreconditionFailed);
+        let unchanged = found(store.get(&present, None).await.unwrap());
+        assert_eq!(unchanged.object().contents().as_ref(), b"original");
+        assert_eq!(unchanged.metadata().content_type().as_header_value(), "application/octet-stream");
+
+        let empty_replace = store
+            .put_context(missing.clone(), content_type("text/plain"), PutCondition::ReplaceOnly)
+            .await
+            .unwrap();
+        assert_eq!(store.put(empty_replace).await.unwrap_err().kind(), StoreErrorKind::PreconditionFailed);
+        assert_eq!(store.get(&missing, None).await.unwrap_err().kind(), StoreErrorKind::NotFound);
+        assert_eq!(found(store.get(&absent, None).await.unwrap()).object().contents().as_ref(), b"created");
+
+        let mut replace = store
+            .put_context(present.clone(), content_type("application/json"), PutCondition::ReplaceOnly)
+            .await
+            .unwrap();
+        replace.append(&Bytes::from_static(b"replaced")).await.unwrap();
+        store.put(replace).await.unwrap();
+        let replaced = found(store.get(&present, None).await.unwrap());
+        assert_eq!(replaced.object().contents().as_ref(), b"replaced");
+        assert_eq!(replaced.metadata().content_type().as_header_value(), "application/json");
+    }
+
+    #[tokio::test]
+    async fn simultaneous_create_only_puts_publish_exactly_one_object() {
+        let store = Store::default();
+        let key = Key::new("race").unwrap();
+        let first = store
+            .put_context(key.clone(), content_type("text/plain"), PutCondition::CreateOnly)
+            .await
+            .unwrap();
+        let second = store
+            .put_context(key.clone(), content_type("application/json"), PutCondition::CreateOnly)
+            .await
+            .unwrap();
+        let (first_result, second_result) = tokio::join!(store.put(first), store.put(second));
+
+        assert_ne!(first_result.is_ok(), second_result.is_ok());
+        assert_eq!(
+            [first_result, second_result]
+                .iter()
+                .filter(|result| matches!(result, Err(error) if error.kind() == StoreErrorKind::PreconditionFailed))
+                .count(),
+            1
+        );
+        assert_eq!(object_count_for_test(&store).await, 1);
+    }
+
+    #[tokio::test]
+    async fn replacement_and_delete_serialize_without_partial_publication() {
+        let store = Store::new([object("race", b"original")]).unwrap();
+        let key = Key::new("race").unwrap();
+        let mut replacement = store
+            .put_context(key.clone(), content_type("text/plain"), PutCondition::Unconditional)
+            .await
+            .unwrap();
+        replacement.append(&Bytes::from_static(b"replacement")).await.unwrap();
+
+        let (put_result, delete_result) = tokio::join!(store.put(replacement), store.delete(&key));
+        put_result.unwrap();
+        delete_result.unwrap();
+
+        match store.get(&key, None).await {
+            Err(error) => assert_eq!(error.kind(), StoreErrorKind::NotFound),
+            Ok(result) => {
+                let published = found(result);
+                assert_eq!(published.object().contents().as_ref(), b"replacement");
+                assert_eq!(published.metadata().content_type().as_header_value(), "text/plain");
+            }
+        }
+    }
+
+    async fn object_count_for_test(store: &Store) -> usize {
+        store.list(list_request("", 10)).await.unwrap().objects().len()
     }
 
     #[tokio::test]

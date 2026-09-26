@@ -71,10 +71,18 @@ pub enum StoreErrorKind {
     InvalidRequest,
     NotFound,
     Conflict,
+    PreconditionFailed,
     Capacity,
     Corrupt,
     Unavailable,
     Internal,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PutCondition {
+    Unconditional,
+    CreateOnly,
+    ReplaceOnly,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -316,13 +324,14 @@ pub trait StoreInterface: Send + Sync + Sized + 'static {
 
     fn put_context(
         &self,
+        key: Key,
         content_type: ContentType,
+        condition: PutCondition,
     ) -> impl Future<Output = Result<Self::PutContext, StoreError>> + Send;
 
-    /// Atomically creates or replaces an object by its exact logical key.
+    /// Atomically creates or replaces an object by the key owned by its context.
     fn put(
         &self,
-        key: &Key,
         put_context: Self::PutContext,
     ) -> impl Future<Output = Result<(), StoreError>> + Send;
 }

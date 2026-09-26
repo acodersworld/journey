@@ -17,6 +17,7 @@ FORWARDED_HEADERS = (
     "accept-ranges",
     "allow",
 )
+PUT_REQUEST_HEADERS = ("Content-Type", "If-Match", "If-None-Match")
 
 
 class ConsoleServer(ThreadingHTTPServer):
@@ -75,11 +76,12 @@ class ConsoleHandler(BaseHTTPRequestHandler):
         target = self.server.storage_url + path
         if route.query:
             target += "?" + route.query
-        headers = {}
-        if method == "PUT" and "Content-Type" in self.headers:
-            headers["Content-Type"] = self.headers["Content-Type"]
+        headers = []
+        if method == "PUT":
+            for name in PUT_REQUEST_HEADERS:
+                headers.extend((name, value) for value in self.headers.get_all(name, []))
         if method == "GET" and route.path.startswith("/api/objects/") and "Range" in self.headers:
-            headers["Range"] = self.headers["Range"]
+            headers.append(("Range", self.headers["Range"]))
 
         try:
             with self.server.client.stream(method, target, headers=headers, content=body) as response:

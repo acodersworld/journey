@@ -10,8 +10,8 @@ mod http2_storage_service;
 
 pub use storage_interface::{
     ContentType, ContentTypeError, GetResult, Key, ListCursor, ListPage, ListRequest,
-    ObjectInterface, ObjectMetadata, PutContextInterface, ReadObject, ReadRange, ReadSpan,
-    StoreError, StoreErrorKind, StoreInterface,
+    ObjectInterface, ObjectMetadata, PutCondition, PutContextInterface, ReadObject, ReadRange,
+    ReadSpan, StoreError, StoreErrorKind, StoreInterface,
 };
 pub use storage_in_memory::{Object, PutContext, Store, StoreConfig};
 pub use http2_storage_service::Service;

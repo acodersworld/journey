@@ -31,7 +31,7 @@ does not need h2c support or cross-origin access.
 | `GET /api/objects?prefix=...&limit=...&cursor=...` | `GET /objects?...` | List keys and follow `next_cursor`. |
 | `GET /api/objects/<key>` | `GET /objects/<key>` | Optionally send one Range value; show text or JSON, or download binary bytes. |
 | `HEAD /api/objects/<key>` | `HEAD /objects/<key>` | Inspect status and metadata headers. |
-| `PUT /api/objects/<key>` | `PUT /objects/<key>` | Upload or replace bytes with the chosen `Content-Type`. |
+| `PUT /api/objects/<key>` | `PUT /objects/<key>` | Upload bytes with the chosen `Content-Type` and optional create or replace condition. |
 | `DELETE /api/objects/<key>` | `DELETE /objects/<key>` | Delete a key after browser confirmation. |
 | `POST /api/objects` | `POST /objects` | Exercise the service's `405 Method Not Allowed` response. |
 
@@ -46,14 +46,18 @@ is empty; `limit` and `cursor` are omitted when their fields are empty.
 PUT sends the selected file's bytes, or UTF-8 text when no file is selected,
 as the entire request body. It does not use multipart encoding. Clearing the
 content-type field sends no `Content-Type`, allowing the storage service to
-return its normal validation error. Empty uploads are supported.
+return its normal validation error. Empty uploads are supported. The PUT
+condition selector sends no condition for **Unconditional**, `If-None-Match: *`
+for **Create only**, or `If-Match: *` for **Replace only**. A failed condition
+shows the upstream `412 Precondition Failed` response.
 
 The response viewer shows status, upstream HTTP version, response headers,
 and text or JSON bodies. It offers binary GET responses as downloads and
 truncates displayed text after 64 KiB. The browser retains a binary response
 in memory while its download link is available. For object GET only, the Range
-field is sent upstream as a `Range` header; HEAD, PUT, DELETE, and LIST do not
-send it. The proxy streams upstream response bytes to the browser and forwards
+field is sent upstream as a `Range` header; HEAD, DELETE, and LIST do not send
+it. PUT forwards its `Content-Type`, `If-Match`, and `If-None-Match` request
+headers. The proxy streams upstream response bytes to the browser and forwards
 `Content-Type`, `Content-Length`, `Content-Range`, `Accept-Ranges`, and `Allow`,
 while retaining upstream error statuses and bodies. A connection failure
 becomes `502`; an upstream timeout becomes `504`. Neither condition stops the
@@ -100,9 +104,13 @@ Python script. Stop each process with Ctrl-C.
 5. PUT a new key using a file and a content type; GET it and compare bytes.
    PUT different bytes and a different content type to the same key, then
    confirm GET and HEAD report the replacement.
-6. DELETE the key and confirm `204`. Repeat DELETE and confirm the same
+6. Choose **Create only** and PUT to an absent key; confirm success. Repeat
+   with an empty body and confirm `412` while the existing bytes and content
+   type remain unchanged. Choose **Replace only** and confirm `412` for a
+   missing key and success for an existing key.
+7. DELETE the key and confirm `204`. Repeat DELETE and confirm the same
    status. GET it and confirm `404`.
-7. Clear the PUT content type and confirm the upstream `400` is visible.
+8. Clear the PUT content type and confirm the upstream `400` is visible.
    Select the POST collection check and confirm `405` and `Allow: GET`.
    Stop the Rust server and confirm the console reports `502` without exiting.
 
