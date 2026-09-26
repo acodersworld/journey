@@ -1,0 +1,192 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Journey storage request console</title>
+  <style>
+    :root { color-scheme: light; font-family: system-ui, sans-serif; }
+    body { max-width: 860px; margin: 2rem auto; padding: 0 1rem; color: #17212b; }
+    h1 { margin-bottom: .3rem; }
+    p { line-height: 1.5; }
+    fieldset { border: 1px solid #c5ced7; border-radius: .5rem; margin: 1rem 0; padding: 1rem; }
+    legend { font-weight: 700; padding: 0 .3rem; }
+    label { display: block; font-weight: 600; margin: .75rem 0 .3rem; }
+    input, select, textarea, button { box-sizing: border-box; font: inherit; }
+    input:not([type=file]), select, textarea { border: 1px solid #8c9aa7; border-radius: .3rem; padding: .5rem; width: 100%; }
+    textarea { min-height: 7rem; resize: vertical; }
+    button { background: #155f97; border: 0; border-radius: .3rem; color: white; cursor: pointer; padding: .65rem 1rem; }
+    button:disabled { cursor: wait; opacity: .6; }
+    button.secondary { background: #46596b; margin-left: .5rem; }
+    .hint { color: #4d5b68; font-size: .9rem; margin: .3rem 0; }
+    .hidden { display: none; }
+    .result { border: 1px solid #c5ced7; border-radius: .5rem; min-height: 5rem; padding: 1rem; }
+    pre { background: #f2f5f7; border-radius: .3rem; overflow: auto; padding: .8rem; white-space: pre-wrap; word-break: break-word; }
+    #download { display: inline-block; margin-top: .5rem; }
+  </style>
+</head>
+<body>
+  <h1>Journey storage request console</h1>
+  <p>Send requests to the local h2c storage example through this browser server. Start the Rust example first; each request below shows the storage response.</p>
+
+  <form id="request-form">
+    <fieldset>
+      <legend>Request</legend>
+      <label for="method">Method</label>
+      <select id="method">
+        <option value="LIST">GET /objects (list)</option>
+        <option value="GET">GET /objects/&lt;key&gt;</option>
+        <option value="HEAD">HEAD /objects/&lt;key&gt;</option>
+        <option value="PUT">PUT /objects/&lt;key&gt;</option>
+        <option value="DELETE">DELETE /objects/&lt;key&gt;</option>
+        <option value="POST_LIST">POST /objects (expect 405)</option>
+      </select>
+
+      <div id="list-fields">
+        <label for="prefix">Prefix</label>
+        <input id="prefix" value="" autocomplete="off">
+        <p class="hint">An empty prefix lists every object.</p>
+        <label for="limit">Page limit</label>
+        <input id="limit" type="number" min="1" step="1" value="100">
+        <label for="cursor">Cursor</label>
+        <input id="cursor" autocomplete="off" placeholder="Leave empty for the first page">
+      </div>
+
+      <div id="object-fields" class="hidden">
+        <label for="key">Object key (URI path suffix)</label>
+        <input id="key" value="image.jpg" autocomplete="off">
+        <p class="hint">Use the path exactly as it appears after /objects/. Slashes are allowed; use percent escapes for special characters.</p>
+      </div>
+
+      <div id="put-fields" class="hidden">
+        <label for="content-type">Content-Type</label>
+        <input id="content-type" value="application/octet-stream" autocomplete="off">
+        <label for="file">Upload file</label>
+        <input id="file" type="file">
+        <label for="text-body">Or text body</label>
+        <textarea id="text-body" placeholder="Used when no file is selected"></textarea>
+        <p class="hint">The file takes precedence. An empty body is allowed.</p>
+      </div>
+    </fieldset>
+    <button id="submit" type="submit">Send request</button>
+  </form>
+
+  <h2>Response</h2>
+  <div class="result" aria-live="polite">
+    <strong id="status">No request sent</strong>
+    <pre id="headers"></pre>
+    <pre id="body"></pre>
+    <a id="download" class="hidden" download>Download response</a>
+    <button id="next-page" type="button" class="secondary hidden">Next page</button>
+  </div>
+
+  <script>
+    const form = document.querySelector('#request-form');
+    const method = document.querySelector('#method');
+    const listFields = document.querySelector('#list-fields');
+    const objectFields = document.querySelector('#object-fields');
+    const putFields = document.querySelector('#put-fields');
+    const status = document.querySelector('#status');
+    const headers = document.querySelector('#headers');
+    const body = document.querySelector('#body');
+    const download = document.querySelector('#download');
+    const nextPage = document.querySelector('#next-page');
+    const submit = document.querySelector('#submit');
+    let downloadUrl = null;
+
+    function updateFields() {
+      listFields.classList.toggle('hidden', method.value !== 'LIST');
+      objectFields.classList.toggle('hidden', method.value === 'LIST' || method.value === 'POST_LIST');
+      putFields.classList.toggle('hidden', method.value !== 'PUT');
+    }
+
+    function clearResult() {
+      if (downloadUrl) URL.revokeObjectURL(downloadUrl);
+      downloadUrl = null;
+      download.classList.add('hidden');
+      nextPage.classList.add('hidden');
+      headers.textContent = '';
+      body.textContent = '';
+    }
+
+    async function sendRequest(event) {
+      event.preventDefault();
+      const action = method.value;
+      const key = document.querySelector('#key').value;
+      if (action !== 'LIST' && action !== 'POST_LIST' && !key) {
+        status.textContent = 'Enter an object key.';
+        return;
+      }
+      if (action === 'DELETE' && !window.confirm(`Delete /objects/${key}?`)) return;
+
+      clearResult();
+      submit.disabled = true;
+      status.textContent = 'Waiting for storage server…';
+      try {
+        let path;
+        const options = { method: action === 'LIST' ? 'GET' : action === 'POST_LIST' ? 'POST' : action };
+        if (action === 'LIST') {
+          const prefix = document.querySelector('#prefix').value;
+          const limit = document.querySelector('#limit').value;
+          const cursor = document.querySelector('#cursor').value;
+          path = '/api/objects?prefix=' + encodeURIComponent(prefix);
+          if (limit) path += '&limit=' + encodeURIComponent(limit);
+          if (cursor) path += '&cursor=' + encodeURIComponent(cursor);
+        } else if (action === 'POST_LIST') {
+          path = '/api/objects';
+        } else {
+          path = '/api/objects/' + key;
+        }
+        if (action === 'PUT') {
+          const contentType = document.querySelector('#content-type').value;
+          const file = document.querySelector('#file').files[0];
+          const text = document.querySelector('#text-body').value;
+          options.body = file ? new Blob([file]) : new TextEncoder().encode(text);
+          options.headers = contentType ? { 'Content-Type': contentType } : {};
+        }
+
+        const response = await fetch(path, options);
+        const version = response.headers.get('X-Upstream-HTTP-Version');
+        status.textContent = `${response.status} ${response.statusText}` + (version ? ` · upstream ${version}` : '');
+        headers.textContent = [...response.headers.entries()]
+          .map(([name, value]) => `${name}: ${value}`).join('\n');
+
+        if (action === 'HEAD') {
+          body.textContent = '(HEAD has no response body)';
+        } else if (action === 'GET' && response.ok && !/^text\/|json/i.test(response.headers.get('Content-Type') || '')) {
+          const blob = await response.blob();
+          downloadUrl = URL.createObjectURL(blob);
+          download.href = downloadUrl;
+          download.download = key.split('/').pop() || 'object';
+          download.textContent = `Download ${blob.size} bytes`;
+          download.classList.remove('hidden');
+          body.textContent = '(binary response)';
+        } else {
+          const text = await response.text();
+          body.textContent = text.length > 65536 ? text.slice(0, 65536) + '\n… (display truncated)' : text || '(empty body)';
+          if (action === 'LIST' && response.ok) {
+            const page = JSON.parse(text);
+            if (page.next_cursor) {
+              nextPage.dataset.cursor = page.next_cursor;
+              nextPage.classList.remove('hidden');
+            }
+          }
+        }
+      } catch (error) {
+        status.textContent = 'Browser request failed';
+        body.textContent = String(error);
+      } finally {
+        submit.disabled = false;
+      }
+    }
+
+    method.addEventListener('change', updateFields);
+    form.addEventListener('submit', sendRequest);
+    nextPage.addEventListener('click', () => {
+      document.querySelector('#cursor').value = nextPage.dataset.cursor;
+      form.requestSubmit();
+    });
+    updateFields();
+  </script>
+</body>
+</html>
