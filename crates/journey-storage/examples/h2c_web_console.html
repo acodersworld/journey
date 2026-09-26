@@ -56,6 +56,11 @@
         <label for="key">Object key (URI path suffix)</label>
         <input id="key" value="image.jpg" autocomplete="off">
         <p class="hint">Use the path exactly as it appears after /objects/. Slashes are allowed; use percent escapes for special characters.</p>
+        <div id="range-fields" class="hidden">
+          <label for="range">Range</label>
+          <input id="range" autocomplete="off" placeholder="bytes=0-99">
+          <p class="hint">Optional: request one byte range, such as bytes=0-99 or bytes=-100.</p>
+        </div>
       </div>
 
       <div id="put-fields" class="hidden">
@@ -85,6 +90,7 @@
     const method = document.querySelector('#method');
     const listFields = document.querySelector('#list-fields');
     const objectFields = document.querySelector('#object-fields');
+    const rangeFields = document.querySelector('#range-fields');
     const putFields = document.querySelector('#put-fields');
     const status = document.querySelector('#status');
     const headers = document.querySelector('#headers');
@@ -97,6 +103,7 @@
     function updateFields() {
       listFields.classList.toggle('hidden', method.value !== 'LIST');
       objectFields.classList.toggle('hidden', method.value === 'LIST' || method.value === 'POST_LIST');
+      rangeFields.classList.toggle('hidden', method.value !== 'GET');
       putFields.classList.toggle('hidden', method.value !== 'PUT');
     }
 
@@ -137,7 +144,10 @@
         } else {
           path = '/api/objects/' + key;
         }
-        if (action === 'PUT') {
+        if (action === 'GET') {
+          const range = document.querySelector('#range').value.trim();
+          if (range) options.headers = { Range: range };
+        } else if (action === 'PUT') {
           const contentType = document.querySelector('#content-type').value;
           const file = document.querySelector('#file').files[0];
           const text = document.querySelector('#text-body').value;

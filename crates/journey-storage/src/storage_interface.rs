@@ -139,11 +139,24 @@ impl ObjectMetadata {
 pub struct ReadObject<O> {
     metadata: ObjectMetadata,
     object: O,
+    selected_span: Option<ReadSpan>,
 }
 
 impl<O> ReadObject<O> {
     pub fn new(metadata: ObjectMetadata, object: O) -> Self {
-        Self { metadata, object }
+        Self {
+            metadata,
+            object,
+            selected_span: None,
+        }
+    }
+
+    pub fn with_selected_span(metadata: ObjectMetadata, object: O, selected_span: ReadSpan) -> Self {
+        Self {
+            metadata,
+            object,
+            selected_span: Some(selected_span),
+        }
     }
 
     pub fn metadata(&self) -> &ObjectMetadata {
@@ -154,9 +167,46 @@ impl<O> ReadObject<O> {
         &self.object
     }
 
+    pub fn selected_span(&self) -> Option<ReadSpan> {
+        self.selected_span
+    }
+
     pub fn into_parts(self) -> (ObjectMetadata, O) {
         (self.metadata, self.object)
     }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ReadRange {
+    Closed { start: u64, end: u64 },
+    From { start: u64 },
+    Suffix { length: u64 },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ReadSpan {
+    offset: u64,
+    size: u64,
+}
+
+impl ReadSpan {
+    pub fn new(offset: u64, size: u64) -> Self {
+        Self { offset, size }
+    }
+
+    pub fn offset(&self) -> u64 {
+        self.offset
+    }
+
+    pub fn size(&self) -> u64 {
+        self.size
+    }
+}
+
+#[derive(Debug)]
+pub enum GetResult<O> {
+    Found(ReadObject<O>),
+    Unsatisfiable { complete_length: u64 },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -255,7 +305,8 @@ pub trait StoreInterface: Send + Sync + Sized + 'static {
     fn get(
         &self,
         key: &Key,
-    ) -> impl Future<Output = Result<ReadObject<Self::Object>, StoreError>> + Send;
+        range: Option<ReadRange>,
+    ) -> impl Future<Output = Result<GetResult<Self::Object>, StoreError>> + Send;
 
     fn stat(&self, key: &Key) -> impl Future<Output = Result<ObjectMetadata, StoreError>> + Send;
 

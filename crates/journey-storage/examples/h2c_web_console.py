@@ -10,7 +10,13 @@ import httpx
 
 
 HTML = Path(__file__).with_name("h2c_web_console.html")
-FORWARDED_HEADERS = ("content-type", "content-length", "allow")
+FORWARDED_HEADERS = (
+    "content-type",
+    "content-length",
+    "content-range",
+    "accept-ranges",
+    "allow",
+)
 
 
 class ConsoleServer(ThreadingHTTPServer):
@@ -72,6 +78,8 @@ class ConsoleHandler(BaseHTTPRequestHandler):
         headers = {}
         if method == "PUT" and "Content-Type" in self.headers:
             headers["Content-Type"] = self.headers["Content-Type"]
+        if method == "GET" and route.path.startswith("/api/objects/") and "Range" in self.headers:
+            headers["Range"] = self.headers["Range"]
 
         try:
             with self.server.client.stream(method, target, headers=headers, content=body) as response:

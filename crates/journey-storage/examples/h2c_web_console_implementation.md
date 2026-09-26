@@ -29,7 +29,7 @@ does not need h2c support or cross-origin access.
 | --- | --- | --- |
 | `GET /` | None | Serve the HTML console. |
 | `GET /api/objects?prefix=...&limit=...&cursor=...` | `GET /objects?...` | List keys and follow `next_cursor`. |
-| `GET /api/objects/<key>` | `GET /objects/<key>` | Show text or JSON, or download binary bytes. |
+| `GET /api/objects/<key>` | `GET /objects/<key>` | Optionally send one Range value; show text or JSON, or download binary bytes. |
 | `HEAD /api/objects/<key>` | `HEAD /objects/<key>` | Inspect status and metadata headers. |
 | `PUT /api/objects/<key>` | `PUT /objects/<key>` | Upload or replace bytes with the chosen `Content-Type`. |
 | `DELETE /api/objects/<key>` | `DELETE /objects/<key>` | Delete a key after browser confirmation. |
@@ -51,9 +51,11 @@ return its normal validation error. Empty uploads are supported.
 The response viewer shows status, upstream HTTP version, response headers,
 and text or JSON bodies. It offers binary GET responses as downloads and
 truncates displayed text after 64 KiB. The browser retains a binary response
-in memory while its download link is available. The proxy streams upstream
-response bytes to the browser, forwards `Content-Type`, `Content-Length`, and
-`Allow`, and retains upstream error statuses and bodies. A connection failure
+in memory while its download link is available. For object GET only, the Range
+field is sent upstream as a `Range` header; HEAD, PUT, DELETE, and LIST do not
+send it. The proxy streams upstream response bytes to the browser and forwards
+`Content-Type`, `Content-Length`, `Content-Range`, `Accept-Ranges`, and `Allow`,
+while retaining upstream error statuses and bodies. A connection failure
 becomes `502`; an upstream timeout becomes `504`. Neither condition stops the
 browser server.
 
@@ -90,14 +92,17 @@ Python script. Stop each process with Ctrl-C.
    to `1`, click **Next page**, and confirm the second page differs.
 2. GET and download each fixture. Compare the downloaded bytes with the
    corresponding file in `examples/assets/`.
-3. HEAD `image.jpg` and confirm `200`, `Content-Type: image/jpeg`, its byte
+3. Set the object GET Range field to `bytes=0-99`; confirm upstream `206`,
+   `Content-Range: bytes 0-99/<complete length>`, `Accept-Ranges: bytes`, and a
+   downloadable 100-byte response.
+4. HEAD `image.jpg` and confirm `200`, `Content-Type: image/jpeg`, its byte
    length, and an empty body. HEAD a missing key and confirm `404`.
-4. PUT a new key using a file and a content type; GET it and compare bytes.
+5. PUT a new key using a file and a content type; GET it and compare bytes.
    PUT different bytes and a different content type to the same key, then
    confirm GET and HEAD report the replacement.
-5. DELETE the key and confirm `204`. Repeat DELETE and confirm the same
+6. DELETE the key and confirm `204`. Repeat DELETE and confirm the same
    status. GET it and confirm `404`.
-6. Clear the PUT content type and confirm the upstream `400` is visible.
+7. Clear the PUT content type and confirm the upstream `400` is visible.
    Select the POST collection check and confirm `405` and `Allow: GET`.
    Stop the Rust server and confirm the console reports `502` without exiting.
 

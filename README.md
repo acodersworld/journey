@@ -60,6 +60,19 @@ curl --http2-prior-knowledge \
 cmp crates/journey-storage/examples/assets/image.jpg downloaded.jpg
 ```
 
+Request and save the first 100 bytes of `image.jpg`:
+
+```bash
+curl --http2-prior-knowledge \
+  -H 'Range: bytes=0-99' \
+  -D - \
+  http://127.0.0.1:8081/objects/image.jpg \
+  --output first-100-bytes.bin
+```
+
+The response is `206 Partial Content` with `Content-Range: bytes 0-99/1222`
+and a 100-byte payload.
+
 Inspect metadata and list the catalogue:
 
 ```bash

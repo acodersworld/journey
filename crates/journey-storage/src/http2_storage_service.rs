@@ -15,14 +15,15 @@ use percent_encoding::percent_decode_str;
 use serde::Serialize;
 
 use crate::storage_interface::{
-    ContentType, Key, ListCursor, ListRequest, ObjectInterface, ObjectMetadata,
-    PutContextInterface, StoreErrorKind, StoreInterface,
+    ContentType, GetResult, Key, ListCursor, ListRequest, ObjectInterface, ObjectMetadata,
+    PutContextInterface, ReadRange, StoreErrorKind, StoreInterface,
 };
 
 const MAX_DATA_SEGMENT_SIZE: usize = 64 * 1024;
 const NOT_FOUND_BODY: &[u8] = b"not found\n";
 const INVALID_KEY_BODY: &[u8] = b"invalid key\n";
 const BAD_REQUEST_BODY: &[u8] = b"bad request\n";
+const RANGE_NOT_SATISFIABLE_BODY: &[u8] = b"range not satisfiable\n";
 const INVALID_CONTENT_TYPE: &[u8] = b"invalid content type\n";
 const STORAGE_ERROR_BODY: &[u8] = b"storage error\n";
 const METHOD_NOT_ALLOWED_BODY: &[u8] = b"method not allowed\n";
@@ -152,6 +153,51 @@ fn parse_list_query(raw_query: Option<&str>) -> Result<ListQuery, ()> {
     })
 }
 
+fn parse_range_header(headers: &http::HeaderMap) -> Result<Option<ReadRange>, ()> {
+    let mut values = headers.get_all(header::RANGE).iter();
+    let Some(value) = values.next() else {
+        return Ok(None);
+    };
+    if values.next().is_some() {
+        return Err(());
+    }
+
+    let value = value.to_str().map_err(|_| ())?.trim_matches([' ', '\t']);
+    let (unit, spec) = value.split_once('=').ok_or(())?;
+    if !unit.eq_ignore_ascii_case("bytes") {
+        return Ok(None);
+    }
+    if spec.is_empty() || spec.contains(',') || spec.matches('-').count() != 1 {
+        return Err(());
+    }
+
+    let (start, end) = spec.split_once('-').ok_or(())?;
+    match (start.is_empty(), end.is_empty()) {
+        (true, false) => Ok(Some(ReadRange::Suffix {
+            length: parse_range_position(end)?,
+        })),
+        (false, true) => Ok(Some(ReadRange::From {
+            start: parse_range_position(start)?,
+        })),
+        (false, false) => {
+            let start = parse_range_position(start)?;
+            let end = parse_range_position(end)?;
+            if end < start {
+                return Err(());
+            }
+            Ok(Some(ReadRange::Closed { start, end }))
+        }
+        (true, true) => Err(()),
+    }
+}
+
+fn parse_range_position(value: &str) -> Result<u64, ()> {
+    if value.is_empty() || !value.bytes().all(|byte| byte.is_ascii_digit()) {
+        return Err(());
+    }
+    value.parse::<u64>().map_err(|_| ())
+}
+
 /// Handles one already accepted HTTP/2 request against a shared catalogue.
 #[derive(Clone, Debug)]
 pub struct Service<S: StoreInterface> {
@@ -198,7 +244,7 @@ impl<S: StoreInterface> Service<S> {
                 ),
             },
             Route::Object(key) => match method {
-                Method::GET => self.handle_get(&key, respond).await,
+                Method::GET => self.handle_get(&key, request.headers(), respond).await,
                 Method::HEAD => self.handle_head(&key, respond).await,
                 Method::PUT => self.handle_put(request, &key, respond).await,
                 Method::DELETE => self.handle_delete(&key, respond).await,
@@ -211,7 +257,7 @@ impl<S: StoreInterface> Service<S> {
                 ),
             },
             Route::EmptyKey => match method {
-                Method::GET => self.handle_get("", respond).await,
+                Method::GET => self.handle_get("", request.headers(), respond).await,
                 Method::HEAD => {
                     send_empty_response(respond, StatusCode::BAD_REQUEST, None, None, None)
                 }
@@ -335,6 +381,7 @@ impl<S: StoreInterface> Service<S> {
     async fn handle_get(
         &self,
         key_text: &str,
+        headers: &http::HeaderMap,
         mut respond: h2::server::SendResponse<Bytes>,
     ) -> Result<(), ServiceError> {
         let key = match Key::new(key_text) {
@@ -348,8 +395,19 @@ impl<S: StoreInterface> Service<S> {
                 );
             }
         };
-        let read_object = match self.store.get(&key).await {
-            Ok(read_object) => read_object,
+        let range = match parse_range_header(headers) {
+            Ok(range) => range,
+            Err(()) => {
+                return send_text_response(
+                    respond,
+                    StatusCode::BAD_REQUEST,
+                    None,
+                    BAD_REQUEST_BODY,
+                );
+            }
+        };
+        let get_result = match self.store.get(&key, range).await {
+            Ok(get_result) => get_result,
             Err(error) => {
                 if error.kind() == StoreErrorKind::NotFound {
                     return send_text_response(respond, StatusCode::NOT_FOUND, None, NOT_FOUND_BODY);
@@ -364,14 +422,59 @@ impl<S: StoreInterface> Service<S> {
             }
         };
 
+        let read_object = match get_result {
+            GetResult::Found(read_object) => read_object,
+            GetResult::Unsatisfiable { complete_length } => {
+                return send_range_unsatisfiable(respond, complete_length);
+            }
+        };
+
         let metadata = read_object.metadata();
         let contents = read_object.object().contents();
-        let response = Response::builder()
+        let selected_span = read_object.selected_span();
+        let content_length = selected_span
+            .map(|span| span.size())
+            .unwrap_or_else(|| metadata.payload_length());
+        if u64::try_from(contents.len()).ok() != Some(content_length) {
+            eprintln!("storage GET returned inconsistent payload length for key {key:?}");
+            return send_text_response(
+                respond,
+                StatusCode::INTERNAL_SERVER_ERROR,
+                None,
+                STORAGE_ERROR_BODY,
+            );
+        }
+        let mut builder = Response::builder()
             .version(Version::HTTP_2)
-            .status(StatusCode::OK)
+            .status(if selected_span.is_some() {
+                StatusCode::PARTIAL_CONTENT
+            } else {
+                StatusCode::OK
+            })
             .header(header::CONTENT_TYPE, metadata.content_type().as_header_value())
-            .header(header::CONTENT_LENGTH, metadata.payload_length())
-            .body(())?;
+            .header(header::CONTENT_LENGTH, content_length)
+            .header(header::ACCEPT_RANGES, "bytes");
+        if let Some(span) = selected_span {
+            let Some(end) = span
+                .offset()
+                .checked_add(span.size())
+                .and_then(|end| end.checked_sub(1))
+                .filter(|end| span.size() > 0 && *end < metadata.payload_length())
+            else {
+                eprintln!("storage GET returned invalid selected span for key {key:?}");
+                return send_text_response(
+                    respond,
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    None,
+                    STORAGE_ERROR_BODY,
+                );
+            };
+            builder = builder.header(
+                header::CONTENT_RANGE,
+                format!("bytes {}-{end}/{}", span.offset(), metadata.payload_length()),
+            );
+        }
+        let response = builder.body(())?;
         if contents.is_empty() {
             respond.send_response(response, true)?;
             return Ok(());
@@ -409,13 +512,16 @@ impl<S: StoreInterface> Service<S> {
             }
         };
 
-        send_empty_response(
-            respond,
-            StatusCode::OK,
-            None,
-            Some(metadata.content_type().as_header_value()),
-            Some(metadata.payload_length()),
-        )
+        let response = Response::builder()
+            .version(Version::HTTP_2)
+            .status(StatusCode::OK)
+            .header(header::CONTENT_TYPE, metadata.content_type().as_header_value())
+            .header(header::CONTENT_LENGTH, metadata.payload_length())
+            .header(header::ACCEPT_RANGES, "bytes")
+            .body(())?;
+        let mut respond = respond;
+        respond.send_response(response, true)?;
+        Ok(())
     }
 
     async fn handle_delete(
@@ -631,6 +737,26 @@ fn send_text_response(
     Ok(())
 }
 
+fn send_range_unsatisfiable(
+    mut respond: h2::server::SendResponse<Bytes>,
+    complete_length: u64,
+) -> Result<(), ServiceError> {
+    let response = Response::builder()
+        .version(Version::HTTP_2)
+        .status(StatusCode::RANGE_NOT_SATISFIABLE)
+        .header(header::ACCEPT_RANGES, "bytes")
+        .header(
+            header::CONTENT_RANGE,
+            format!("bytes */{complete_length}"),
+        )
+        .header(header::CONTENT_TYPE, "text/plain; charset=utf-8")
+        .header(header::CONTENT_LENGTH, RANGE_NOT_SATISFIABLE_BODY.len())
+        .body(())?;
+    let mut stream = respond.send_response(response, false)?;
+    stream.send_data(Bytes::from_static(RANGE_NOT_SATISFIABLE_BODY), true)?;
+    Ok(())
+}
+
 async fn send_payload(
     stream: &mut h2::SendStream<Bytes>,
     payload: &Bytes,
@@ -658,8 +784,8 @@ async fn send_payload(
 mod tests {
     use super::*;
     use crate::{
-        ContentType, Key, ListPage, ListRequest, Object, ObjectMetadata, PutContextInterface,
-        ReadObject, Store, StoreError,
+        ContentType, GetResult, Key, ListPage, ListRequest, Object, ObjectMetadata,
+        PutContextInterface, ReadObject, ReadRange, Store, StoreError,
     };
     use h2::{client, server};
     use std::{collections::HashMap, num::NonZeroUsize, sync::Arc};
@@ -692,7 +818,10 @@ mod tests {
     }
 
     async fn stored_object(store: &Store, key: &str) -> ReadObject<Object> {
-        store.get(&Key::new(key).unwrap()).await.unwrap()
+        match store.get(&Key::new(key).unwrap(), None).await.unwrap() {
+            GetResult::Found(read_object) => read_object,
+            GetResult::Unsatisfiable { .. } => unreachable!(),
+        }
     }
 
     async fn object_count(store: &Store) -> usize {
@@ -775,7 +904,11 @@ mod tests {
         type Object = FailureObject;
         type PutContext = FailurePutContext;
 
-        async fn get(&self, key: &Key) -> Result<ReadObject<Self::Object>, StoreError> {
+        async fn get(
+            &self,
+            key: &Key,
+            _range: Option<ReadRange>,
+        ) -> Result<GetResult<Self::Object>, StoreError> {
             if self.failure == FailureOperation::Get {
                 return Err(StoreError::new(
                     StoreErrorKind::Internal,
@@ -791,7 +924,7 @@ mod tests {
                 object.content_type.clone(),
                 object.contents.len() as u64,
             );
-            Ok(ReadObject::new(metadata, object))
+            Ok(GetResult::Found(ReadObject::new(metadata, object)))
         }
 
         async fn stat(&self, key: &Key) -> Result<ObjectMetadata, StoreError> {
@@ -952,6 +1085,46 @@ mod tests {
         );
     }
 
+    #[test]
+    fn range_parser_accepts_supported_forms_and_ignores_unknown_units() {
+        let cases = [
+            ("bytes=0-9", Some(ReadRange::Closed { start: 0, end: 9 })),
+            ("BYTES=10-", Some(ReadRange::From { start: 10 })),
+            ("bytes=-25", Some(ReadRange::Suffix { length: 25 })),
+            (" \tByTeS=2-4\t ", Some(ReadRange::Closed { start: 2, end: 4 })),
+            ("items=0-9", None),
+        ];
+        for (value, expected) in cases {
+            let mut headers = http::HeaderMap::new();
+            headers.insert(header::RANGE, value.parse().unwrap());
+            assert_eq!(parse_range_header(&headers).unwrap(), expected);
+        }
+    }
+
+    #[test]
+    fn range_parser_rejects_malformed_duplicate_and_overflowing_ranges() {
+        let cases = [
+            "bytes=",
+            "bytes=-",
+            "bytes=abc-def",
+            "bytes=0-1,2-3",
+            "bytes=1-2-3",
+            "bytes=5-4",
+            "bytes=18446744073709551616-",
+            "bytes=0-18446744073709551616",
+        ];
+        for value in cases {
+            let mut headers = http::HeaderMap::new();
+            headers.insert(header::RANGE, value.parse().unwrap());
+            assert!(parse_range_header(&headers).is_err(), "accepted {value:?}");
+        }
+
+        let mut headers = http::HeaderMap::new();
+        headers.append(header::RANGE, "bytes=0-1".parse().unwrap());
+        headers.append(header::RANGE, "bytes=2-3".parse().unwrap());
+        assert!(parse_range_header(&headers).is_err());
+    }
+
     #[tokio::test]
     async fn catalogue_constructs_and_looks_up_exact_keys() {
         let store = sample_store();
@@ -960,11 +1133,11 @@ mod tests {
         assert_eq!(stored_object(&store, "image.jpg").await.object().contents(), IMAGE);
         assert_eq!(stored_object(&store, "video.mp4").await.object().contents(), VIDEO);
         assert_eq!(
-            store.get(&Key::new("IMAGE.jpg").unwrap()).await.unwrap_err().kind(),
+            store.get(&Key::new("IMAGE.jpg").unwrap(), None).await.unwrap_err().kind(),
             StoreErrorKind::NotFound
         );
         assert_eq!(
-            store.get(&Key::new("missing").unwrap()).await.unwrap_err().kind(),
+            store.get(&Key::new("missing").unwrap(), None).await.unwrap_err().kind(),
             StoreErrorKind::NotFound
         );
     }
@@ -1091,13 +1264,7 @@ mod tests {
         sender: &mut client::SendRequest<Bytes>,
         path: &str,
     ) -> Result<http::Response<h2::RecvStream>, h2::Error> {
-        let request = Request::builder()
-            .method(Method::GET)
-            .uri(path)
-            .body(())
-            .unwrap();
-        let (response, _) = sender.send_request(request, true)?;
-        response.await
+        request_with_headers(sender, Method::GET, path, &[]).await
     }
 
     async fn request(
@@ -1105,7 +1272,20 @@ mod tests {
         method: Method,
         path: &str,
     ) -> Result<http::Response<h2::RecvStream>, h2::Error> {
-        let request = Request::builder().method(method).uri(path).body(()).unwrap();
+        request_with_headers(sender, method, path, &[]).await
+    }
+
+    async fn request_with_headers(
+        sender: &mut client::SendRequest<Bytes>,
+        method: Method,
+        path: &str,
+        headers: &[(&str, &str)],
+    ) -> Result<http::Response<h2::RecvStream>, h2::Error> {
+        let mut builder = Request::builder().method(method).uri(path);
+        for (name, value) in headers {
+            builder = builder.header(*name, *value);
+        }
+        let request = builder.body(()).unwrap();
         let (response, _) = sender.send_request(request, true)?;
         response.await
     }
@@ -1198,6 +1378,7 @@ mod tests {
     ) {
         assert_eq!(response.status(), StatusCode::OK);
         assert_eq!(response.headers()[header::CONTENT_TYPE], content_type);
+        assert_eq!(response.headers()[header::ACCEPT_RANGES], "bytes");
         assert_eq!(
             response.headers()[header::CONTENT_LENGTH],
             length.to_string()
@@ -1218,6 +1399,143 @@ mod tests {
             .unwrap();
         assert_success_headers(&video, "video/mp4", VIDEO.len());
         assert_eq!(collect(video.into_body()).await.unwrap(), VIDEO);
+    }
+
+    #[tokio::test]
+    async fn range_get_returns_exact_partial_headers_and_bytes() {
+        let store = Store::new([object(
+            "item",
+            "application/octet-stream",
+            Bytes::from_static(b"0123456789"),
+        )])
+        .unwrap();
+        let mut connection = connection(store, None).await;
+        let cases: [(&str, &[u8], &str); 7] = [
+            ("bytes=0-2", b"012", "bytes 0-2/10"),
+            ("bytes=3-5", b"345", "bytes 3-5/10"),
+            ("bytes=9-9", b"9", "bytes 9-9/10"),
+            ("bytes=7-", b"789", "bytes 7-9/10"),
+            ("bytes=-4", b"6789", "bytes 6-9/10"),
+            ("bytes=8-100", b"89", "bytes 8-9/10"),
+            ("bytes=0-99", b"0123456789", "bytes 0-9/10"),
+        ];
+
+        for (range, expected, content_range) in cases {
+            let response = request_with_headers(
+                &mut connection.sender,
+                Method::GET,
+                "/objects/item",
+                &[("range", range)],
+            )
+            .await
+            .unwrap();
+            assert_eq!(response.status(), StatusCode::PARTIAL_CONTENT);
+            assert_eq!(response.headers()[header::CONTENT_TYPE], "application/octet-stream");
+            assert_eq!(response.headers()[header::CONTENT_LENGTH], expected.len().to_string());
+            assert_eq!(response.headers()[header::CONTENT_RANGE], content_range);
+            assert_eq!(response.headers()[header::ACCEPT_RANGES], "bytes");
+            assert_eq!(collect(response.into_body()).await.unwrap(), expected);
+        }
+    }
+
+    #[tokio::test]
+    async fn unsatisfiable_ranges_return_416_with_complete_length_and_bounded_body() {
+        let store = Store::new([
+            object("item", "application/octet-stream", Bytes::from_static(b"123")),
+            object("empty", "application/octet-stream", Bytes::new()),
+        ])
+        .unwrap();
+        let mut connection = connection(store, None).await;
+        for (key, range, complete_length) in [
+            ("item", "bytes=3-", 3),
+            ("item", "bytes=20-30", 3),
+            ("item", "bytes=-0", 3),
+            ("empty", "bytes=0-0", 0),
+        ] {
+            let response = request_with_headers(
+                &mut connection.sender,
+                Method::GET,
+                &format!("/objects/{key}"),
+                &[("range", range)],
+            )
+            .await
+            .unwrap();
+            assert_eq!(response.status(), StatusCode::RANGE_NOT_SATISFIABLE);
+            assert_eq!(response.headers()[header::ACCEPT_RANGES], "bytes");
+            assert_eq!(
+                response.headers()[header::CONTENT_RANGE],
+                format!("bytes */{complete_length}")
+            );
+            assert_eq!(
+                response.headers()[header::CONTENT_LENGTH],
+                RANGE_NOT_SATISFIABLE_BODY.len().to_string()
+            );
+            assert_eq!(
+                collect(response.into_body()).await.unwrap(),
+                RANGE_NOT_SATISFIABLE_BODY
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn malformed_ranges_return_400_and_unknown_units_return_complete_get() {
+        let store = Store::new([object(
+            "item",
+            "application/octet-stream",
+            Bytes::from_static(b"0123456789"),
+        )])
+        .unwrap();
+        let mut connection = connection(store, None).await;
+        for range in [
+            "bytes=abc",
+            "bytes=18446744073709551616-",
+            "bytes=4-3",
+            "bytes=0-1,4-5",
+        ] {
+            let response = request_with_headers(
+                &mut connection.sender,
+                Method::GET,
+                "/objects/item",
+                &[("range", range)],
+            )
+            .await
+            .unwrap();
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+            assert_eq!(collect(response.into_body()).await.unwrap(), BAD_REQUEST_BODY);
+        }
+
+        let response = request_with_headers(
+            &mut connection.sender,
+            Method::GET,
+            "/objects/item",
+            &[("range", "bytes=0-1"), ("range", "bytes=2-3")],
+        )
+        .await
+        .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(collect(response.into_body()).await.unwrap(), BAD_REQUEST_BODY);
+
+        let response = request_with_headers(
+            &mut connection.sender,
+            Method::GET,
+            "/objects/item",
+            &[("range", "items=0-1")],
+        )
+        .await
+        .unwrap();
+        assert_success_headers(&response, "application/octet-stream", 10);
+        assert_eq!(collect(response.into_body()).await.unwrap(), b"0123456789");
+
+        let response = request_with_headers(
+            &mut connection.sender,
+            Method::GET,
+            "/objects/missing",
+            &[("range", "bytes=0-1")],
+        )
+        .await
+        .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        assert_eq!(collect(response.into_body()).await.unwrap(), NOT_FOUND_BODY);
     }
 
     #[test]
@@ -1332,6 +1650,7 @@ mod tests {
         assert_eq!(response.status(), StatusCode::OK);
         assert_eq!(response.headers()[header::CONTENT_TYPE], "image/jpeg");
         assert_eq!(response.headers()[header::CONTENT_LENGTH], IMAGE.len().to_string());
+        assert_eq!(response.headers()[header::ACCEPT_RANGES], "bytes");
         assert!(response.body().is_end_stream());
         assert!(collect(response.into_body()).await.unwrap().is_empty());
 
@@ -1339,6 +1658,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.headers()[header::CONTENT_LENGTH], "0");
+        assert_eq!(response.headers()[header::ACCEPT_RANGES], "bytes");
         assert_empty_response(response, StatusCode::OK).await;
 
         let response = request(&mut connection.sender, Method::HEAD, "/objects/missing")
@@ -1366,6 +1686,7 @@ mod tests {
         assert_eq!(response.status(), StatusCode::OK);
         assert_eq!(response.headers()[header::CONTENT_TYPE], "image/jpeg");
         assert_eq!(response.headers()[header::CONTENT_LENGTH], "15");
+        assert_eq!(response.headers()[header::ACCEPT_RANGES], "bytes");
         assert_empty_response(response, StatusCode::OK).await;
 
         let store = FailureStore::with_existing_object(FailureOperation::Stat);
@@ -1375,6 +1696,38 @@ mod tests {
             .unwrap();
         assert!(!response.headers().contains_key(header::CONTENT_LENGTH));
         assert_empty_response(response, StatusCode::INTERNAL_SERVER_ERROR).await;
+    }
+
+    #[tokio::test]
+    async fn head_ignores_valid_malformed_and_duplicate_range_headers() {
+        let store = Store::new([object(
+            "item",
+            "application/octet-stream",
+            Bytes::from_static(b"0123456789"),
+        )])
+        .unwrap();
+        let mut connection = connection(store, None).await;
+
+        for ranges in [
+            vec![("range", "bytes=2-4")],
+            vec![("range", "bytes=malformed")],
+            vec![("range", "bytes=0-1"), ("range", "bytes=2-3")],
+        ] {
+            let response = request_with_headers(
+                &mut connection.sender,
+                Method::HEAD,
+                "/objects/item",
+                &ranges,
+            )
+            .await
+            .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            assert_eq!(response.headers()[header::CONTENT_TYPE], "application/octet-stream");
+            assert_eq!(response.headers()[header::CONTENT_LENGTH], "10");
+            assert_eq!(response.headers()[header::ACCEPT_RANGES], "bytes");
+            assert!(!response.headers().contains_key(header::CONTENT_RANGE));
+            assert_empty_response(response, StatusCode::OK).await;
+        }
     }
 
     #[tokio::test]
@@ -1719,7 +2072,7 @@ mod tests {
 
         assert_eq!(object_count(&store).await, 2);
         assert_eq!(
-            store.get(&Key::new("missing-type").unwrap()).await.unwrap_err().kind(),
+            store.get(&Key::new("missing-type").unwrap(), None).await.unwrap_err().kind(),
             StoreErrorKind::NotFound
         );
     }
@@ -1747,7 +2100,7 @@ mod tests {
         assert_eq!(collect(response.into_body()).await.unwrap(), BAD_REQUEST_BODY);
         assert_eq!(object_count(&store).await, 2);
         assert_eq!(
-            store.get(&Key::new("duplicate-type").unwrap()).await.unwrap_err().kind(),
+            store.get(&Key::new("duplicate-type").unwrap(), None).await.unwrap_err().kind(),
             StoreErrorKind::NotFound
         );
     }

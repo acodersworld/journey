@@ -141,15 +141,17 @@ On cancellation, connection loss, timeout, or storage failure:
 Conceptually:
 
 ```text
-get(logical_key) -> object_metadata + complete_payload
+get(logical_key, optional_range) -> object_metadata + payload + optional_span
 ```
 
-The current Rust interface returns metadata and the complete payload as
-`Bytes`. A future filesystem backend may return a payload reader. Physical
-container headers are never returned through the object interface.
+The Rust interface returns metadata and the payload as `Bytes`. A complete GET
+has no selected span; a ranged GET carries the selected offset and size along
+with the full object metadata. The in-memory backend resolves one range while
+holding its read lock and returns a shared `Bytes` slice, so the selected bytes
+and metadata come from the same object version without copying the payload.
+Physical container headers are never returned through the object interface.
 
-Position/size reads and byte ranges are deferred. When designed, a range model
-may support one of:
+One range may use any of these forms:
 
 ```text
 complete payload
@@ -158,9 +160,10 @@ bytes=start-
 bytes=-suffix_length
 ```
 
-Multiple ranges in one request are not initially supported. A valid range
-returns the selected payload bytes and describes positions relative to the
-payload, not the physical container file.
+Multiple ranges in one request are not supported. A valid range returns the
+selected payload bytes and describes positions relative to the payload, not the
+physical container file. The in-memory backend supports this slice operation;
+streaming range reads from a future filesystem backend remain future work.
 
 The service validates the stored header, requested logical key, physical
 length, and requested range before or while establishing the stream. It does

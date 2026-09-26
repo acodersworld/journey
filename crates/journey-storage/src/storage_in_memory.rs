@@ -1,6 +1,7 @@
 use std::{
     collections::BTreeMap,
     num::NonZeroUsize,
+    ops::Range,
     ops::Bound::{Excluded, Included, Unbounded},
     sync::Arc,
 };
@@ -10,7 +11,8 @@ use tokio::sync::RwLock;
 
 use crate::storage_interface::{
     ContentType, Key, ListCursor, ListPage, ListRequest, ObjectMetadata, ObjectInterface,
-    PutContextInterface, ReadObject, StoreError, StoreErrorKind, StoreInterface,
+    GetResult, PutContextInterface, ReadObject, ReadRange, ReadSpan, StoreError, StoreErrorKind,
+    StoreInterface,
 };
 
 /// One immutable object in a [`Store`].
@@ -123,6 +125,63 @@ impl Store {
             payload_length,
         ))
     }
+
+    fn resolve_range(range: ReadRange, total: u64) -> Result<Option<ReadSpan>, StoreError> {
+        let span = match range {
+            ReadRange::Closed { start, end } => {
+                if end < start {
+                    return Err(StoreError::new(
+                        StoreErrorKind::InvalidRequest,
+                        "Range end precedes range start",
+                    ));
+                }
+                if start >= total {
+                    return Ok(None);
+                }
+                let end = end.min(total - 1);
+                let size = end
+                    .checked_sub(start)
+                    .and_then(|size| size.checked_add(1))
+                    .ok_or_else(|| {
+                        StoreError::new(StoreErrorKind::Internal, "Range size overflow")
+                    })?;
+                ReadSpan::new(start, size)
+            }
+            ReadRange::From { start } => {
+                if start >= total {
+                    return Ok(None);
+                }
+                ReadSpan::new(start, total - start)
+            }
+            ReadRange::Suffix { length } => {
+                if length == 0 || total == 0 {
+                    return Ok(None);
+                }
+                let size = length.min(total);
+                ReadSpan::new(total - size, size)
+            }
+        };
+        Ok(Some(span))
+    }
+
+    fn span_bounds(span: ReadSpan) -> Result<Range<usize>, StoreError> {
+        let offset = usize::try_from(span.offset()).map_err(|error| {
+            StoreError::new(
+                StoreErrorKind::Internal,
+                format!("Range offset does not fit in usize: {error}"),
+            )
+        })?;
+        let size = usize::try_from(span.size()).map_err(|error| {
+            StoreError::new(
+                StoreErrorKind::Internal,
+                format!("Range size does not fit in usize: {error}"),
+            )
+        })?;
+        let end = offset.checked_add(size).ok_or_else(|| {
+            StoreError::new(StoreErrorKind::Internal, "Range end does not fit in usize")
+        })?;
+        Ok(offset..end)
+    }
 }
 
 impl Default for Store {
@@ -135,13 +194,31 @@ impl StoreInterface for Store {
     type Object = Object;
     type PutContext = PutContext;
 
-    async fn get(&self, key: &Key) -> Result<ReadObject<Object>, StoreError> {
+    async fn get(
+        &self,
+        key: &Key,
+        range: Option<ReadRange>,
+    ) -> Result<GetResult<Object>, StoreError> {
         let objects = self.objects.read().await;
         let object = objects.get(key).ok_or_else(|| {
             StoreError::new(StoreErrorKind::NotFound, format!("Object not found: {key}"))
         })?;
         let metadata = Self::metadata_for(key, object)?;
-        Ok(ReadObject::new(metadata, object.clone()))
+        let Some(range) = range else {
+            return Ok(GetResult::Found(ReadObject::new(metadata, object.clone())));
+        };
+        let Some(selected_span) = Self::resolve_range(range, metadata.payload_length())? else {
+            return Ok(GetResult::Unsatisfiable {
+                complete_length: metadata.payload_length(),
+            });
+        };
+        let contents = object.contents.clone().slice(Self::span_bounds(selected_span)?);
+        let selected_object = Object::new(object.content_type.clone(), contents);
+        Ok(GetResult::Found(ReadObject::with_selected_span(
+            metadata,
+            selected_object,
+            selected_span,
+        )))
     }
 
     async fn stat(&self, key: &Key) -> Result<ObjectMetadata, StoreError> {
@@ -240,6 +317,13 @@ mod tests {
         ListRequest::new(prefix, None, NonZeroUsize::new(limit).unwrap())
     }
 
+    fn found(result: GetResult<Object>) -> ReadObject<Object> {
+        match result {
+            GetResult::Found(read_object) => read_object,
+            GetResult::Unsatisfiable { .. } => panic!("complete read was unsatisfiable"),
+        }
+    }
+
     #[test]
     fn default_list_page_limit_is_one_thousand() {
         assert_eq!(
@@ -264,9 +348,10 @@ mod tests {
         .unwrap();
         let key = Key::new("non-empty").unwrap();
 
-        let read = store.get(&key).await.unwrap();
+        let read = found(store.get(&key, None).await.unwrap());
         let metadata = store.stat(&key).await.unwrap();
         assert_eq!(read.metadata(), &metadata);
+        assert_eq!(read.selected_span(), None);
         assert_eq!(read.metadata().key().as_str(), "non-empty");
         assert_eq!(read.metadata().payload_length(), 13);
         assert_eq!(read.object().contents().as_ref(), b"payload bytes");
@@ -276,11 +361,99 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn ranged_get_resolves_closed_open_ended_suffix_and_clamped_ranges() {
+        let contents = Bytes::from_static(b"0123456789");
+        let original_ptr = contents.as_ptr();
+        let store = Store::new([(
+            Key::new("item").unwrap(),
+            Object::new(content_type("application/octet-stream"), contents),
+        )])
+        .unwrap();
+        let key = Key::new("item").unwrap();
+
+        let cases = [
+            (ReadRange::Closed { start: 2, end: 5 }, 2, 4, b"2345".as_slice()),
+            (ReadRange::From { start: 7 }, 7, 3, b"789".as_slice()),
+            (ReadRange::Suffix { length: 4 }, 6, 4, b"6789".as_slice()),
+            (ReadRange::Closed { start: 6, end: 100 }, 6, 4, b"6789".as_slice()),
+            (ReadRange::Suffix { length: 20 }, 0, 10, b"0123456789".as_slice()),
+        ];
+
+        for (range, offset, size, expected) in cases {
+            let read = match store.get(&key, Some(range)).await.unwrap() {
+                GetResult::Found(read) => read,
+                GetResult::Unsatisfiable { .. } => panic!("valid range was unsatisfiable"),
+            };
+            assert_eq!(read.metadata().payload_length(), 10);
+            assert_eq!(read.selected_span(), Some(ReadSpan::new(offset, size)));
+            assert_eq!(read.object().contents().as_ref(), expected);
+            assert_eq!(
+                read.object().contents().as_ptr(),
+                original_ptr.wrapping_add(offset as usize)
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn ranged_get_reports_unsatisfiable_length_and_rejects_reversed_bounds() {
+        let store = Store::new([object("item", b"123"), object("empty", b"")]).unwrap();
+
+        for (key, range, expected_length) in [
+            ("item", ReadRange::Closed { start: 3, end: 4 }, 3),
+            ("item", ReadRange::From { start: 30 }, 3),
+            ("item", ReadRange::Suffix { length: 0 }, 3),
+            ("empty", ReadRange::Closed { start: 0, end: 0 }, 0),
+            ("empty", ReadRange::Suffix { length: 1 }, 0),
+        ] {
+            assert!(matches!(
+                store.get(&Key::new(key).unwrap(), Some(range)).await.unwrap(),
+                GetResult::Unsatisfiable { complete_length } if complete_length == expected_length
+            ));
+        }
+
+        let error = store
+            .get(
+                &Key::new("item").unwrap(),
+                Some(ReadRange::Closed { start: 2, end: 1 }),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(error.kind(), StoreErrorKind::InvalidRequest);
+    }
+
+    #[tokio::test]
+    async fn captured_ranged_get_keeps_its_metadata_span_and_bytes_after_replacement() {
+        let store = Store::new([object("item", b"old-version")]).unwrap();
+        let key = Key::new("item").unwrap();
+        let captured = match store
+            .get(&key, Some(ReadRange::Closed { start: 1, end: 4 }))
+            .await
+            .unwrap()
+        {
+            GetResult::Found(read) => read,
+            GetResult::Unsatisfiable { .. } => panic!("valid range was unsatisfiable"),
+        };
+
+        let mut context = store.put_context(content_type("text/plain")).await.unwrap();
+        context.append(&Bytes::from_static(b"new and longer version")).await.unwrap();
+        store.put(&key, context).await.unwrap();
+
+        assert_eq!(captured.metadata().payload_length(), 11);
+        assert_eq!(captured.metadata().content_type().as_header_value(), "application/octet-stream");
+        assert_eq!(captured.selected_span(), Some(ReadSpan::new(1, 4)));
+        assert_eq!(captured.object().contents().as_ref(), b"ld-v");
+        let current = found(store.get(&key, None).await.unwrap());
+        assert_eq!(current.metadata().payload_length(), 22);
+        assert_eq!(current.metadata().content_type().as_header_value(), "text/plain");
+        assert_eq!(current.object().contents().as_ref(), b"new and longer version");
+    }
+
+    #[tokio::test]
     async fn missing_get_and_stat_return_not_found() {
         let store = Store::default();
         let key = Key::new("missing").unwrap();
 
-        assert_eq!(store.get(&key).await.unwrap_err().kind(), StoreErrorKind::NotFound);
+        assert_eq!(store.get(&key, None).await.unwrap_err().kind(), StoreErrorKind::NotFound);
         assert_eq!(store.stat(&key).await.unwrap_err().kind(), StoreErrorKind::NotFound);
     }
 
@@ -292,7 +465,7 @@ mod tests {
         context.append(&Bytes::from_static(b"replacement")).await.unwrap();
         store.put(&key, context).await.unwrap();
 
-        let read = store.get(&key).await.unwrap();
+        let read = found(store.get(&key, None).await.unwrap());
         assert_eq!(read.metadata().payload_length(), 11);
         assert_eq!(read.metadata().content_type().as_header_value(), "text/plain");
         assert_eq!(read.object().contents().as_ref(), b"replacement");
