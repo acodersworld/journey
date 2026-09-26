@@ -6,7 +6,7 @@ use std::{
 };
 
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
-use bytes::Bytes;
+use bytes::{Bytes, BytesMut};
 use http::{
     header,
     Method, Request, Response, StatusCode, Version,
@@ -465,7 +465,7 @@ impl<S: StoreInterface> Service<S> {
             }
         };
 
-        let read_object = match get_result {
+        let mut read_object = match get_result {
             GetResult::Found(read_object) => read_object,
             GetResult::Unsatisfiable { complete_length } => {
                 return send_range_unsatisfiable(respond, complete_length);
@@ -473,20 +473,10 @@ impl<S: StoreInterface> Service<S> {
         };
 
         let metadata = read_object.metadata();
-        let contents = read_object.object().contents();
         let selected_span = read_object.selected_span();
         let content_length = selected_span
             .map(|span| span.size())
             .unwrap_or_else(|| metadata.payload_length());
-        if u64::try_from(contents.len()).ok() != Some(content_length) {
-            eprintln!("storage GET returned inconsistent payload length for key {key:?}");
-            return send_text_response(
-                respond,
-                StatusCode::INTERNAL_SERVER_ERROR,
-                None,
-                STORAGE_ERROR_BODY,
-            );
-        }
         let mut builder = Response::builder()
             .version(Version::HTTP_2)
             .status(if selected_span.is_some() {
@@ -518,13 +508,19 @@ impl<S: StoreInterface> Service<S> {
             );
         }
         let response = builder.body(())?;
-        if contents.is_empty() {
+        if content_length == 0 {
             respond.send_response(response, true)?;
             return Ok(());
         }
 
         let mut stream = respond.send_response(response, false)?;
-        send_payload(&mut stream, contents).await
+        send_object_reader(
+            &mut stream,
+            read_object.object_mut(),
+            content_length,
+            key.as_str(),
+        )
+        .await
     }
 
     async fn handle_head(
@@ -823,18 +819,70 @@ async fn send_payload(
     Ok(())
 }
 
+async fn send_object_reader<O: ObjectInterface>(
+    stream: &mut h2::SendStream<Bytes>,
+    reader: &mut O,
+    content_length: u64,
+    key: &str,
+) -> Result<(), ServiceError> {
+    let mut remaining = content_length;
+    let mut buffer = BytesMut::new();
+    while remaining > 0 {
+        let requested = remaining.min(MAX_DATA_SEGMENT_SIZE as u64) as usize;
+        stream.reserve_capacity(requested);
+        let capacity = stream.capacity();
+        let capacity = if capacity > 0 {
+            capacity
+        } else {
+            poll_fn(|context| match stream.poll_capacity(context) {
+                Poll::Ready(Some(Ok(capacity))) if capacity > 0 => Poll::Ready(Ok(capacity)),
+                Poll::Ready(Some(Ok(_))) | Poll::Pending => Poll::Pending,
+                Poll::Ready(Some(Err(error))) => Poll::Ready(Err(ServiceError::Http2(error))),
+                Poll::Ready(None) => Poll::Ready(Err(ServiceError::StreamClosed)),
+            })
+            .await?
+        };
+        let requested = requested.min(capacity);
+        buffer.resize(requested, 0);
+        let count = match reader.read(&mut buffer).await {
+            Ok(count) if count > 0 && count <= requested => count,
+            Ok(0) => {
+                eprintln!("storage GET reader reached EOF before declared length for key {key:?}");
+                stream.send_reset(h2::Reason::INTERNAL_ERROR);
+                return Ok(());
+            }
+            Ok(count) => {
+                eprintln!(
+                    "storage GET reader returned {count} bytes for a {requested}-byte buffer for key {key:?}"
+                );
+                stream.send_reset(h2::Reason::INTERNAL_ERROR);
+                return Ok(());
+            }
+            Err(error) => {
+                eprintln!("storage GET read failed for key {key:?}: {error}");
+                stream.send_reset(h2::Reason::INTERNAL_ERROR);
+                return Ok(());
+            }
+        };
+        let chunk = Bytes::copy_from_slice(&buffer[..count]);
+        remaining -= count as u64;
+        stream.send_data(chunk, remaining == 0)?;
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::{
         ContentType, GetResult, Key, ListPage, ListRequest, Object, ObjectMetadata,
-        PutCondition, PutContextInterface, ReadObject, ReadRange, Store, StoreError,
+        ObjectReader, PutCondition, PutContextInterface, ReadObject, ReadRange, Store, StoreError,
     };
     use h2::{client, server};
-    use std::{collections::HashMap, num::NonZeroUsize, sync::Arc};
+    use std::{collections::HashMap, future::Future, num::NonZeroUsize, sync::Arc};
     use tokio::{
         io::{duplex, DuplexStream},
-        sync::RwLock,
+        sync::{Notify, RwLock},
         task::{JoinHandle, JoinSet},
     };
 
@@ -860,11 +908,29 @@ mod tests {
         .unwrap()
     }
 
-    async fn stored_object(store: &Store, key: &str) -> ReadObject<Object> {
+    async fn stored_object(store: &Store, key: &str) -> ReadObject<ObjectReader> {
         match store.get(&Key::new(key).unwrap(), None).await.unwrap() {
             GetResult::Found(read_object) => read_object,
             GetResult::Unsatisfiable { .. } => unreachable!(),
         }
+    }
+
+    async fn collect_object<O: ObjectInterface>(read: &mut ReadObject<O>) -> Bytes {
+        let mut buffer = BytesMut::zeroed(3);
+        let mut contents = Vec::new();
+        loop {
+            let count = read.object_mut().read(&mut buffer).await.unwrap();
+            if count == 0 {
+                break;
+            }
+            contents.extend_from_slice(&buffer[..count]);
+        }
+        Bytes::from(contents)
+    }
+
+    async fn collect_stored_object(store: &Store, key: &str) -> Bytes {
+        let mut read = stored_object(store, key).await;
+        collect_object(&mut read).await
     }
 
     async fn object_count(store: &Store) -> usize {
@@ -885,6 +951,11 @@ mod tests {
         Commit,
         PreconditionFailed,
         Get,
+        Read,
+        EarlyEof,
+        ShortRead,
+        OverRead,
+        ReadEmpty,
         Stat,
         List,
         Delete,
@@ -894,11 +965,50 @@ mod tests {
     struct FailureObject {
         content_type: ContentType,
         contents: Bytes,
+        cursor: usize,
+        read_failure: bool,
+        early_eof: bool,
+        over_read: bool,
+        read_limit: usize,
+        read_gate: Option<Arc<Notify>>,
     }
 
     impl ObjectInterface for FailureObject {
-        fn contents(&self) -> &Bytes {
-            &self.contents
+        fn read(
+            &mut self,
+            buffer: &mut BytesMut,
+        ) -> impl Future<Output = Result<usize, StoreError>> + Send {
+            async move {
+                if self.read_failure && self.cursor >= self.read_limit {
+                    if let Some(read_gate) = &self.read_gate {
+                        read_gate.notified().await;
+                    }
+                    return Err(StoreError::new(
+                        StoreErrorKind::Internal,
+                        SECRET_STORAGE_ERROR,
+                    ));
+                }
+                if self.early_eof && self.cursor >= self.read_limit {
+                    if let Some(read_gate) = &self.read_gate {
+                        read_gate.notified().await;
+                    }
+                    return Ok(0);
+                }
+                if self.over_read && self.cursor >= self.read_limit {
+                    if let Some(read_gate) = &self.read_gate {
+                        read_gate.notified().await;
+                    }
+                    return Ok(buffer.len() + 1);
+                }
+                let count = buffer
+                    .len()
+                    .min(self.contents.len() - self.cursor)
+                    .min(self.read_limit);
+                buffer[..count]
+                    .copy_from_slice(&self.contents[self.cursor..self.cursor + count]);
+                self.cursor += count;
+                Ok(count)
+            }
         }
     }
 
@@ -928,6 +1038,7 @@ mod tests {
     struct FailureStore {
         failure: FailureOperation,
         objects: Arc<RwLock<HashMap<Key, FailureObject>>>,
+        read_gate: Arc<Notify>,
     }
 
     impl FailureStore {
@@ -936,12 +1047,27 @@ mod tests {
                 Key::new("target").unwrap(),
                 FailureObject {
                     content_type: validated_content_type("image/jpeg"),
-                    contents: Bytes::from_static(b"original object"),
+                    contents: if failure == FailureOperation::ReadEmpty {
+                        Bytes::new()
+                    } else {
+                        Bytes::from_static(b"original object")
+                    },
+                    cursor: 0,
+                    read_failure: false,
+                    early_eof: false,
+                    over_read: false,
+                    read_limit: if failure == FailureOperation::ReadEmpty {
+                        0
+                    } else {
+                        usize::MAX
+                    },
+                    read_gate: None,
                 },
             )]);
             Self {
                 failure,
                 objects: Arc::new(RwLock::new(objects)),
+                read_gate: Arc::new(Notify::new()),
             }
         }
     }
@@ -962,9 +1088,30 @@ mod tests {
                 ));
             }
 
-            let object = self.objects.read().await.get(key).cloned().ok_or_else(|| {
+            let mut object = self.objects.read().await.get(key).cloned().ok_or_else(|| {
                 StoreError::new(StoreErrorKind::NotFound, "missing test object")
             })?;
+            object.read_failure = matches!(
+                self.failure,
+                FailureOperation::Read | FailureOperation::ReadEmpty
+            );
+            object.early_eof = self.failure == FailureOperation::EarlyEof;
+            object.over_read = self.failure == FailureOperation::OverRead;
+            if matches!(
+                self.failure,
+                FailureOperation::Read | FailureOperation::EarlyEof | FailureOperation::OverRead
+            ) {
+                object.read_gate = Some(Arc::clone(&self.read_gate));
+            }
+            if matches!(
+                self.failure,
+                FailureOperation::Read
+                    | FailureOperation::EarlyEof
+                    | FailureOperation::ShortRead
+                    | FailureOperation::OverRead
+            ) {
+                object.read_limit = 2;
+            }
             let metadata = ObjectMetadata::new(
                 key.clone(),
                 object.content_type.clone(),
@@ -1068,6 +1215,12 @@ mod tests {
                 FailureObject {
                     content_type: put_context.content_type,
                     contents: put_context.contents.into(),
+                    cursor: 0,
+                    read_failure: false,
+                    early_eof: false,
+                    over_read: false,
+                    read_limit: usize::MAX,
+                    read_gate: None,
                 },
             );
             Ok(())
@@ -1227,8 +1380,8 @@ mod tests {
         let store = sample_store();
 
         assert_eq!(object_count(&store).await, 2);
-        assert_eq!(stored_object(&store, "image.jpg").await.object().contents(), IMAGE);
-        assert_eq!(stored_object(&store, "video.mp4").await.object().contents(), VIDEO);
+        assert_eq!(collect_stored_object(&store, "image.jpg").await.as_ref(), IMAGE);
+        assert_eq!(collect_stored_object(&store, "video.mp4").await.as_ref(), VIDEO);
         assert_eq!(
             store.get(&Key::new("IMAGE.jpg").unwrap(), None).await.unwrap_err().kind(),
             StoreErrorKind::NotFound
@@ -1272,13 +1425,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn lookup_clone_shares_payload_allocation() {
+    async fn lookup_returns_a_reader_over_the_stored_payload() {
         let payload = Bytes::from(vec![7; 32]);
-        let original_ptr = payload.as_ptr();
         let store = Store::new([object("payload", "application/octet-stream", payload)]).unwrap();
-        let cloned = stored_object(&store, "payload").await;
+        let mut cloned = stored_object(&store, "payload").await;
 
-        assert_eq!(cloned.object().contents().as_ptr(), original_ptr);
+        assert_eq!(collect_object(&mut cloned).await.as_ref(), vec![7; 32]);
     }
 
     #[tokio::test]
@@ -1298,7 +1450,7 @@ mod tests {
         first.append(&Bytes::from_static(b"first")).await.unwrap();
         store.put(first).await.unwrap();
         assert_eq!(
-            stored_object(&clone, "new").await.object().contents().as_ref(),
+            collect_stored_object(&clone, "new").await.as_ref(),
             b"first"
         );
         let mut second = clone
@@ -1312,10 +1464,10 @@ mod tests {
         second.append(&Bytes::from_static(b"second")).await.unwrap();
         clone.put(second).await.unwrap();
 
-        let replaced = stored_object(&store, "new").await;
-        assert_eq!(replaced.object().contents().as_ref(), b"second");
+        let mut replaced = stored_object(&store, "new").await;
         assert_eq!(replaced.metadata().content_type().as_header_value().as_bytes(), b"application/json");
         assert_eq!(object_count(&store).await, 3);
+        assert_eq!(collect_object(&mut replaced).await.as_ref(), b"second");
     }
 
     struct TestConnection {
@@ -1761,6 +1913,58 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn get_reader_errors_and_early_eof_reset_after_headers() {
+        for failure in [
+            FailureOperation::Read,
+            FailureOperation::EarlyEof,
+            FailureOperation::OverRead,
+        ] {
+            let store = FailureStore::with_existing_object(failure);
+            let read_gate = Arc::clone(&store.read_gate);
+            let mut connection = connection(store, None).await;
+            let response = get(&mut connection.sender, "/objects/target")
+                .await
+                .unwrap();
+
+            assert_eq!(response.status(), StatusCode::OK);
+            assert_eq!(response.headers()[header::CONTENT_LENGTH], "15");
+            let mut body = response.into_body();
+            let prefix = body.data().await.unwrap().unwrap();
+            body.flow_control().release_capacity(prefix.len()).unwrap();
+            assert_eq!(&prefix[..], b"or");
+            read_gate.notify_one();
+            assert!(body.data().await.unwrap().is_err());
+        }
+    }
+
+    #[tokio::test]
+    async fn get_continues_after_short_positive_reader_reads() {
+        let store = FailureStore::with_existing_object(FailureOperation::ShortRead);
+        let mut connection = connection(store, None).await;
+        let response = get(&mut connection.sender, "/objects/target")
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.headers()[header::CONTENT_LENGTH], "15");
+        assert_eq!(collect(response.into_body()).await.unwrap(), b"original object");
+    }
+
+    #[tokio::test]
+    async fn empty_get_sends_end_stream_without_reading_the_object() {
+        let store = FailureStore::with_existing_object(FailureOperation::ReadEmpty);
+        let mut connection = connection(store, None).await;
+        let response = get(&mut connection.sender, "/objects/target")
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.headers()[header::CONTENT_LENGTH], "0");
+        assert!(response.body().is_end_stream());
+        assert!(collect(response.into_body()).await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
     async fn head_uses_stat_and_returns_metadata_without_a_body() {
         let store = Store::new([
             object("image.jpg", "image/jpeg", Bytes::from_static(IMAGE)),
@@ -2056,7 +2260,7 @@ mod tests {
             .unwrap();
         assert_success_headers(&response, "application/octet-stream", uploaded.len());
         assert_eq!(collect(response.into_body()).await.unwrap(), uploaded);
-        assert_eq!(stored_object(&store, "uploaded.bin").await.object().contents().as_ref(), uploaded);
+        assert_eq!(collect_stored_object(&store, "uploaded.bin").await.as_ref(), uploaded);
     }
 
     #[tokio::test]
@@ -2107,9 +2311,9 @@ mod tests {
             .unwrap();
         assert_success_headers(&response, "image/png", b"new image".len());
         assert_eq!(collect(response.into_body()).await.unwrap(), b"new image");
-        let object = stored_object(&store, "image.jpg").await;
+        let mut object = stored_object(&store, "image.jpg").await;
         assert_eq!(object.metadata().content_type().as_header_value().as_bytes(), b"image/png");
-        assert_eq!(object.object().contents().as_ref(), b"new image");
+        assert_eq!(collect_object(&mut object).await.as_ref(), b"new image");
     }
 
     #[tokio::test]
@@ -2149,9 +2353,9 @@ mod tests {
         let failure_body = collect(create_conflict.into_body()).await.unwrap();
         assert_eq!(failure_body, PRECONDITION_FAILED_BODY);
         assert!(!failure_body.windows(b"private".len()).any(|part| part == b"private"));
-        let unchanged = stored_object(&store, "image.jpg").await;
-        assert_eq!(unchanged.object().contents().as_ref(), IMAGE);
+        let mut unchanged = stored_object(&store, "image.jpg").await;
         assert_eq!(unchanged.metadata().content_type().as_header_value().as_bytes(), b"image/jpeg");
+        assert_eq!(collect_object(&mut unchanged).await.as_ref(), IMAGE);
 
         let replace_conflict = put_with_headers(
             &mut connection.sender,
@@ -2178,9 +2382,9 @@ mod tests {
         .unwrap();
         assert_eq!(replaced.status(), StatusCode::OK);
         assert!(collect(replaced.into_body()).await.unwrap().is_empty());
-        let current = stored_object(&store, "image.jpg").await;
-        assert_eq!(current.object().contents().as_ref(), b"replacement");
+        let mut current = stored_object(&store, "image.jpg").await;
         assert_eq!(current.metadata().content_type().as_header_value().as_bytes(), b"image/png");
+        assert_eq!(collect_object(&mut current).await.as_ref(), b"replacement");
     }
 
     #[tokio::test]
@@ -2376,9 +2580,9 @@ mod tests {
         if let Ok(response) = response_result {
             assert!(!response.status().is_success());
         }
-        let original = stored_object(&store, "image.jpg").await;
+        let mut original = stored_object(&store, "image.jpg").await;
         assert_eq!(original.metadata().content_type().as_header_value().as_bytes(), b"image/jpeg");
-        assert_eq!(original.object().contents().as_ref(), IMAGE);
+        assert_eq!(collect_object(&mut original).await.as_ref(), IMAGE);
     }
 
     #[tokio::test]
@@ -2396,9 +2600,9 @@ mod tests {
         stream.send_reset(h2::Reason::CANCEL);
         assert!(response.await.is_err());
 
-        let original = stored_object(&store, "image.jpg").await;
+        let mut original = stored_object(&store, "image.jpg").await;
         assert_eq!(original.metadata().content_type().as_header_value().as_bytes(), b"image/jpeg");
-        assert_eq!(original.object().contents().as_ref(), IMAGE);
+        assert_eq!(collect_object(&mut original).await.as_ref(), IMAGE);
     }
 
     #[tokio::test]
@@ -2423,9 +2627,9 @@ mod tests {
         let put_response = put_response.await.unwrap();
         assert_eq!(put_response.status(), StatusCode::OK);
         assert!(collect(put_response.into_body()).await.unwrap().is_empty());
-        let replacement = stored_object(&store, "image.jpg").await;
+        let mut replacement = stored_object(&store, "image.jpg").await;
         assert_eq!(replacement.metadata().content_type().as_header_value().as_bytes(), b"image/png");
-        assert_eq!(replacement.object().contents().as_ref(), b"replacement bytes");
+        assert_eq!(collect_object(&mut replacement).await.as_ref(), b"replacement bytes");
     }
 
     #[tokio::test]
@@ -2460,9 +2664,11 @@ mod tests {
         assert!(collect(second_response.into_body()).await.unwrap().is_empty());
 
         let final_object = stored_object(&store, "shared").await;
-        let is_first = final_object.object().contents().as_ref() == b"first-candidate"
+        let mut final_object = final_object;
+        let final_contents = collect_object(&mut final_object).await;
+        let is_first = final_contents.as_ref() == b"first-candidate"
             && final_object.metadata().content_type().as_header_value().as_bytes() == b"text/plain";
-        let is_second = final_object.object().contents().as_ref() == b"second-candidate"
+        let is_second = final_contents.as_ref() == b"second-candidate"
             && final_object.metadata().content_type().as_header_value().as_bytes() == b"application/json";
         assert!(is_first || is_second);
     }

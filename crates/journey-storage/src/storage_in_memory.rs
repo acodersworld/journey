@@ -1,12 +1,13 @@
 use std::{
     collections::BTreeMap,
+    future::Future,
     num::NonZeroUsize,
     ops::Range,
     ops::Bound::{Excluded, Included, Unbounded},
     sync::Arc,
 };
 
-use bytes::Bytes;
+use bytes::{Bytes, BytesMut};
 use tokio::sync::RwLock;
 
 use crate::storage_interface::{
@@ -35,9 +36,31 @@ impl Object {
     }
 }
 
-impl ObjectInterface for Object {
-    fn contents(&self) -> &Bytes {
-        &self.contents
+/// A per-GET reader over an immutable view of an object's selected bytes.
+#[derive(Clone, Debug)]
+pub struct ObjectReader {
+    contents: Bytes,
+    cursor: usize,
+}
+
+impl ObjectReader {
+    fn new(contents: Bytes) -> Self {
+        Self { contents, cursor: 0 }
+    }
+}
+
+impl ObjectInterface for ObjectReader {
+    fn read(
+        &mut self,
+        buffer: &mut BytesMut,
+    ) -> impl Future<Output = Result<usize, StoreError>> + Send {
+        async move {
+            let count = buffer.len().min(self.contents.len() - self.cursor);
+            buffer[..count]
+                .copy_from_slice(&self.contents[self.cursor..self.cursor + count]);
+            self.cursor += count;
+            Ok(count)
+        }
     }
 }
 
@@ -193,21 +216,24 @@ impl Default for Store {
 }
 
 impl StoreInterface for Store {
-    type Object = Object;
+    type Object = ObjectReader;
     type PutContext = PutContext;
 
     async fn get(
         &self,
         key: &Key,
         range: Option<ReadRange>,
-    ) -> Result<GetResult<Object>, StoreError> {
+    ) -> Result<GetResult<ObjectReader>, StoreError> {
         let objects = self.objects.read().await;
         let object = objects.get(key).ok_or_else(|| {
             StoreError::new(StoreErrorKind::NotFound, format!("Object not found: {key}"))
         })?;
         let metadata = Self::metadata_for(key, object)?;
         let Some(range) = range else {
-            return Ok(GetResult::Found(ReadObject::new(metadata, object.clone())));
+            return Ok(GetResult::Found(ReadObject::new(
+                metadata,
+                ObjectReader::new(object.contents.clone()),
+            )));
         };
         let Some(selected_span) = Self::resolve_range(range, metadata.payload_length())? else {
             return Ok(GetResult::Unsatisfiable {
@@ -215,10 +241,9 @@ impl StoreInterface for Store {
             });
         };
         let contents = object.contents.clone().slice(Self::span_bounds(selected_span)?);
-        let selected_object = Object::new(object.content_type.clone(), contents);
         Ok(GetResult::Found(ReadObject::with_selected_span(
             metadata,
-            selected_object,
+            ObjectReader::new(contents),
             selected_span,
         )))
     }
@@ -341,11 +366,24 @@ mod tests {
         ListRequest::new(prefix, None, NonZeroUsize::new(limit).unwrap())
     }
 
-    fn found(result: GetResult<Object>) -> ReadObject<Object> {
+    fn found(result: GetResult<ObjectReader>) -> ReadObject<ObjectReader> {
         match result {
             GetResult::Found(read_object) => read_object,
             GetResult::Unsatisfiable { .. } => panic!("complete read was unsatisfiable"),
         }
+    }
+
+    async fn collect_object(mut read: ReadObject<ObjectReader>) -> Bytes {
+        let mut buffer = BytesMut::zeroed(3);
+        let mut contents = Vec::new();
+        loop {
+            let count = read.object_mut().read(&mut buffer).await.unwrap();
+            if count == 0 {
+                break;
+            }
+            contents.extend_from_slice(&buffer[..count]);
+        }
+        Bytes::from(contents)
     }
 
     #[test]
@@ -378,10 +416,40 @@ mod tests {
         assert_eq!(read.selected_span(), None);
         assert_eq!(read.metadata().key().as_str(), "non-empty");
         assert_eq!(read.metadata().payload_length(), 13);
-        assert_eq!(read.object().contents().as_ref(), b"payload bytes");
+        assert_eq!(collect_object(read).await.as_ref(), b"payload bytes");
 
         let empty = store.stat(&Key::new("empty").unwrap()).await.unwrap();
         assert_eq!(empty.payload_length(), 0);
+    }
+
+    #[tokio::test]
+    async fn get_readers_have_independent_cursors_and_zero_length_reads_do_not_advance() {
+        let store = Store::new([object("item", b"abcdef")]).unwrap();
+        let key = Key::new("item").unwrap();
+        let mut first = found(store.get(&key, None).await.unwrap());
+        let mut second = found(store.get(&key, None).await.unwrap());
+        let mut buffer = BytesMut::zeroed(2);
+
+        assert_eq!(first.object_mut().read(&mut buffer).await.unwrap(), 2);
+        assert_eq!(&buffer[..], b"ab");
+        assert_eq!(buffer.len(), 2);
+
+        buffer.clear();
+        assert_eq!(first.object_mut().read(&mut buffer).await.unwrap(), 0);
+        assert!(buffer.is_empty());
+
+        buffer.resize(3, 0);
+        assert_eq!(first.object_mut().read(&mut buffer).await.unwrap(), 3);
+        assert_eq!(&buffer[..], b"cde");
+
+        buffer.resize(2, 0);
+        assert_eq!(second.object_mut().read(&mut buffer).await.unwrap(), 2);
+        assert_eq!(&buffer[..], b"ab");
+        assert_eq!(second.object_mut().read(&mut buffer).await.unwrap(), 2);
+        assert_eq!(&buffer[..], b"cd");
+        assert_eq!(second.object_mut().read(&mut buffer).await.unwrap(), 2);
+        assert_eq!(&buffer[..], b"ef");
+        assert_eq!(second.object_mut().read(&mut buffer).await.unwrap(), 0);
     }
 
     #[tokio::test]
@@ -410,12 +478,23 @@ mod tests {
             };
             assert_eq!(read.metadata().payload_length(), 10);
             assert_eq!(read.selected_span(), Some(ReadSpan::new(offset, size)));
-            assert_eq!(read.object().contents().as_ref(), expected);
-            assert_eq!(
-                read.object().contents().as_ptr(),
-                original_ptr.wrapping_add(offset as usize)
-            );
+            assert_eq!(collect_object(read).await.as_ref(), expected);
         }
+
+        let complete = found(store.get(&key, None).await.unwrap());
+        assert_eq!(complete.object().contents.as_ptr(), original_ptr);
+        let ranged = match store
+            .get(&key, Some(ReadRange::Closed { start: 2, end: 5 }))
+            .await
+            .unwrap()
+        {
+            GetResult::Found(read) => read,
+            GetResult::Unsatisfiable { .. } => panic!("valid range was unsatisfiable"),
+        };
+        assert_eq!(
+            ranged.object().contents.as_ptr(),
+            original_ptr.wrapping_add(2)
+        );
     }
 
     #[tokio::test]
@@ -468,11 +547,11 @@ mod tests {
         assert_eq!(captured.metadata().payload_length(), 11);
         assert_eq!(captured.metadata().content_type().as_header_value(), "application/octet-stream");
         assert_eq!(captured.selected_span(), Some(ReadSpan::new(1, 4)));
-        assert_eq!(captured.object().contents().as_ref(), b"ld-v");
+        assert_eq!(collect_object(captured).await.as_ref(), b"ld-v");
         let current = found(store.get(&key, None).await.unwrap());
         assert_eq!(current.metadata().payload_length(), 22);
         assert_eq!(current.metadata().content_type().as_header_value(), "text/plain");
-        assert_eq!(current.object().contents().as_ref(), b"new and longer version");
+        assert_eq!(collect_object(current).await.as_ref(), b"new and longer version");
     }
 
     #[tokio::test]
@@ -498,7 +577,7 @@ mod tests {
         let read = found(store.get(&key, None).await.unwrap());
         assert_eq!(read.metadata().payload_length(), 11);
         assert_eq!(read.metadata().content_type().as_header_value(), "text/plain");
-        assert_eq!(read.object().contents().as_ref(), b"replacement");
+        assert_eq!(collect_object(read).await.as_ref(), b"replacement");
     }
 
     #[tokio::test]
@@ -514,7 +593,7 @@ mod tests {
             .unwrap();
         create.append(&Bytes::from_static(b"created")).await.unwrap();
         store.put(create).await.unwrap();
-        assert_eq!(found(store.get(&absent, None).await.unwrap()).object().contents().as_ref(), b"created");
+        assert_eq!(collect_object(found(store.get(&absent, None).await.unwrap())).await.as_ref(), b"created");
 
         let empty_create = store
             .put_context(present.clone(), content_type("application/json"), PutCondition::CreateOnly)
@@ -523,8 +602,8 @@ mod tests {
         let error = store.put(empty_create).await.unwrap_err();
         assert_eq!(error.kind(), StoreErrorKind::PreconditionFailed);
         let unchanged = found(store.get(&present, None).await.unwrap());
-        assert_eq!(unchanged.object().contents().as_ref(), b"original");
         assert_eq!(unchanged.metadata().content_type().as_header_value(), "application/octet-stream");
+        assert_eq!(collect_object(unchanged).await.as_ref(), b"original");
 
         let empty_replace = store
             .put_context(missing.clone(), content_type("text/plain"), PutCondition::ReplaceOnly)
@@ -532,7 +611,7 @@ mod tests {
             .unwrap();
         assert_eq!(store.put(empty_replace).await.unwrap_err().kind(), StoreErrorKind::PreconditionFailed);
         assert_eq!(store.get(&missing, None).await.unwrap_err().kind(), StoreErrorKind::NotFound);
-        assert_eq!(found(store.get(&absent, None).await.unwrap()).object().contents().as_ref(), b"created");
+        assert_eq!(collect_object(found(store.get(&absent, None).await.unwrap())).await.as_ref(), b"created");
 
         let mut replace = store
             .put_context(present.clone(), content_type("application/json"), PutCondition::ReplaceOnly)
@@ -541,8 +620,8 @@ mod tests {
         replace.append(&Bytes::from_static(b"replaced")).await.unwrap();
         store.put(replace).await.unwrap();
         let replaced = found(store.get(&present, None).await.unwrap());
-        assert_eq!(replaced.object().contents().as_ref(), b"replaced");
         assert_eq!(replaced.metadata().content_type().as_header_value(), "application/json");
+        assert_eq!(collect_object(replaced).await.as_ref(), b"replaced");
     }
 
     #[tokio::test]
@@ -588,8 +667,8 @@ mod tests {
             Err(error) => assert_eq!(error.kind(), StoreErrorKind::NotFound),
             Ok(result) => {
                 let published = found(result);
-                assert_eq!(published.object().contents().as_ref(), b"replacement");
                 assert_eq!(published.metadata().content_type().as_header_value(), "text/plain");
+                assert_eq!(collect_object(published).await.as_ref(), b"replacement");
             }
         }
     }

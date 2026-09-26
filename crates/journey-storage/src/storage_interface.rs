@@ -1,4 +1,4 @@
-use bytes::Bytes;
+use bytes::{Bytes, BytesMut};
 use http::HeaderValue;
 use std::{
     fmt,
@@ -175,6 +175,10 @@ impl<O> ReadObject<O> {
         &self.object
     }
 
+    pub fn object_mut(&mut self) -> &mut O {
+        &mut self.object
+    }
+
     pub fn selected_span(&self) -> Option<ReadSpan> {
         self.selected_span
     }
@@ -298,8 +302,16 @@ impl ListPage {
 }
 
 pub trait ObjectInterface: Send + Sync + 'static {
-    /// Returns the immutable payload bytes.
-    fn contents(&self) -> &Bytes;
+    /// Reads at most the buffer's initialized length without changing that length.
+    ///
+    /// A zero-length buffer returns `Ok(0)` without moving the cursor. With a
+    /// positive-length buffer, `Ok(0)` means the selected object is exhausted.
+    /// Successful reads advance the reader by the returned count; short
+    /// positive reads are valid, and errors must not advance the reader.
+    fn read(
+        &mut self,
+        buffer: &mut BytesMut,
+    ) -> impl Future<Output = Result<usize, StoreError>> + Send;
 }
 
 pub trait PutContextInterface {

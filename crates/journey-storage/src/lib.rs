@@ -13,5 +13,5 @@ pub use storage_interface::{
     ObjectInterface, ObjectMetadata, PutCondition, PutContextInterface, ReadObject, ReadRange,
     ReadSpan, StoreError, StoreErrorKind, StoreInterface,
 };
-pub use storage_in_memory::{Object, PutContext, Store, StoreConfig};
+pub use storage_in_memory::{Object, ObjectReader, PutContext, Store, StoreConfig};
 pub use http2_storage_service::Service;
