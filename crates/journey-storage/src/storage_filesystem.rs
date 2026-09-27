@@ -62,7 +62,7 @@ impl FilesystemStoreConfig {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub struct FilesystemStore {
     config: FilesystemStoreConfig,
     objects_dir: PathBuf,

@@ -1,6 +1,5 @@
 use std::{
     collections::BTreeMap,
-    future::Future,
     num::NonZeroUsize,
     ops::Range,
     ops::Bound::{Included, Unbounded},
@@ -17,7 +16,7 @@ use crate::storage_interface::{
 };
 
 /// One immutable object in a [`Store`].
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub struct Object {
     content_type: ContentType,
     contents: Bytes,
@@ -37,7 +36,7 @@ impl Object {
 }
 
 /// A per-GET reader over an immutable view of an object's selected bytes.
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub struct ObjectReader {
     contents: Bytes,
     cursor: usize,
@@ -100,7 +99,7 @@ impl Default for StoreConfig {
 }
 
 /// A mutable catalogue of complete objects indexed by exact logical key.
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub struct Store {
     config: StoreConfig,
     objects: Arc<RwLock<BTreeMap<Key, Object>>>,

@@ -70,17 +70,18 @@ fn storage_selection() -> Result<StorageSelection, Box<dyn Error>> {
     Ok(StorageSelection::Filesystem(root.into()))
 }
 
-async fn run_server<S: StoreInterface + Clone + Sync + Send>(
+async fn run_server<S: StoreInterface + Sync + Send>(
     store: S,
     seeded_fixtures: bool,
 ) -> Result<(), Box<dyn Error>> {
+    let store = Arc::new(store);
     let bind = std::env::var("JOURNEY_STORAGE_BIND").unwrap_or_else(|_| DEFAULT_BIND.to_owned());
     let address: SocketAddr = bind.parse()?;
     let listener = TcpListener::bind(address).await.map_err(|error| {
         std::io::Error::new(error.kind(), format!("failed to bind h2c listener at {address}: {error}"))
     })?;
     let bound_address = listener.local_addr()?;
-    let web_store = store.clone();
+    let web_store = Arc::clone(&store);
     let service = Arc::new(Service::new(store));
 
     let web_bind = std::env::var("JOURNEY_STORAGE_WEB_BIND")

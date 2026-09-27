@@ -77,7 +77,7 @@ impl fmt::Display for WebCredentialsError {
 impl std::error::Error for WebCredentialsError {}
 
 struct WebState<S: StoreInterface> {
-    store: S,
+    store: Arc<S>,
     credentials: WebCredentials,
 }
 
@@ -87,7 +87,7 @@ struct WebState<S: StoreInterface> {
 /// before calling this function when another service must share the store.
 pub async fn serve_web_interface<S: StoreInterface>(
     listener: TcpListener,
-    store: S,
+    store: Arc<S>,
     credentials: WebCredentials,
 ) -> std::io::Result<()> {
     let address = listener.local_addr()?;
@@ -633,6 +633,10 @@ mod tests {
         WebCredentials::new("user", "pass").unwrap()
     }
 
+    fn test_router<S: StoreInterface>(store: Arc<S>) -> Router {
+        web_router(Arc::new(WebState { store, credentials: credentials() }))
+    }
+
     fn request(method: &str, uri: &str, authenticated: bool) -> Request<Body> {
         let mut builder = Request::builder().method(method).uri(uri).header(header::HOST, "example.test");
         if authenticated {
@@ -647,12 +651,12 @@ mod tests {
 
     async fn seeded_router() -> Router {
         let content_type = ContentType::try_from_header(&HeaderValue::from_static("text/plain")).unwrap();
-        let store = Store::new([
+        let store = Arc::new(Store::new([
             (Key::new("alpha.txt").unwrap(), Object::new(content_type.clone(), Bytes::from_static(b"alpha"))),
             (Key::new("folder/a.txt").unwrap(), Object::new(content_type.clone(), Bytes::from_static(b"nested"))),
             (Key::new("folder/").unwrap(), Object::new(content_type, Bytes::from_static(b"slash key"))),
-        ]).unwrap();
-        web_router(Arc::new(WebState { store, credentials: credentials() }))
+        ]).unwrap());
+        test_router(store)
     }
 
     #[tokio::test]
@@ -782,7 +786,7 @@ mod tests {
             Key::new(key).unwrap(),
             Object::new(content_type.clone(), Bytes::from_static(b"value")),
         ))).unwrap();
-        let app = web_router(Arc::new(WebState { store, credentials: credentials() }));
+        let app = test_router(Arc::new(store));
 
         let root = app.clone().oneshot(request("GET", "/api/entries?prefix=", true)).await.unwrap();
         let root: serde_json::Value = serde_json::from_slice(&collect(root).await).unwrap();
@@ -819,7 +823,7 @@ mod tests {
             Key::new("unused").unwrap(),
             Object::new(content_type, Bytes::new()),
         )]).unwrap();
-        let app = web_router(Arc::new(WebState { store, credentials: credentials() }));
+        let app = test_router(Arc::new(store));
         let expected: Vec<u8> = (0..160_000).map(|index| (index % 251) as u8).collect();
         let chunks = expected.chunks(8_192).map(|chunk| {
             Ok::<_, Infallible>(Bytes::copy_from_slice(chunk))
@@ -857,7 +861,7 @@ mod tests {
             (Key::new(&key).unwrap(), Object::new(content_type.clone(), Bytes::new()))
         }));
         let store = Store::new(objects).unwrap();
-        let app = web_router(Arc::new(WebState { store, credentials: credentials() }));
+        let app = test_router(Arc::new(store));
         let first = app.clone().oneshot(request("GET", "/api/entries?prefix=", true)).await.unwrap();
         let first: serde_json::Value = serde_json::from_slice(&collect(first).await).unwrap();
         assert_eq!(first["entries"].as_array().unwrap().len(), 100);
@@ -913,7 +917,7 @@ mod tests {
         let nonce = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
         let root = std::env::temp_dir().join(format!("journey-web-interface-{}-{nonce}", std::process::id()));
         let store = FilesystemStore::open(FilesystemStoreConfig::new(&root)).await.unwrap();
-        let app = web_router(Arc::new(WebState { store, credentials: credentials() }));
+        let app = test_router(Arc::new(store));
         let mut upload = request("PUT", "/api/object?key=nested%2Fitem.bin", true);
         upload.headers_mut().insert(header::ORIGIN, HeaderValue::from_static("http://example.test"));
         upload.headers_mut().insert(header::CONTENT_TYPE, HeaderValue::from_static("application/octet-stream"));

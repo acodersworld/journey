@@ -13,6 +13,7 @@ use http::{
 };
 use percent_encoding::percent_decode_str;
 use serde::Serialize;
+use std::sync::Arc;
 
 use crate::storage_interface::{
     ContentType, GetResult, Key, ListCursor, ListRequest, ObjectInterface, ObjectMetadata,
@@ -229,14 +230,20 @@ fn parse_put_condition(headers: &http::HeaderMap) -> Result<PutCondition, ()> {
 }
 
 /// Handles one already accepted HTTP/2 request against a shared catalogue.
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub struct Service<S: StoreInterface> {
-    store: S,
+    store: Arc<S>,
+}
+
+impl<S: StoreInterface> Clone for Service<S> {
+    fn clone(&self) -> Self {
+        Self { store: Arc::clone(&self.store) }
+    }
 }
 
 impl<S: StoreInterface> Service<S> {
     /// Creates a service backed by the supplied mutable catalogue.
-    pub fn new(store: S) -> Self {
+    pub fn new(store: Arc<S>) -> Self {
         Self { store }
     }
 
@@ -893,12 +900,12 @@ mod tests {
         )
     }
 
-    fn sample_store() -> Store {
-        Store::new([
+    fn sample_store() -> Arc<Store> {
+        Arc::new(Store::new([
             object("image.jpg", "image/jpeg", Bytes::from_static(IMAGE)),
             object("video.mp4", "video/mp4", Bytes::from_static(VIDEO)),
         ])
-        .unwrap()
+        .unwrap())
     }
 
     async fn stored_object(store: &Store, key: &str) -> ReadObject<ObjectReader> {
@@ -1454,7 +1461,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn store_clones_share_atomic_insertions_and_replacements() {
+    async fn shared_store_handles_share_atomic_insertions_and_replacements() {
         let store = sample_store();
         let clone = store.clone();
 
@@ -1496,8 +1503,8 @@ mod tests {
         _server_task: JoinHandle<()>,
     }
 
-    async fn connection<S: StoreInterface + Clone>(
-        store: S,
+    async fn connection<S: StoreInterface>(
+        store: Arc<S>,
         client_window: Option<u32>,
     ) -> TestConnection {
         let (client_io, server_io) = duplex(256 * 1024);
@@ -1519,7 +1526,7 @@ mod tests {
         }
     }
 
-    async fn run_test_server<S: StoreInterface + Clone>(io: DuplexStream, service: Service<S>) {
+    async fn run_test_server<S: StoreInterface>(io: DuplexStream, service: Service<S>) {
         let mut connection = server::handshake(io).await.unwrap();
         let mut handlers = JoinSet::new();
         loop {
@@ -1706,7 +1713,7 @@ mod tests {
             Bytes::from_static(b"0123456789"),
         )])
         .unwrap();
-        let mut connection = connection(store, None).await;
+        let mut connection = connection(Arc::new(store), None).await;
         let cases: [(&str, &[u8], &str); 7] = [
             ("bytes=0-2", b"012", "bytes 0-2/10"),
             ("bytes=3-5", b"345", "bytes 3-5/10"),
@@ -1742,7 +1749,7 @@ mod tests {
             object("empty", "application/octet-stream", Bytes::new()),
         ])
         .unwrap();
-        let mut connection = connection(store, None).await;
+        let mut connection = connection(Arc::new(store), None).await;
         for (key, range, complete_length) in [
             ("item", "bytes=3-", 3),
             ("item", "bytes=20-30", 3),
@@ -1782,7 +1789,7 @@ mod tests {
             Bytes::from_static(b"0123456789"),
         )])
         .unwrap();
-        let mut connection = connection(store, None).await;
+        let mut connection = connection(Arc::new(store), None).await;
         for range in [
             "bytes=abc",
             "bytes=18446744073709551616-",
@@ -1859,7 +1866,7 @@ mod tests {
     async fn put_context_failure_returns_bounded_storage_error_without_replacement() {
         let store = FailureStore::with_existing_object(FailureOperation::PutContext);
         let before = store.objects.read().await.get("target").unwrap().clone();
-        let mut connection = connection(store.clone(), None).await;
+        let mut connection = connection(Arc::new(store.clone()), None).await;
 
         let response = put(
             &mut connection.sender,
@@ -1881,7 +1888,7 @@ mod tests {
     async fn append_failure_returns_bounded_storage_error_without_replacement() {
         let store = FailureStore::with_existing_object(FailureOperation::Append);
         let before = store.objects.read().await.get("target").unwrap().clone();
-        let mut connection = connection(store.clone(), None).await;
+        let mut connection = connection(Arc::new(store.clone()), None).await;
 
         let response = put(
             &mut connection.sender,
@@ -1903,7 +1910,7 @@ mod tests {
     async fn commit_failure_returns_bounded_storage_error_without_replacement() {
         let store = FailureStore::with_existing_object(FailureOperation::Commit);
         let before = store.objects.read().await.get("target").unwrap().clone();
-        let mut connection = connection(store.clone(), None).await;
+        let mut connection = connection(Arc::new(store.clone()), None).await;
 
         let response = put(
             &mut connection.sender,
@@ -1924,7 +1931,7 @@ mod tests {
     #[tokio::test]
     async fn get_lookup_failure_returns_bounded_storage_error() {
         let store = FailureStore::with_existing_object(FailureOperation::Get);
-        let mut connection = connection(store, None).await;
+        let mut connection = connection(Arc::new(store), None).await;
 
         let response = get(&mut connection.sender, "/objects/target")
             .await
@@ -1941,7 +1948,7 @@ mod tests {
         ] {
             let store = FailureStore::with_existing_object(failure);
             let read_gate = Arc::clone(&store.read_gate);
-            let mut connection = connection(store, None).await;
+            let mut connection = connection(Arc::new(store), None).await;
             let response = get(&mut connection.sender, "/objects/target")
                 .await
                 .unwrap();
@@ -1960,7 +1967,7 @@ mod tests {
     #[tokio::test]
     async fn get_continues_after_short_positive_reader_reads() {
         let store = FailureStore::with_existing_object(FailureOperation::ShortRead);
-        let mut connection = connection(store, None).await;
+        let mut connection = connection(Arc::new(store), None).await;
         let response = get(&mut connection.sender, "/objects/target")
             .await
             .unwrap();
@@ -1973,7 +1980,7 @@ mod tests {
     #[tokio::test]
     async fn empty_get_sends_end_stream_without_reading_the_object() {
         let store = FailureStore::with_existing_object(FailureOperation::ReadEmpty);
-        let mut connection = connection(store, None).await;
+        let mut connection = connection(Arc::new(store), None).await;
         let response = get(&mut connection.sender, "/objects/target")
             .await
             .unwrap();
@@ -1991,7 +1998,7 @@ mod tests {
             object("empty", "application/octet-stream", Bytes::new()),
         ])
         .unwrap();
-        let mut connection = connection(store, None).await;
+        let mut connection = connection(Arc::new(store), None).await;
 
         let response = request(&mut connection.sender, Method::HEAD, "/objects/image.jpg")
             .await
@@ -2028,7 +2035,7 @@ mod tests {
     #[tokio::test]
     async fn head_does_not_call_get_and_redacts_stat_failures() {
         let store = FailureStore::with_existing_object(FailureOperation::Get);
-        let mut get_failure_connection = connection(store, None).await;
+        let mut get_failure_connection = connection(Arc::new(store), None).await;
         let response = request(&mut get_failure_connection.sender, Method::HEAD, "/objects/target")
             .await
             .unwrap();
@@ -2039,7 +2046,7 @@ mod tests {
         assert_empty_response(response, StatusCode::OK).await;
 
         let store = FailureStore::with_existing_object(FailureOperation::Stat);
-        let mut connection = connection(store, None).await;
+        let mut connection = connection(Arc::new(store), None).await;
         let response = request(&mut connection.sender, Method::HEAD, "/objects/target")
             .await
             .unwrap();
@@ -2055,7 +2062,7 @@ mod tests {
             Bytes::from_static(b"0123456789"),
         )])
         .unwrap();
-        let mut connection = connection(store, None).await;
+        let mut connection = connection(Arc::new(store), None).await;
 
         for ranges in [
             vec![("range", "bytes=2-4")],
@@ -2115,7 +2122,7 @@ mod tests {
     async fn delete_failure_is_bounded_and_preserves_the_object() {
         let store = FailureStore::with_existing_object(FailureOperation::Delete);
         let before = store.objects.read().await.get("target").unwrap().clone();
-        let mut connection = connection(store.clone(), None).await;
+        let mut connection = connection(Arc::new(store.clone()), None).await;
         let response = request(&mut connection.sender, Method::DELETE, "/objects/target")
             .await
             .unwrap();
@@ -2127,13 +2134,13 @@ mod tests {
 
     #[tokio::test]
     async fn list_returns_json_pages_and_continues_after_cursor_key_deletion() {
-        let store = Store::new([
+        let store = Arc::new(Store::new([
             object("photos/a.jpg", "image/jpeg", Bytes::from_static(b"a")),
             object("photos/b plus +.jpg", "image/jpeg", Bytes::from_static(b"bb")),
             object("photos/éété.jpg", "image/jpeg", Bytes::from_static(b"ccc")),
             object("videos/c.mp4", "video/mp4", Bytes::from_static(b"dddd")),
         ])
-        .unwrap();
+        .unwrap());
         let mut connection = connection(store.clone(), None).await;
 
         let first = get(&mut connection.sender, "/objects?prefix=photos%2F&limit=1")
@@ -2189,7 +2196,7 @@ mod tests {
     #[tokio::test]
     async fn list_storage_failure_is_bounded_and_redacted() {
         let store = FailureStore::with_existing_object(FailureOperation::List);
-        let mut connection = connection(store, None).await;
+        let mut connection = connection(Arc::new(store), None).await;
         let response = get(&mut connection.sender, "/objects?prefix=")
             .await
             .unwrap();
@@ -2285,7 +2292,7 @@ mod tests {
 
     #[tokio::test]
     async fn object_paths_decode_logical_keys_for_every_object_method_and_list_prefix() {
-        let store = Store::default();
+        let store = Arc::new(Store::default());
         let mut connection = connection(store.clone(), None).await;
         let cases = [
             ("space key", "space%20key"),
@@ -2350,7 +2357,7 @@ mod tests {
 
     #[tokio::test]
     async fn percent_escaped_keys_are_distinct_and_invalid_object_paths_return_400() {
-        let store = Store::default();
+        let store = Arc::new(Store::default());
         let mut connection = connection(store.clone(), None).await;
         for (path, logical_key, payload) in [
             ("/objects/a%20b", "a b", b"space".as_slice()),
@@ -2416,7 +2423,7 @@ mod tests {
 
     #[tokio::test]
     async fn large_put_releases_receive_capacity_until_end_stream() {
-        let store = Store::default();
+        let store = Arc::new(Store::default());
         let mut connection = connection(store.clone(), None).await;
         let payload = (0..180_000)
             .map(|value| (value % 251) as u8)
@@ -2541,7 +2548,7 @@ mod tests {
     #[tokio::test]
     async fn precondition_failure_redacts_private_store_detail() {
         let store = FailureStore::with_existing_object(FailureOperation::PreconditionFailed);
-        let mut connection = connection(store, None).await;
+        let mut connection = connection(Arc::new(store), None).await;
         let response = put(
             &mut connection.sender,
             "/objects/target",
@@ -2563,7 +2570,7 @@ mod tests {
     #[tokio::test]
     async fn invalid_conditional_put_headers_return_bad_request_before_context_creation() {
         let store = FailureStore::with_existing_object(FailureOperation::PutContext);
-        let mut connection = connection(store, None).await;
+        let mut connection = connection(Arc::new(store), None).await;
         let cases: &[&[(&str, &str)]] = &[
             &[("if-match", "*"), ("if-match", "*")],
             &[("if-none-match", "*"), ("if-none-match", "*")],
@@ -2595,7 +2602,7 @@ mod tests {
 
     #[tokio::test]
     async fn empty_put_body_publishes_an_empty_object() {
-        let mut connection = connection(Store::default(), None).await;
+        let mut connection = connection(Arc::new(Store::default()), None).await;
         let response = put(
             &mut connection.sender,
             "/objects/empty",
@@ -2685,7 +2692,7 @@ mod tests {
 
     #[tokio::test]
     async fn object_metadata_limits_are_enforced_by_http_put_routes() {
-        let store = Store::default();
+        let store = Arc::new(Store::default());
         let mut connection = connection(store.clone(), None).await;
         let maximum_key = format!("/objects/{}", "k".repeat(1_024));
         let maximum_content_type = "x".repeat(128);
@@ -2834,7 +2841,7 @@ mod tests {
 
     #[tokio::test]
     async fn concurrent_puts_publish_one_complete_payload_with_matching_metadata() {
-        let store = Store::default();
+        let store = Arc::new(Store::default());
         let mut connection = connection(store.clone(), None).await;
         let first_request = Request::builder()
             .method(Method::PUT)
@@ -2900,7 +2907,7 @@ mod tests {
             Bytes::new(),
         )])
         .unwrap();
-        let mut connection = connection(store, None).await;
+        let mut connection = connection(Arc::new(store), None).await;
         let response = get(&mut connection.sender, "/objects/empty")
             .await
             .unwrap();
@@ -2916,7 +2923,7 @@ mod tests {
         let payload = Bytes::from((0..180_000).map(|value| (value % 251) as u8).collect::<Vec<_>>());
         let expected = payload.to_vec();
         let store = Store::new([object("large", "application/octet-stream", payload)]).unwrap();
-        let mut connection = connection(store, None).await;
+        let mut connection = connection(Arc::new(store), None).await;
         let response = get(&mut connection.sender, "/objects/large")
             .await
             .unwrap();
@@ -2942,7 +2949,7 @@ mod tests {
         let payload = Bytes::from(vec![0x5a; 96 * 1024]);
         let expected = payload.to_vec();
         let store = Store::new([object("slow", "application/octet-stream", payload)]).unwrap();
-        let mut connection = connection(store, Some(WINDOW)).await;
+        let mut connection = connection(Arc::new(store), Some(WINDOW)).await;
         let response = get(&mut connection.sender, "/objects/slow").await.unwrap();
 
         let mut body = response.into_body();
