@@ -47,9 +47,11 @@ This keeps later extraction mechanical without delaying product work now.
 
 The [current object storage design](design/current-object-storage.md) describes
 the implemented interface, HTTP/2 routes, self-describing object files, and
-startup-built in-memory index. SQLite is not used. Integrity verification,
-manifest export, and the LAN admin page are
-[deferred](plans/storage-diagnostics-and-administration-deferred.md). The older
+startup-built in-memory index. SQLite is not used. The
+[storage web interface](design/storage-web-interface.md) provides authenticated
+object management. Integrity verification, manifest export, and diagnostic
+web views remain [deferred](plans/storage-diagnostics-and-administration-deferred.md).
+The older
 [storage design](design/home-object-storage-design.md) and
 [interface design](design/home-object-storage-interface.md) remain historical context.
 

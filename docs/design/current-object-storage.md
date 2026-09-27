@@ -65,7 +65,7 @@ reading or hashing payload bytes. Healthy entries retain metadata and an
 Files without a trustworthy key are skipped and reported by physical filename.
 Corrupt entries are omitted from LIST and return a corruption error on GET or
 HEAD. The [deferred diagnostics plan](../plans/storage-diagnostics-and-administration-deferred.md)
-covers explicit payload SHA-256 checks, manifest export, and a LAN admin page.
+covers explicit payload SHA-256 checks, manifest export, and diagnostic web views.
 
 PUT writes a randomly named, exclusively created `.part` file, hashing and
 counting the payload as it streams. It fills in metadata, syncs the file, then
