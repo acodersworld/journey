@@ -69,11 +69,15 @@ as an object row, including keys ending in `/`.
 PUT consumes request body chunks sequentially and appends each chunk to a
 store PUT context. Download reads fixed-size chunks from `ObjectInterface`
 only as the response body is polled, allowing backpressure and cancellation.
-Downloads use the stored content type and payload length and carry an
-attachment disposition.
+It reads no more than the stored payload length, ends without another reader
+call at that length, and fails the body stream on early EOF, invalid read
+counts, or reader errors. Downloads use the stored content type and payload
+length and carry an attachment disposition.
 
 The page uses same-origin browser requests and encodes full logical keys in
-query values. It displays folders, metadata, downloads, uploads, and deletion.
+query values. Each listing request has an increasing ID; only the latest
+request may update the rows, pagination, or status after its response arrives.
+It displays folders, metadata, downloads, uploads, and deletion.
 Uploads use the selected file's type or `application/octet-stream`, with
 create-only as the default. A `412` response prompts before a second
 replace-only upload; dismissal sends no replacement. Deletion also requires

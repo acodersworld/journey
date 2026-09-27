@@ -117,6 +117,7 @@
     let currentCursor = null;
     let cursorHistory = [];
     let nextCursor = null;
+    let latestPageRequestId = 0;
 
     function apiUrl(path, values) {
       const query = new URLSearchParams(values);
@@ -256,6 +257,7 @@
     }
 
     async function loadPage(prefix, cursor) {
+      const requestId = ++latestPageRequestId;
       folderRows.replaceChildren();
       fileRows.replaceChildren();
       folderSummary.textContent = 'Folders (0)';
@@ -269,6 +271,7 @@
       try {
         const response = await checkedFetch(apiUrl('/api/entries', values));
         const page = await response.json();
+        if (requestId !== latestPageRequestId) return;
         const folders = page.entries.filter((entry) => entry.kind === 'folder');
         const files = page.entries.filter((entry) => entry.kind !== 'folder');
         folderSummary.textContent = 'Folders (' + folders.length + ')';
@@ -281,7 +284,9 @@
         previousButton.hidden = cursorHistory.length === 0;
         setMessage(page.entries.length ? (page.entries.length + ' entries') : 'This folder is empty.');
       } catch (error) {
-        setMessage('Could not list this folder: ' + error.message);
+        if (requestId === latestPageRequestId) {
+          setMessage('Could not list this folder: ' + error.message);
+        }
       }
     }
 

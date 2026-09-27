@@ -399,7 +399,7 @@ async fn download<S: StoreInterface>(
                 .filter(|name| !name.is_empty())
                 .unwrap_or("object");
             let (metadata, reader) = object.into_parts();
-            let stream = object_stream(reader);
+            let stream = object_stream(reader, metadata.payload_length(), key.as_str().to_owned());
             let mut response = Body::from_stream(stream).into_response();
             response.headers_mut().insert(
                 header::CONTENT_TYPE,
@@ -420,16 +420,41 @@ async fn download<S: StoreInterface>(
     }
 }
 
-fn object_stream<O: ObjectInterface>(object: O) -> impl Stream<Item = Result<Bytes, StoreError>> + Send + 'static {
-    stream::try_unfold(object, |mut object| async move {
-        let mut buffer = BytesMut::with_capacity(STREAM_CHUNK_SIZE);
-        buffer.resize(STREAM_CHUNK_SIZE, 0);
-        let count = object.read(&mut buffer).await?;
-        if count == 0 {
+fn object_stream<O: ObjectInterface>(
+    object: O,
+    payload_length: u64,
+    key: String,
+) -> impl Stream<Item = Result<Bytes, StoreError>> + Send + 'static {
+    stream::try_unfold((object, payload_length, key), |(mut object, mut remaining, key)| async move {
+        if remaining == 0 {
             return Ok(None);
         }
+        let requested = remaining.min(STREAM_CHUNK_SIZE as u64) as usize;
+        let mut buffer = BytesMut::with_capacity(requested);
+        buffer.resize(requested, 0);
+        let count = match object.read(&mut buffer).await {
+            Ok(count) if count > 0 && count <= requested => count,
+            Ok(0) => {
+                let error = StoreError::new(StoreErrorKind::Corrupt, "Object reader reached EOF before declared length");
+                eprintln!("storage web GET read failed for key {key:?}: {error}");
+                return Err(error);
+            }
+            Ok(count) => {
+                let error = StoreError::new(
+                    StoreErrorKind::Corrupt,
+                    format!("Object reader returned {count} bytes for a {requested}-byte buffer"),
+                );
+                eprintln!("storage web GET read failed for key {key:?}: {error}");
+                return Err(error);
+            }
+            Err(error) => {
+                eprintln!("storage web GET read failed for key {key:?}: {error}");
+                return Err(error);
+            }
+        };
+        remaining -= count as u64;
         buffer.truncate(count);
-        Ok(Some((buffer.freeze(), object)))
+        Ok(Some((buffer.freeze(), (object, remaining, key))))
     })
 }
 
