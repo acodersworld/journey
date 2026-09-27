@@ -38,6 +38,13 @@ in-memory store seeded with the included image and video:
 cargo run -p journey-storage --example h2c_get_server
 ```
 
+The example serves the h2c API at `http://127.0.0.1:8081` and starts a
+Basic-authenticated browser object manager at `http://127.0.0.1:8082`.
+The example manager credentials are `user` / `pass`. The web listener
+defaults to `0.0.0.0:8082` and uses plain HTTP; set
+`JOURNEY_STORAGE_WEB_BIND` to change it. The h2c listener keeps its separate
+`JOURNEY_STORAGE_BIND` setting.
+
 To use persistent filesystem storage instead, specify a directory. The server
 creates it if needed and loads its existing objects on startup; it does not
 seed the example image and video in this mode:

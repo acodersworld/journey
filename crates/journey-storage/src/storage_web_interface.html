@@ -1,0 +1,384 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Journey storage</title>
+  <style>
+    :root { color-scheme: light; font-family: system-ui, sans-serif; color: #182431; background: #f5f7f9; }
+    body { max-width: 1120px; margin: 2rem auto; padding: 0 1rem; }
+    h1 { margin-bottom: .25rem; }
+    button, input { font: inherit; }
+    button { border: 1px solid #9aa9b6; border-radius: .35rem; background: white; color: #163f60; cursor: pointer; padding: .45rem .7rem; }
+    button:hover { background: #eaf2f8; }
+    button:disabled { cursor: wait; opacity: .6; }
+    input { border: 1px solid #9aa9b6; border-radius: .35rem; padding: .5rem; }
+    .panel { background: white; border: 1px solid #d3dbe1; border-radius: .6rem; margin: 1rem 0; padding: 1rem; }
+    #breadcrumbs { display: flex; flex-wrap: wrap; align-items: center; gap: .4rem; }
+    #breadcrumbs span { color: #596977; }
+    #upload-form { display: grid; grid-template-columns: minmax(12rem, 1fr) minmax(12rem, 2fr) auto; gap: .65rem; align-items: end; }
+    #upload-form label { display: grid; gap: .3rem; font-size: .9rem; }
+    #upload-form input[type=file] { max-width: 100%; }
+    #entry-filter { display: flex; flex-wrap: wrap; align-items: end; gap: .65rem 1rem; margin: .25rem 0 .75rem; }
+    #entry-filter .filter-query { display: grid; flex: 1 1 16rem; gap: .3rem; }
+    #entry-filter .filter-option { align-items: center; display: flex; gap: .35rem; }
+    #entry-filter input[type=checkbox] { padding: 0; }
+    .table-wrap { overflow-x: auto; }
+    .entry-group + .entry-group { border-top: 1px solid #e1e6ea; margin-top: .75rem; padding-top: .75rem; }
+    .entry-group summary { color: #354b5c; cursor: pointer; font-weight: 600; padding: .35rem 0; }
+    table { border-collapse: collapse; width: 100%; }
+    th, td { border-bottom: 1px solid #e1e6ea; padding: .65rem .5rem; text-align: left; vertical-align: middle; }
+    th { color: #526270; font-size: .85rem; }
+    td.actions { white-space: nowrap; }
+    td.actions button, td.actions a { margin-right: .35rem; }
+    .name-button { border: 0; background: transparent; color: #155f97; padding: 0; text-align: left; }
+    .name-button:hover { text-decoration: underline; background: transparent; }
+    tr.metadata-row > td { background: #f8fafb; }
+    .entry-metadata { margin: .25rem 0; max-height: 16rem; overflow: auto; white-space: pre-wrap; overflow-wrap: anywhere; }
+    .muted { color: #657582; }
+    #message { min-height: 1.5rem; white-space: pre-wrap; overflow-wrap: anywhere; }
+    #pagination { display: flex; gap: .5rem; justify-content: flex-end; margin-top: .75rem; }
+    @media (max-width: 720px) {
+      #upload-form { grid-template-columns: 1fr; }
+      td.actions { white-space: normal; min-width: 12rem; }
+    }
+  </style>
+</head>
+<body>
+  <h1>Journey storage</h1>
+  <p class="muted">Browse and manage objects in the connected store.</p>
+
+  <section class="panel" aria-label="Current folder">
+    <nav id="breadcrumbs" aria-label="Breadcrumb"></nav>
+  </section>
+
+  <section class="panel" aria-label="Upload object">
+    <form id="upload-form">
+      <label>File
+        <input id="file" type="file" required>
+      </label>
+      <label>Object key
+        <input id="key" autocomplete="off" required>
+      </label>
+      <button id="upload-button" type="submit">Upload</button>
+    </form>
+  </section>
+
+  <section class="panel">
+    <div id="message" role="status" aria-live="polite"></div>
+    <div id="entry-filter">
+      <label class="filter-query" for="entry-query">Filter entries by name
+        <input id="entry-query" type="search" autocomplete="off">
+      </label>
+      <label class="filter-option"><input id="whole-word" type="checkbox"> Whole word</label>
+      <label class="filter-option"><input id="case-sensitive" type="checkbox"> Case sensitive</label>
+    </div>
+    <div id="entry-groups">
+      <details class="entry-group" open>
+        <summary id="folder-summary">Folders (0)</summary>
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th>Name</th><th>Type</th><th>Size</th><th>Actions</th></tr></thead>
+            <tbody id="folders"></tbody>
+          </table>
+        </div>
+      </details>
+      <details class="entry-group" open>
+        <summary id="file-summary">Files (0)</summary>
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th>Name</th><th>Type</th><th>Size</th><th>Actions</th></tr></thead>
+            <tbody id="files"></tbody>
+          </table>
+        </div>
+      </details>
+    </div>
+    <div id="pagination">
+      <button id="previous" type="button" hidden>Previous</button>
+      <button id="next" type="button" hidden>Next</button>
+    </div>
+  </section>
+
+  <script>
+    const folderRows = document.querySelector('#folders');
+    const fileRows = document.querySelector('#files');
+    const folderSummary = document.querySelector('#folder-summary');
+    const fileSummary = document.querySelector('#file-summary');
+    const entryQuery = document.querySelector('#entry-query');
+    const wholeWord = document.querySelector('#whole-word');
+    const caseSensitive = document.querySelector('#case-sensitive');
+    const message = document.querySelector('#message');
+    const fileField = document.querySelector('#file');
+    const keyField = document.querySelector('#key');
+    const uploadButton = document.querySelector('#upload-button');
+    const nextButton = document.querySelector('#next');
+    const previousButton = document.querySelector('#previous');
+    let currentPrefix = '';
+    let currentCursor = null;
+    let cursorHistory = [];
+    let nextCursor = null;
+
+    function apiUrl(path, values) {
+      const query = new URLSearchParams(values);
+      return path + '?' + query.toString();
+    }
+
+    function setMessage(value) {
+      message.textContent = String(value).slice(0, 1024);
+    }
+
+    async function checkedFetch(url, options) {
+      const response = await fetch(url, options);
+      if (!response.ok) {
+        const detail = (await response.text()).slice(0, 512);
+        throw new Error(detail || (response.status + ' ' + response.statusText));
+      }
+      return response;
+    }
+
+    function makeButton(label, action) {
+      const button = document.createElement('button');
+      button.type = 'button';
+      button.textContent = label;
+      button.addEventListener('click', action);
+      return button;
+    }
+
+    function entryMatchesFilter(name, query) {
+      const value = caseSensitive.checked ? name : name.toLowerCase();
+      const search = caseSensitive.checked ? query : query.toLowerCase();
+      if (!wholeWord.checked) return value.includes(search);
+
+      const escaped = search.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+      const pattern = new RegExp('(^|[^\\p{L}\\p{N}_])' + escaped + '(?=$|[^\\p{L}\\p{N}_])', 'u');
+      return pattern.test(value);
+    }
+
+    function filterGroup(rows, summary, label, query) {
+      const entries = Array.from(rows.querySelectorAll('tr[data-name]'));
+      let visible = 0;
+      for (const row of entries) {
+        row.hidden = query !== '' && !entryMatchesFilter(row.dataset.name, query);
+        const metadataRow = row.nextElementSibling;
+        if (metadataRow && metadataRow.classList.contains('metadata-row')) {
+          metadataRow.hidden = row.hidden || row.dataset.expanded !== 'true';
+        }
+        if (!row.hidden) visible += 1;
+      }
+      const count = query !== '' && visible !== entries.length
+        ? visible + ' of ' + entries.length
+        : String(entries.length);
+      summary.textContent = label + ' (' + count + ')';
+    }
+
+    function applyEntryFilter() {
+      const query = entryQuery.value;
+      filterGroup(folderRows, folderSummary, 'Folders', query);
+      filterGroup(fileRows, fileSummary, 'Files', query);
+    }
+
+    function renderBreadcrumbs() {
+      const nav = document.querySelector('#breadcrumbs');
+      nav.replaceChildren();
+      nav.append(makeButton('Root', () => navigate('')));
+      if (!currentPrefix) return;
+
+      const components = currentPrefix.slice(0, -1).split('/');
+      let prefix = '';
+      for (const component of components) {
+        const separator = document.createElement('span');
+        separator.textContent = '/';
+        nav.append(separator);
+        prefix += component + '/';
+        const selectedPrefix = prefix;
+        nav.append(makeButton(component || '/', () => navigate(selectedPrefix)));
+      }
+    }
+
+    function renderEntry(entry, rows) {
+      const row = document.createElement('tr');
+      row.dataset.name = entry.name;
+      const nameCell = document.createElement('td');
+      const typeCell = document.createElement('td');
+      const sizeCell = document.createElement('td');
+      const actionsCell = document.createElement('td');
+      actionsCell.className = 'actions';
+      let metadataRow = null;
+
+      if (entry.kind === 'folder') {
+        const label = entry.name === '/' ? '/' : entry.name + '/';
+        const open = makeButton(label, () => navigate(entry.key));
+        open.className = 'name-button';
+        nameCell.append(open);
+        typeCell.textContent = 'Folder';
+        sizeCell.textContent = '—';
+      } else {
+        typeCell.textContent = entry.content_type || 'application/octet-stream';
+        sizeCell.textContent = entry.size + ' bytes';
+
+        metadataRow = document.createElement('tr');
+        metadataRow.className = 'metadata-row';
+        metadataRow.hidden = true;
+        const metadataCell = document.createElement('td');
+        metadataCell.colSpan = 4;
+        const metadataView = document.createElement('pre');
+        metadataView.className = 'entry-metadata muted';
+        metadataCell.append(metadataView);
+        metadataRow.append(metadataCell);
+        let metadataLoaded = false;
+        let metadataLoading = false;
+        const expand = makeButton('▸ ' + entry.name, async () => {
+          const expanded = metadataRow.hidden;
+          row.dataset.expanded = String(expanded);
+          metadataRow.hidden = !expanded;
+          expand.textContent = (expanded ? '▾ ' : '▸ ') + entry.name;
+          expand.setAttribute('aria-expanded', String(expanded));
+          if (!expanded || metadataLoaded || metadataLoading) return;
+          metadataLoading = true;
+          metadataLoaded = await loadEntryMetadata(entry.key, metadataView);
+          metadataLoading = false;
+        });
+        expand.className = 'name-button';
+        expand.setAttribute('aria-expanded', 'false');
+        nameCell.append(expand);
+
+        const download = document.createElement('a');
+        download.href = apiUrl('/api/download', { key: entry.key });
+        download.download = entry.name.split('/').filter(Boolean).pop() || 'object';
+        download.textContent = 'Download';
+        actionsCell.append(download);
+        actionsCell.append(makeButton('Delete', () => removeObject(entry.key)));
+      }
+
+      row.append(nameCell, typeCell, sizeCell, actionsCell);
+      rows.append(row);
+      if (metadataRow) rows.append(metadataRow);
+    }
+
+    async function loadPage(prefix, cursor) {
+      folderRows.replaceChildren();
+      fileRows.replaceChildren();
+      folderSummary.textContent = 'Folders (0)';
+      fileSummary.textContent = 'Files (0)';
+      renderBreadcrumbs();
+      setMessage('Loading objects…');
+      nextButton.hidden = true;
+      previousButton.hidden = cursorHistory.length === 0;
+      const values = { prefix };
+      if (cursor) values.cursor = cursor;
+      try {
+        const response = await checkedFetch(apiUrl('/api/entries', values));
+        const page = await response.json();
+        const folders = page.entries.filter((entry) => entry.kind === 'folder');
+        const files = page.entries.filter((entry) => entry.kind !== 'folder');
+        folderSummary.textContent = 'Folders (' + folders.length + ')';
+        fileSummary.textContent = 'Files (' + files.length + ')';
+        for (const entry of folders) renderEntry(entry, folderRows);
+        for (const entry of files) renderEntry(entry, fileRows);
+        applyEntryFilter();
+        nextCursor = page.next_cursor || null;
+        nextButton.hidden = !nextCursor;
+        previousButton.hidden = cursorHistory.length === 0;
+        setMessage(page.entries.length ? (page.entries.length + ' entries') : 'This folder is empty.');
+      } catch (error) {
+        setMessage('Could not list this folder: ' + error.message);
+      }
+    }
+
+    function navigate(prefix) {
+      currentPrefix = prefix;
+      currentCursor = null;
+      cursorHistory = [];
+      loadPage(currentPrefix, currentCursor);
+    }
+
+    async function loadEntryMetadata(key, view) {
+      view.textContent = 'Loading metadata…';
+      try {
+        const response = await checkedFetch(apiUrl('/api/metadata', { key }));
+        const value = await response.json();
+        view.textContent = JSON.stringify(value, null, 2).slice(0, 4096);
+        return true;
+      } catch (error) {
+        view.textContent = 'Could not read metadata: ' + error.message;
+        return false;
+      }
+    }
+
+    async function removeObject(key) {
+      if (!window.confirm('Delete object key “' + key + '”?')) return;
+      setMessage('Deleting object…');
+      try {
+        await checkedFetch(apiUrl('/api/object', { key }), { method: 'DELETE' });
+        setMessage('Object deleted.');
+        await loadPage(currentPrefix, currentCursor);
+      } catch (error) {
+        setMessage('Could not delete object: ' + error.message);
+      }
+    }
+
+    fileField.addEventListener('change', () => {
+      const file = fileField.files[0];
+      if (file) keyField.value = currentPrefix + file.name;
+    });
+
+    entryQuery.addEventListener('input', applyEntryFilter);
+    wholeWord.addEventListener('change', applyEntryFilter);
+    caseSensitive.addEventListener('change', applyEntryFilter);
+
+    document.querySelector('#upload-form').addEventListener('submit', async (event) => {
+      event.preventDefault();
+      const file = fileField.files[0];
+      const key = keyField.value;
+      if (!file || !key) return;
+      const contentType = file.type || 'application/octet-stream';
+      uploadButton.disabled = true;
+      setMessage('Uploading object…');
+      try {
+        let response = await fetch(apiUrl('/api/object', { key }), {
+          method: 'PUT',
+          headers: { 'Content-Type': contentType, 'If-None-Match': '*' },
+          body: file
+        });
+        if (response.status === 412) {
+          if (!window.confirm('Object “' + key + '” already exists. Replace it?')) {
+            setMessage('Replacement cancelled; the existing object was kept.');
+            return;
+          }
+          response = await fetch(apiUrl('/api/object', { key }), {
+            method: 'PUT',
+            headers: { 'Content-Type': contentType, 'If-Match': '*' },
+            body: file
+          });
+        }
+        if (!response.ok) {
+          const detail = (await response.text()).slice(0, 512);
+          throw new Error(detail || (response.status + ' ' + response.statusText));
+        }
+        fileField.value = '';
+        keyField.value = '';
+        setMessage('Upload complete.');
+        await loadPage(currentPrefix, currentCursor);
+      } catch (error) {
+        setMessage('Could not upload object: ' + error.message);
+      } finally {
+        uploadButton.disabled = false;
+      }
+    });
+
+    nextButton.addEventListener('click', async () => {
+      if (!nextCursor) return;
+      cursorHistory.push(currentCursor);
+      currentCursor = nextCursor;
+      await loadPage(currentPrefix, currentCursor);
+    });
+
+    previousButton.addEventListener('click', async () => {
+      currentCursor = cursorHistory.pop() || null;
+      await loadPage(currentPrefix, currentCursor);
+    });
+
+    navigate('');
+  </script>
+</body>
+</html>

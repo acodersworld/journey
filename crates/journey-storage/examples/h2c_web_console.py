@@ -126,7 +126,7 @@ class ConsoleHandler(BaseHTTPRequestHandler):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--listen", default="127.0.0.1:8082", metavar="HOST:PORT")
+    parser.add_argument("--listen", default="127.0.0.1:8083", metavar="HOST:PORT")
     parser.add_argument("--storage-url", default="http://127.0.0.1:8081")
     args = parser.parse_args()
     host, separator, port = args.listen.rpartition(":")

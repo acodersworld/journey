@@ -20,6 +20,9 @@ cursor identifies the inclusive next key. PUT supports unconditional,
 create-only (`If-None-Match: *`), and replace-only (`If-Match: *`) publication.
 GET can select one byte range. The same interface has an in-memory backend.
 
+The separate browser object manager and its authenticated HTTP routes are
+described in [Storage Web Interface](storage-web-interface.md).
+
 Logical keys are nonempty UTF-8 of at most 1,024 bytes. Content types contain
 1 through 128 header bytes. The filesystem backend maps a key to the lowercase
 SHA-256 digest of its UTF-8 bytes followed by `.obj`; client keys never become

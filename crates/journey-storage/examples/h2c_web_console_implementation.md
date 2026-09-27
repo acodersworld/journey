@@ -9,6 +9,10 @@ existing h2c listener. The console does not change the Rust storage routes.
 Run both processes; in-memory mode loses uploaded objects when the Rust
 process stops, while filesystem mode keeps them in the selected directory.
 
+The Rust example also starts its built-in object manager on port 8082. The
+Python request console remains a separate development tool and defaults to
+port 8083.
+
 ## Files and dependencies
 
 - `h2c_web_console.py` serves the page and proxies requests.
@@ -101,11 +105,14 @@ python3 -m venv /tmp/journey-h2c-console-venv
 /tmp/journey-h2c-console-venv/bin/python crates/journey-storage/examples/h2c_web_console.py
 ```
 
-Open `http://127.0.0.1:8082/`. The defaults match the Rust example's
-`127.0.0.1:8081` listener. To use other loopback ports, set
+The Rust process also serves the built-in object manager at
+`http://127.0.0.1:8082/`; its example credentials are `user` / `pass`.
+The Python console is at `http://127.0.0.1:8083/` and proxies to the Rust
+example's `127.0.0.1:8081` listener. To use other loopback ports, set
 `JOURNEY_STORAGE_BIND` for the Rust example, then pass `--storage-url
 http://127.0.0.1:<port>` and optionally `--listen 127.0.0.1:<port>` to the
-Python script. Stop each process with Ctrl-C.
+Python script. The built-in listener has its independent
+`JOURNEY_STORAGE_WEB_BIND` setting. Stop each process with Ctrl-C.
 
 ## Acceptance checks
 

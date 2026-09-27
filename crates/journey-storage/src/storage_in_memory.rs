@@ -50,17 +50,15 @@ impl ObjectReader {
 }
 
 impl ObjectInterface for ObjectReader {
-    fn read(
+    async fn read(
         &mut self,
         buffer: &mut BytesMut,
-    ) -> impl Future<Output = Result<usize, StoreError>> + Send {
-        async move {
-            let count = buffer.len().min(self.contents.len() - self.cursor);
-            buffer[..count]
-                .copy_from_slice(&self.contents[self.cursor..self.cursor + count]);
-            self.cursor += count;
-            Ok(count)
-        }
+    ) -> Result<usize, StoreError> {
+        let count = buffer.len().min(self.contents.len() - self.cursor);
+        buffer[..count]
+            .copy_from_slice(&self.contents[self.cursor..self.cursor + count]);
+        self.cursor += count;
+        Ok(count)
     }
 }
 

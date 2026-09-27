@@ -8,8 +8,8 @@ use std::{
 use bytes::Bytes;
 use h2::server;
 use journey_storage::{
-    ContentType, FilesystemStore, FilesystemStoreConfig, Key, Object, Service, Store,
-    StoreInterface,
+    serve_web_interface, ContentType, FilesystemStore, FilesystemStoreConfig, Key, Object,
+    Service, Store, StoreInterface, WebCredentials,
 };
 use http::HeaderValue;
 use tokio::{
@@ -18,6 +18,7 @@ use tokio::{
 };
 
 const DEFAULT_BIND: &str = "127.0.0.1:8081";
+const DEFAULT_WEB_BIND: &str = "0.0.0.0:8082";
 const MAX_CONCURRENT_STREAMS: u32 = 8;
 const MAX_HEADER_LIST_SIZE: u32 = 16 * 1024;
 
@@ -69,17 +70,34 @@ fn storage_selection() -> Result<StorageSelection, Box<dyn Error>> {
     Ok(StorageSelection::Filesystem(root.into()))
 }
 
-async fn run_server<S: StoreInterface + Sync + Send>(
+async fn run_server<S: StoreInterface + Clone + Sync + Send>(
     store: S,
     seeded_fixtures: bool,
 ) -> Result<(), Box<dyn Error>> {
     let bind = std::env::var("JOURNEY_STORAGE_BIND").unwrap_or_else(|_| DEFAULT_BIND.to_owned());
     let address: SocketAddr = bind.parse()?;
-    let listener = TcpListener::bind(address).await?;
+    let listener = TcpListener::bind(address).await.map_err(|error| {
+        std::io::Error::new(error.kind(), format!("failed to bind h2c listener at {address}: {error}"))
+    })?;
     let bound_address = listener.local_addr()?;
+    let web_store = store.clone();
     let service = Arc::new(Service::new(store));
 
-    println!("journey-storage listening on http://{bound_address}");
+    let web_bind = std::env::var("JOURNEY_STORAGE_WEB_BIND")
+        .unwrap_or_else(|_| DEFAULT_WEB_BIND.to_owned());
+    let web_address: SocketAddr = web_bind.parse()?;
+    let web_listener = TcpListener::bind(web_address).await.map_err(|error| {
+        std::io::Error::new(error.kind(), format!("failed to bind web listener at {web_address}: {error}"))
+    })?;
+    let web_bound_address = web_listener.local_addr()?;
+    let web_credentials = WebCredentials::new("user", "pass")?;
+    let mut web_server = tokio::spawn(async move {
+        serve_web_interface(web_listener, web_store, web_credentials).await
+    });
+
+    println!("journey-storage HTTP/2 listening on http://{bound_address}");
+    println!("journey-storage web interface listening on http://{web_bound_address}");
+    println!("  example web credentials: user / pass");
     if seeded_fixtures {
         println!("  http://{bound_address}/objects/image.jpg");
         println!("  http://{bound_address}/objects/video.mp4");
@@ -109,6 +127,13 @@ async fn run_server<S: StoreInterface + Sync + Send>(
     let mut connections = JoinSet::new();
     loop {
         tokio::select! {
+            result = &mut web_server => {
+                match result {
+                    Ok(Ok(())) => return Err("storage web interface stopped unexpectedly".into()),
+                    Ok(Err(error)) => return Err(error.into()),
+                    Err(error) => return Err(error.into()),
+                }
+            }
             accepted = listener.accept() => match accepted {
                 Ok((stream, peer)) => {
                     let service = Arc::clone(&service);
