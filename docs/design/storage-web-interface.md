@@ -7,10 +7,11 @@
 ## Server and routes
 
 `journey-storage` exports `serve_web_interface`, which accepts an already
-bound Tokio TCP listener, an owned `StoreInterface` backend, and validated
+bound Tokio TCP listener, an `Arc<S>` where `S: StoreInterface`, and validated
 `WebCredentials`. It builds an Axum HTTP router and calls the store directly.
-A caller that also runs the HTTP/2 `Service` can clone the in-memory or
-filesystem backend; both values share the same catalogue.
+The HTTP/2 `Service` also accepts an `Arc<S>`, so callers can clone the `Arc`
+to share one backend between both listeners. The in-memory and filesystem
+backends themselves are not clonable.
 
 The web listener serves an embedded object manager and these routes:
 
