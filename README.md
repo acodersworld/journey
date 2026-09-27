@@ -6,9 +6,10 @@ site Basic Authentication, and proxy backpressure. The home agent owns the
 read-only media fixtures and digest-named upload storage. Application routes
 and storage behavior remain outside `journey-websocket`.
 
-The deployment bundle and teardown procedure are in
-`deploy/README.md`. The implementation and acceptance gate are described in
-`docs/aws-home-real-world-validation-plan.md`.
+The deployment bundle and teardown procedure are in `deploy/README.md`.
+Use `scripts/aws-home-real-world-validation.sh` with the browser and lifecycle
+checklist in `docs/aws-home-real-world-validation-checklist.md` to repeat the
+validation.
 
 ## Local Compose
 

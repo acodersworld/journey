@@ -6,7 +6,7 @@
 **Scope:** The first filesystem-backed Journey object store on the home server
 
 This document records an earlier SQLite-based proposal. The current
-[filesystem implementation plan](filesystem-object-store-in-memory-index-implementation-plan.md)
+[current object storage design](current-object-storage.md)
 uses a startup-built in-memory index with no SQLite database and is
 authoritative for file layout, publication, and recovery behavior.
 

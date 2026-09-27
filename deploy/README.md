@@ -1,8 +1,7 @@
 # Disposable AWS/home validation deployment
 
-This directory is the small deployment bundle described by
-docs/aws-home-real-world-validation-plan.md. It intentionally contains no
-certificates, fixtures, uploads, or passwords.
+This directory is the disposable AWS/home validation deployment bundle. It
+intentionally contains no certificates, fixtures, uploads, or passwords.
 
 ## Build and deliver the image
 

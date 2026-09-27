@@ -7,9 +7,9 @@
 the first Journey home object store
 
 This document records earlier interface and SQLite assumptions. Use the
-[filesystem implementation plan](filesystem-object-store-in-memory-index-implementation-plan.md)
+[current object storage design](current-object-storage.md)
 for the current storage contract and
-[deferred diagnostics and administration](storage-diagnostics-and-administration-deferred.md)
+[deferred diagnostics and administration](../plans/storage-diagnostics-and-administration-deferred.md)
 for later maintenance and LAN admin work. The implemented Rust interfaces and
 HTTP/2 routes are authoritative for current client behavior.
 
@@ -17,8 +17,7 @@ HTTP/2 routes are authoritative for current client behavior.
 
 This document defines what the Journey home object store does independently
 from its physical layout and SQLite schema. The current HTTP/2 route contract
-is specified in the follow-up
-[HTTP/2 Object Management Routes Implementation Plan](http2-object-management-routes-implementation-plan.md).
+is summarized in the [current object storage design](current-object-storage.md).
 
 The interface sits above the physical container and index described in
 [Home Object Storage Design](home-object-storage-design.md). A caller works

@@ -2,7 +2,9 @@
 
 **Status:** Active planning
 **Created:** 23 September 2026
-**Current position:** The real AWS-to-home transport validation succeeded
+**Current position:** AWS-to-home transport validation and the filesystem-backed
+object-storage HTTP interface are implemented; diagnostics and administration
+remain deferred
 
 ## 1. Direction
 
@@ -11,16 +13,17 @@ bounded HTTP/2 streams through one home-initiated WebSocket connection on a
 real deployment. Transport feasibility is no longer the project's main open
 question.
 
-The next work moves toward the smallest useful Journey application in two
+The project moves toward the smallest useful Journey application in two
 major milestones:
 
-1. A real object-storage service on the home server.
+1. A real object-storage service for the home server (the storage crate is
+   implemented; integration into the home application remains future work).
 2. A basic server-rendered HTML website on AWS, delivered through Nginx over
    HTTPS with HTTP/2.
 
-The object-storage interface must be understood before its implementation is
-selected. Existing storage software must be evaluated before Journey commits
-to building its own storage engine.
+The storage interface and filesystem-backed implementation are documented in
+the completed plans below. Earlier evaluation of existing storage software
+preceded the decision to build this store.
 
 ## 2. Transport boundary
 
@@ -42,39 +45,13 @@ This keeps later extraction mechanical without delaying product work now.
 
 ## 3. Milestone 1: home object-storage service
 
-The current filesystem design is documented in
-[Filesystem Object Store with an In-Memory Index](filesystem-object-store-in-memory-index-implementation-plan.md).
-It uses self-describing object files and rebuilds an in-memory index at startup;
-SQLite is not part of the implementation. Integrity verification, manifest
-export, and the LAN admin page are
-[deferred](storage-diagnostics-and-administration-deferred.md). The older
-[storage design](home-object-storage-design.md) and
-[interface design](home-object-storage-interface.md) remain historical context.
-
-Implementation begins with the narrower read-only slice in
-[Read-Only In-Memory HTTP/2 Server Implementation Plan](read-only-in-memory-http2-server-implementation-plan.md).
-It deliberately proves a reusable HTTP/2 `GET` service and h2c development
-host before adding filesystem storage or mutations.
-
-The next protocol slice is defined in
-[In-Memory HTTP/2 PUT Implementation Plan](in-memory-http2-put-implementation-plan.md).
-It adds unconditional create-or-replace PUT behavior and HTTP/2 request-body
-flow control while deliberately retaining process-local in-memory storage.
-
-The final review hardening for that refactor is specified in
-[Storage Interface Review Follow-Up Implementation Plan](storage-interface-review-follow-up-implementation-plan.md).
-It keeps internal storage failures behind bounded public responses and makes
-validated content type a storage-interface invariant.
-
-The next backend-only interface increment is specified in
-[In-Memory Object Management Interface Implementation Plan](in-memory-object-management-interface-implementation-plan.md).
-It adds shared object metadata, STAT, bounded prefix LIST, idempotent DELETE,
-and typed storage errors without adding new HTTP routes.
-
-The implemented HTTP adapter increment is documented in
-[HTTP/2 Object Management Routes Implementation Plan](http2-object-management-routes-implementation-plan.md).
-It exposes metadata-only HEAD, repeatable DELETE, and prefix-paginated JSON LIST
-alongside the existing GET and PUT object routes.
+The [current object storage design](design/current-object-storage.md) describes
+the implemented interface, HTTP/2 routes, self-describing object files, and
+startup-built in-memory index. SQLite is not used. Integrity verification,
+manifest export, and the LAN admin page are
+[deferred](plans/storage-diagnostics-and-administration-deferred.md). The older
+[storage design](design/home-object-storage-design.md) and
+[interface design](design/home-object-storage-interface.md) remain historical context.
 
 ### 3.1 Define the interface first
 

@@ -2,7 +2,7 @@
 
 **Status:** Implementation plan  
 **Updated:** 19 September 2026  
-**Implements:** [Vertical Slice 01: HTTP/2 over WebSocket Object Download](vertical-slice-01-http2-over-websocket.md)  
+**Implements:** [Vertical Slice 01: HTTP/2 over WebSocket Object Download](../design/vertical-slice-01-http2-over-websocket.md)  
 **This plan covers:** Checkpoint 1 only — HTTP/2 over a transferable Tokio byte-stream boundary
 
 **Extraction review:** [HTTP/2-over-WebSocket Crate Extraction Review](h2-over-websocket-crate-extraction.md)
