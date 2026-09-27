@@ -1,9 +1,10 @@
 # HTTP/2-over-WebSocket Crate Extraction Review
 
-**Status:** Source hardening complete; Docker and sustained RSS verification remain
-**Updated:** 20 September 2026
+**Status:** Deferred; source hardening complete, Docker and sustained RSS verification remain
+**Updated:** 27 September 2026
 **Reviewed component:** `crates/journey-websocket`  
-**Related plan:** [Vertical Slice 01 Implementation Plan](vertical-slice-01-implementation-plan.md)
+**Related design:** [Vertical Slice 01](../design/vertical-slice-01-http2-over-websocket.md)
+**Historical checkpoint plan:** [Checkpoint 1](../design/history/vertical-slice-01-checkpoint-1.md)
 
 **Working checklist:** [HTTP/2-over-WebSocket Hardening Checklist](h2-over-websocket-hardening-checklist.md)
 

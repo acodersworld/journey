@@ -64,7 +64,7 @@ reading or hashing payload bytes. Healthy entries retain metadata and an
 `Arc<File>`; entries with a recoverable key can instead be marked corrupt.
 Files without a trustworthy key are skipped and reported by physical filename.
 Corrupt entries are omitted from LIST and return a corruption error on GET or
-HEAD. The [deferred diagnostics plan](../plans/storage-diagnostics-and-administration-deferred.md)
+HEAD. The [deferred diagnostics plan](../deferred/storage-diagnostics-and-administration.md)
 covers explicit payload SHA-256 checks, manifest export, and diagnostic web views.
 
 PUT writes a randomly named, exclusively created `.part` file, hashing and

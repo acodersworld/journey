@@ -1,7 +1,8 @@
 # HTTP/2-over-WebSocket Hardening Checklist
 
-**Status:** Active  
-**Updated:** 20 September 2026
+**Status:** Deferred; source hardening complete, extraction-readiness verification remains
+
+**Updated:** 27 September 2026
 **Component:** `crates/journey-websocket`  
 **Related review:** [HTTP/2-over-WebSocket Crate Extraction Review](h2-over-websocket-crate-extraction.md)
 

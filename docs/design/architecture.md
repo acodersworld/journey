@@ -4,7 +4,7 @@
 **Updated:** 19 September 2026  
 **Purpose:** Record the intended production direction and unresolved questions. This remains an exploratory architecture, not a commitment to implement every component immediately.  
 **First implementation:** [Vertical Slice 01: HTTP/2 over WebSocket Object Download](vertical-slice-01-http2-over-websocket.md)  
-**Implementation plan:** [Checkpoint 1: Transferable HTTP/2 Transport Boundary](../plans/vertical-slice-01-implementation-plan.md)
+**Later transport work:** [Deferred crate extraction](../deferred/h2-over-websocket-crate-extraction.md)
 
 ## 1. Project idea
 

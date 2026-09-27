@@ -1,11 +1,18 @@
-# Vertical Slice 01 Implementation Plan: Transferable HTTP/2 Transport Boundary
+# Vertical Slice 01 Checkpoint 1: Historical Implementation Plan
 
-**Status:** Implementation plan  
+**Status:** Historical; superseded by the current transport and storage crates
+
 **Updated:** 19 September 2026  
-**Implements:** [Vertical Slice 01: HTTP/2 over WebSocket Object Download](../design/vertical-slice-01-http2-over-websocket.md)  
+**Implements:** [Vertical Slice 01: HTTP/2 over WebSocket Object Download](../vertical-slice-01-http2-over-websocket.md)
+
 **This plan covers:** Checkpoint 1 only — HTTP/2 over a transferable Tokio byte-stream boundary
 
-**Extraction review:** [HTTP/2-over-WebSocket Crate Extraction Review](h2-over-websocket-crate-extraction.md)
+**Extraction review:** [HTTP/2-over-WebSocket Crate Extraction Review](../../deferred/h2-over-websocket-crate-extraction.md)
+
+This document preserves the original checkpoint plan for historical context.
+Its proposed layout, dependencies, verification commands, and future-tense
+steps are not current instructions. Follow the repository's `AGENTS.md` and
+the current design documents for ongoing work.
 
 ## 1. Goal
 

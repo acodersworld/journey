@@ -4,7 +4,8 @@
 **Updated:** 19 September 2026  
 **Scope:** Validate HTTP/2 as the protocol carried inside WebSocket, then prove the WebSocket bridge on a LAN  
 **Parent architecture:** [Journey Architecture](architecture.md)
-**Implementation plan:** [Checkpoint 1: Transferable HTTP/2 Transport Boundary](../plans/vertical-slice-01-implementation-plan.md)
+**Later transport work:** [Deferred crate extraction](../deferred/h2-over-websocket-crate-extraction.md)
+**Historical checkpoint plan:** [Checkpoint 1](history/vertical-slice-01-checkpoint-1.md)
 
 ## 1. Purpose
 
@@ -21,6 +22,13 @@ The completed slice proves that:
 - Home acts as the corresponding HTTP/2 server.
 - Public HTTP requests are bridged to independent inner HTTP/2 object requests.
 - File bodies stream with bounded memory and HTTP/2 backpressure.
+
+The initial Checkpoint 1 implementation plan has been superseded by the
+current transport and storage crates. Its lasting decision was to keep the
+HTTP/2 object protocol independent of the byte-stream transport, allowing a
+bounded Tokio duplex connection to be replaced by a WebSocket bridge without
+changing object request semantics. Container and sustained-memory checks for
+crate extraction remain tracked with the deferred transport work.
 
 This slice runs on two physical machines on a trusted internal network. It uses preinstalled JPEG and MP4 objects and implements only read operations.
 

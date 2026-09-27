@@ -9,7 +9,7 @@ the first Journey home object store
 This document records earlier interface and SQLite assumptions. Use the
 [current object storage design](current-object-storage.md)
 for the current storage contract and
-[deferred diagnostics and administration](../plans/storage-diagnostics-and-administration-deferred.md)
+[deferred diagnostics and administration](../deferred/storage-diagnostics-and-administration.md)
 for later maintenance and LAN admin work. The implemented Rust interfaces and
 HTTP/2 routes are authoritative for current client behavior.
 
