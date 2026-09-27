@@ -1,8 +1,9 @@
-# Journey AWS/home validation slice
+# Journey prototypes
 
-This workspace contains the bounded HTTP/2-over-WebSocket transport and the
-disposable real-world validation applications. The gateway owns public routes,
-site Basic Authentication, and proxy backpressure. The home agent owns the
+This workspace contains the bounded HTTP/2-over-WebSocket transport, the
+disposable gateway/home validation applications, and a separate local
+`journey-site` post backend. The gateway owns public validation routes, site
+Basic Authentication, and proxy backpressure. The home agent owns the
 read-only media fixtures and digest-named upload storage. Application routes
 and storage behavior remain outside `journey-websocket`.
 
@@ -28,6 +29,55 @@ The local gateway is published on port 8080 and uses plain WebSocket only for
 local development. The AWS bundle uses Nginx, TLS, HTTP/2, and WSS instead.
 Use credentials from the environment file when calling `/health` or the media
 routes.
+
+## Website post backend
+
+The `journey-site` application imports a JSON manifest into SQLite and serves
+read-only post and media routes. Start the storage example with both listeners
+on loopback and persistent storage:
+
+```bash
+JOURNEY_STORAGE_BIND=127.0.0.1:8081 \
+JOURNEY_STORAGE_WEB_BIND=127.0.0.1:8082 \
+cargo run -p journey-storage --example h2c_get_server -- --storage-dir ./journey-storage-data
+```
+
+Create a manifest next to its local media files, for example:
+
+```json
+{
+  "posts": [
+    {
+      "title": "A first journey",
+      "published_at": "2026-09-27",
+      "summary": "Notes from the road.",
+      "blocks": [
+        { "type": "paragraph", "text": "We set out before sunrise." },
+        { "type": "heading", "level": 2, "text": "Along the coast" },
+        { "type": "image", "path": "media/coast.jpg", "alt": "Coast at dawn", "caption": "The first light." },
+        { "type": "video", "path": "media/harbour.mp4", "caption": "A quiet harbour." }
+      ]
+    }
+  ]
+}
+```
+
+Import and run the website backend in another terminal:
+
+```bash
+cargo run -p journey-site -- import ./posts.json
+cargo run -p journey-site -- db posts
+cargo run -p journey-site -- serve
+```
+
+`JOURNEY_SITE_DB` selects the SQLite file, `JOURNEY_SITE_BIND` selects the
+HTTP listener (default `127.0.0.1:8080`), and `JOURNEY_STORAGE_H2C` selects the
+loopback storage address (default `127.0.0.1:8081`). The bounded feed is
+`GET /api/posts?limit=20`; full content is available at
+`GET /api/posts/{id}` and the normal link `GET /posts/{id}`. Media is served
+only through `GET` or `HEAD /posts/{id}/blocks/{position}/media`, where the
+position is zero-based. Video requests forward one byte range to storage.
+`journey-site --help` and `journey-site db` list the CLI commands.
 
 ## HTTP/2 object storage
 
