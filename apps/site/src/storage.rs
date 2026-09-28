@@ -5,6 +5,7 @@ use std::{
     path::Path,
     pin::Pin,
     net::SocketAddr,
+    sync::Arc,
 };
 
 use bytes::Bytes;
@@ -46,7 +47,13 @@ pub trait StorageClient: Clone + Send + Sync + 'static {
 
 #[derive(Clone)]
 pub struct H2cStorageClient {
-    sender: std::sync::Arc<Mutex<SendRequest<Bytes>>>,
+    address: SocketAddr,
+    connection: Arc<Mutex<ConnectionState>>,
+}
+
+struct ConnectionState {
+    generation: u64,
+    sender: Option<SendRequest<Bytes>>,
 }
 
 impl H2cStorageClient {
@@ -54,16 +61,46 @@ impl H2cStorageClient {
         if !address.ip().is_loopback() {
             return Err(format!("storage h2c address must be loopback: {address}").into());
         }
-        let stream = TcpStream::connect(address).await?;
-        let (sender, connection) = client::handshake(stream).await?;
+        let client = Self {
+            address,
+            connection: Arc::new(Mutex::new(ConnectionState {
+                generation: 0,
+                sender: None,
+            })),
+        };
+        let mut state = client.connection.lock().await;
+        client
+            .connect_sender(&mut state)
+            .await
+            .map_err(std::io::Error::other)?;
+        drop(state);
+        Ok(client)
+    }
+
+    async fn connect_sender(&self, state: &mut ConnectionState) -> Result<(), String> {
+        let stream = TcpStream::connect(self.address)
+            .await
+            .map_err(|error| error.to_string())?;
+        let (sender, connection) = client::handshake(stream)
+            .await
+            .map_err(|error| error.to_string())?;
+        let generation = state
+            .generation
+            .checked_add(1)
+            .ok_or_else(|| "storage h2c connection generation overflow".to_owned())?;
+        state.generation = generation;
+        state.sender = Some(sender);
+        let shared_connection = Arc::clone(&self.connection);
         tokio::spawn(async move {
             if let Err(error) = connection.await {
                 eprintln!("storage h2c connection ended: {error}");
             }
+            let mut state = shared_connection.lock().await;
+            if state.generation == generation {
+                state.sender = None;
+            }
         });
-        Ok(Self {
-            sender: std::sync::Arc::new(Mutex::new(sender)),
-        })
+        Ok(())
     }
 
     async fn start_request(
@@ -71,13 +108,45 @@ impl H2cStorageClient {
         request: Request<()>,
         end_of_stream: bool,
     ) -> Result<(client::ResponseFuture, h2::SendStream<Bytes>), String> {
-        let mut sender = self.sender.lock().await;
-        poll_fn(|context| sender.poll_ready(context))
-            .await
-            .map_err(|error| error.to_string())?;
-        sender
+        let mut state = self.connection.lock().await;
+        let sender_was_present = state.sender.is_some();
+        if state.sender.is_none() {
+            self.connect_sender(&mut state).await?;
+        }
+
+        let readiness = {
+            let sender = state.sender.as_mut().unwrap();
+            poll_fn(|context| sender.poll_ready(context)).await
+        };
+        if let Err(error) = readiness {
+            let error = error.to_string();
+            state.sender = None;
+            if !sender_was_present {
+                return Err(error);
+            }
+            self.connect_sender(&mut state).await?;
+            let readiness = {
+                let sender = state.sender.as_mut().unwrap();
+                poll_fn(|context| sender.poll_ready(context)).await
+            };
+            if let Err(error) = readiness {
+                state.sender = None;
+                return Err(error.to_string());
+            }
+        }
+
+        match state
+            .sender
+            .as_mut()
+            .unwrap()
             .send_request(request, end_of_stream)
-            .map_err(|error| error.to_string())
+        {
+            Ok(result) => Ok(result),
+            Err(error) => {
+                state.sender = None;
+                Err(error.to_string())
+            }
+        }
     }
 
     fn request(
@@ -255,6 +324,94 @@ fn extract_generated_media_key(headers: &http::HeaderMap) -> Result<String, Stri
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio::{
+        net::TcpListener,
+        sync::oneshot,
+        task::JoinHandle,
+    };
+
+    struct ReconnectingStorageServer {
+        client: H2cStorageClient,
+        server: JoinHandle<usize>,
+        close_initial: oneshot::Sender<()>,
+        initial_closed: oneshot::Receiver<()>,
+        restart: oneshot::Sender<()>,
+        restarted: oneshot::Receiver<()>,
+        finished: oneshot::Sender<()>,
+    }
+
+    async fn start_reconnecting_storage_server() -> ReconnectingStorageServer {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let (close_initial, close_initial_rx) = oneshot::channel();
+        let (initial_closed_tx, initial_closed) = oneshot::channel();
+        let (restart, restart_rx) = oneshot::channel();
+        let (restarted_tx, restarted) = oneshot::channel();
+        let (finished, mut finished_rx) = oneshot::channel();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut accepted_connections = 1;
+            let mut connection = h2::server::handshake(stream).await.unwrap();
+            let mut close_initial_rx = close_initial_rx;
+            loop {
+                tokio::select! {
+                    _ = &mut close_initial_rx => break,
+                    _ = respond_to_next_request(&mut connection) => {}
+                }
+            }
+            drop(connection);
+            drop(listener);
+            let _ = initial_closed_tx.send(());
+
+            let _ = restart_rx.await;
+            let listener = TcpListener::bind(address).await.unwrap();
+            let _ = restarted_tx.send(());
+            let (stream, _) = listener.accept().await.unwrap();
+            accepted_connections += 1;
+            let mut connection = h2::server::handshake(stream).await.unwrap();
+            loop {
+                tokio::select! {
+                    _ = &mut finished_rx => break,
+                    _ = respond_to_next_request(&mut connection) => {}
+                }
+            }
+            drop(connection);
+            accepted_connections
+        });
+        let client = H2cStorageClient::connect(address).await.unwrap();
+        ReconnectingStorageServer {
+            client,
+            server,
+            close_initial,
+            initial_closed,
+            restart,
+            restarted,
+            finished,
+        }
+    }
+
+    async fn respond_to_next_request(
+        connection: &mut h2::server::Connection<TcpStream, Bytes>,
+    ) {
+        let Some(Ok((_request, mut respond))) = connection.accept().await else {
+            panic!("h2 client did not send a request");
+        };
+        let response = http::Response::builder()
+            .status(StatusCode::OK)
+            .body(())
+            .unwrap();
+        respond.send_response(response, true).unwrap();
+    }
+
+    async fn wait_until_disconnected(client: &H2cStorageClient) {
+        for _ in 0..1_000 {
+            if client.connection.lock().await.sender.is_none() {
+                return;
+            }
+            tokio::task::yield_now().await;
+        }
+        panic!("h2 connection driver did not clear its sender");
+    }
 
     #[test]
     fn extract_generated_media_key_requires_exactly_one_valid_object_name() {
@@ -280,5 +437,49 @@ mod tests {
             extract_generated_media_key(&headers).unwrap(),
             format!("{MEDIA_KEY_PREFIX}{}", "a".repeat(64))
         );
+    }
+
+    #[tokio::test]
+    async fn reconnects_after_storage_becomes_unavailable_and_restarts() {
+        let server = start_reconnecting_storage_server().await;
+        server.client.get("first", None, true).await.unwrap();
+        server.close_initial.send(()).unwrap();
+        server.initial_closed.await.unwrap();
+        wait_until_disconnected(&server.client).await;
+
+        assert!(server.client.get("while-down", None, true).await.is_err());
+        server.restart.send(()).unwrap();
+        server.restarted.await.unwrap();
+        let response = server.client.get("after-restart", None, true).await.unwrap();
+        assert_eq!(response.status, StatusCode::OK);
+
+        server.finished.send(()).unwrap();
+        assert_eq!(server.server.await.unwrap(), 2);
+    }
+
+    #[tokio::test]
+    async fn concurrent_requests_share_one_replacement_connection() {
+        const REQUEST_COUNT: usize = 8;
+
+        let server = start_reconnecting_storage_server().await;
+        server.client.get("first", None, true).await.unwrap();
+        server.close_initial.send(()).unwrap();
+        server.initial_closed.await.unwrap();
+        wait_until_disconnected(&server.client).await;
+        server.restart.send(()).unwrap();
+        server.restarted.await.unwrap();
+
+        let requests = (0..REQUEST_COUNT)
+            .map(|_| {
+                let client = server.client.clone();
+                tokio::spawn(async move { client.get("concurrent", None, true).await })
+            })
+            .collect::<Vec<_>>();
+        for request in requests {
+            assert_eq!(request.await.unwrap().unwrap().status, StatusCode::OK);
+        }
+
+        server.finished.send(()).unwrap();
+        assert_eq!(server.server.await.unwrap(), 2);
     }
 }

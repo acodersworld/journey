@@ -51,6 +51,16 @@ loopback address. This keeps storage protocol details out of the website
 handlers and leaves room for a later WebSocket-backed implementation without
 changing `journey-storage`.
 
+`journey-site serve` requires storage to accept an initial connection before
+the website starts. After startup, the shared storage client reconnects to the
+configured loopback address when its h2 connection ends or a request finds the
+sender closed or dispatch fails. Concurrent requests share the replacement
+connection. A request already in flight can fail during a disconnect; the
+client does not replay uploads or restart a GET response body. Media routes
+keep returning their upstream failure response while storage is unavailable,
+and later requests can succeed after storage returns without restarting the
+website.
+
 `GET /api/posts` returns `{ "posts": [...], "next_cursor": string | null }`
 with published summaries ordered by `published_at DESC, id DESC`. The default
 page size is 10 and the maximum is 100. Its optional `after` parameter contains
