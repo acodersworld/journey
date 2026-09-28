@@ -16,7 +16,7 @@ The AWS instance is deliberately small, initially assumed to have about 1 GiB of
 
 - Run the public website, application logic, and content database on AWS.
 - Serve the public website over HTTPS with HTTP/2, while retaining HTTP/1.1 fallback where needed.
-- Use React for browser-side interactivity without running Node.js in production.
+- Render the public post feed as HTML and use a small browser script for scrolling and expansion.
 - Keep original pictures and videos on the home server.
 - Let AWS store and retrieve media through a narrow, purpose-built interface.
 - Support progressive video playback and seeking through standard public HTTP range requests.
@@ -49,7 +49,7 @@ Browser
 +--------------------------------+
 | AWS micro instance             |
 |                                |
-|  Nginx + compiled React assets |
+|  Nginx reverse proxy           |
 |    |                           |
 |  Rust API + SQLite             |
 |    |                           |
@@ -81,22 +81,19 @@ Public browser HTTP/2 and private storage HTTP/2 are independent connections. Ng
 
 The home HTTP/2 server is not a general proxy. It exposes only a strict object API using immutable identifiers. This is intentionally narrower than WireGuard, Tailscale, Chisel, or a reverse SSH tunnel. Yamux plus a custom object protocol remains an alternative if HTTP/2 proves disproportionate in the first vertical slice.
 
-### Frontend build and runtime
+### Public website rendering
 
-React runs in each visitor's browser. The React source, TypeScript, CSS, and dependencies are compiled into versioned static HTML, JavaScript, CSS, and asset files before deployment.
+Rust renders the public feed at `GET /` with its first ten post previews and
+renders complete posts at `GET /posts/{id}`. A small browser script progressively
+enhances the feed: it requests cursor-paginated summaries from
+`GET /api/posts?limit=10&after=<cursor>` after the reader scrolls to the end,
+and fetches a post's blocks from `GET /api/posts/{id}` only when its preview is
+expanded. Direct post links work without the script.
 
-The production container build uses multiple stages:
-
-1. A pinned Node.js build stage installs the exact dependency versions from the committed lockfile using `npm ci`.
-2. The Node stage runs the frontend production build and produces a `dist` directory.
-3. Only the compiled `dist` files are copied into the final Nginx image or other static-asset image.
-4. The Node build stage and `node_modules` are absent from the production runtime image.
-
-Frontend images should normally be built on a development machine or in CI and then deployed to AWS. Running the build on the 1 GiB production instance would create avoidable memory and CPU pressure.
-
-Nginx serves fingerprinted frontend assets with long-lived immutable cache headers and routes dynamic API requests to the Rust application. React requests data on demand; for example, infinite scrolling calls a cursor-paginated endpoint such as `GET /api/posts?limit=20&after=<cursor>` and appends the returned records in the browser.
-
-Node.js is therefore a build-time dependency only. It is not a production service and consumes no runtime memory on AWS. The initial rendering and search-indexing strategy for public post pages remains an open product decision; Rust-rendered public HTML and a React administration/editor application remain compatible with this build model.
+The first public feed does not need a JavaScript framework or a frontend build
+stage. React remains a possible choice for a future authoring interface or
+other richer browser application; Node.js would then be a build-time dependency
+and would not run in production.
 
 ## 5. Connection model
 
@@ -361,7 +358,7 @@ These are planning allowances, not measurements:
 | Snapshot compression | Temporary bounded memory and CPU; run off peak |
 | Private transport working memory | Bounded per-stream HTTP/2 and WebSocket-adapter buffers |
 | Public media cache | Primarily disk; bounded block/segment metadata index |
-| Node.js frontend toolchain | Build time only; absent from production runtime |
+| Optional authoring frontend toolchain | Future build time only; absent from production runtime |
 
 The private transport should require little idle memory, but HTTP/2 multiplexing creates per-stream state and flow-control buffers. The byte-stream adapter therefore emits small bounded WebSocket messages rather than using one WebSocket message per object.
 
@@ -375,7 +372,7 @@ Docker Compose remains a candidate, but neither side requires every component to
 
 ### AWS
 
-- Nginx public reverse proxy serving compiled, fingerprinted React assets over HTTP/2
+- Nginx public reverse proxy serving the Rust-rendered website over HTTP/2
 - Rust Journey API, including or adjacent to the WebSocket endpoint
 - SQLite database on a persistent volume
 - Scheduled consistent snapshot and Zstandard compression job
@@ -422,8 +419,8 @@ S3 or another object store could hold originals or public variants. This would i
 - Who can author content, and how many authors are expected?
 - Are comments, themes, plugins, revisions, scheduling, and moderation required?
 - What does "like WordPress" mean for the first usable release?
-- Which public routes should Rust render as indexable HTML, and which should be handled entirely by React?
-- What editing component and content format should the React authoring interface use?
+- Which additional public routes should Rust render as indexable HTML?
+- Should a future authoring interface use React, and what editing component and content format should it use?
 
 ### Content and metadata
 
@@ -478,7 +475,7 @@ The internal-network transport proof of concept is specified separately in [Vert
 2. **Safe storage:** Add idempotent inner HTTP/2 `PUT`, temporary files, size/digest checks, atomic rename, and storage quota.
 3. **Failure tests:** Interrupt uploads, restart both endpoints, send invalid requests and excessive streams, and fill staging areas safely.
 4. **AWS cache:** Add bounded atomic caching, request coalescing, queue limits, and offline behaviour.
-5. **Publishing slice:** Build React in a disposable Node.js container stage, serve the compiled assets from Nginx, load cursor-paginated post data from Rust, and publish one post with pictures over public HTTP/2.
+5. **Publishing slice:** Render public posts as HTML from Rust, load cursor-paginated previews in the browser, and publish one post with pictures over public HTTP/2.
 6. **Database backup:** Generate, compress, transfer, retain, restore, and integrity-check a complete SQLite snapshot while the application remains active.
 7. **Video slice:** Integrate browser playback with the already-proven inner HTTP/2 range path and test seeking and cache reuse.
 8. **Load measurement:** Measure AWS/home RAM, CPU, bandwidth, snapshot/compression cost, video startup time, seek latency, maximum-file behavior, and queue delay.
@@ -490,9 +487,9 @@ The internal-network transport proof of concept is specified separately in [Vert
 |---|---|---|
 | Public entry point | Small AWS instance | High |
 | Public web protocol | HTTPS with HTTP/2 preferred and HTTP/1.1 fallback | High |
-| Browser interface | Precompiled React assets with dynamic Rust JSON APIs | High |
-| Infinite scrolling | Cursor pagination loaded on demand by React | Medium |
-| Frontend build | Pinned Node.js multi-stage container build | High |
+| Public browser interface | Rust-rendered HTML with a small browser script | High |
+| Infinite scrolling | Cursor pagination loaded on demand by the browser script | High |
+| Authoring interface | Undecided; React remains an option | Low |
 | Production Node.js service | None | High |
 | Website logic and authoritative database | AWS | High |
 | Initial database | SQLite; media bytes excluded | Medium |

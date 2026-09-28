@@ -46,6 +46,18 @@ pub struct PostSummary {
 }
 
 #[derive(Clone, Debug, Serialize)]
+pub struct FeedPage {
+    pub posts: Vec<PostSummary>,
+    pub next_cursor: Option<String>,
+}
+
+#[derive(Clone, Debug)]
+pub struct FeedCursor {
+    pub published_at: String,
+    pub id: i64,
+}
+
+#[derive(Clone, Debug, Serialize)]
 pub struct PostBlock {
     pub position: i64,
     #[serde(rename = "type")]
@@ -140,14 +152,40 @@ impl Database {
         .await
     }
 
-    pub async fn feed(&self, limit: usize) -> Result<Vec<PostSummary>, String> {
+    pub async fn feed(
+        &self,
+        limit: usize,
+        after: Option<FeedCursor>,
+    ) -> Result<FeedPage, String> {
         self.run(move |connection| {
-            let mut statement = connection.prepare(
-                "SELECT id, title, published_at, summary FROM posts \
-                 WHERE published = 1 ORDER BY published_at DESC, id DESC LIMIT ?1",
-            )?;
-            let rows = statement.query_map([limit as i64], post_summary_from_row)?;
-            rows.collect()
+            let mut posts = if let Some(cursor) = after {
+                let mut statement = connection.prepare(
+                    "SELECT id, title, published_at, summary FROM posts \
+                     WHERE published = 1 \
+                       AND (published_at < ?1 OR (published_at = ?1 AND id < ?2)) \
+                     ORDER BY published_at DESC, id DESC LIMIT ?3",
+                )?;
+                let rows = statement.query_map(
+                    params![cursor.published_at, cursor.id, (limit + 1) as i64],
+                    post_summary_from_row,
+                )?;
+                rows.collect::<rusqlite::Result<Vec<_>>>()?
+            } else {
+                let mut statement = connection.prepare(
+                    "SELECT id, title, published_at, summary FROM posts \
+                     WHERE published = 1 ORDER BY published_at DESC, id DESC LIMIT ?1",
+                )?;
+                let rows = statement.query_map([(limit + 1) as i64], post_summary_from_row)?;
+                rows.collect::<rusqlite::Result<Vec<_>>>()?
+            };
+            let has_more = posts.len() > limit;
+            posts.truncate(limit);
+            let next_cursor = if has_more {
+                posts.last().map(|post| format!("{}:{}", post.published_at, post.id))
+            } else {
+                None
+            };
+            Ok(FeedPage { posts, next_cursor })
         })
         .await
     }
@@ -282,4 +320,65 @@ fn post_summary_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<PostSummar
         published_at: row.get(2)?,
         summary: row.get(3)?,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{
+        path::PathBuf,
+        time::{SystemTime, UNIX_EPOCH},
+    };
+
+    use super::{Database, NewPost};
+
+    fn test_database_path() -> PathBuf {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir().join(format!("journey-site-db-{}-{nonce}.sqlite3", std::process::id()))
+    }
+
+    fn post(published_at: &str, title: &str) -> NewPost {
+        NewPost {
+            title: title.to_owned(),
+            published_at: published_at.to_owned(),
+            summary: format!("Summary for {title}"),
+            blocks: Vec::new(),
+        }
+    }
+
+    #[tokio::test]
+    async fn feed_paginates_in_date_and_id_order_across_equal_dates() {
+        let path = test_database_path();
+        let database = Database::new(path.clone());
+        let posts = (1..=8)
+            .map(|id| post("2026-04-01", &format!("newer {id}")))
+            .chain((9..=12).map(|id| post("2026-03-31", &format!("older {id}"))))
+            .collect();
+        database.replace_posts(posts).await.unwrap();
+
+        let first = database.feed(10, None).await.unwrap();
+        assert_eq!(first.posts.len(), 10);
+        assert_eq!(
+            first.posts.iter().map(|post| post.id).collect::<Vec<_>>(),
+            vec![8, 7, 6, 5, 4, 3, 2, 1, 12, 11]
+        );
+        assert_eq!(first.next_cursor.as_deref(), Some("2026-03-31:11"));
+
+        let second = database
+            .feed(
+                10,
+                Some(super::FeedCursor {
+                    published_at: "2026-03-31".to_owned(),
+                    id: 11,
+                }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(second.posts.iter().map(|post| post.id).collect::<Vec<_>>(), vec![10, 9]);
+        assert_eq!(second.next_cursor, None);
+
+        std::fs::remove_file(path).unwrap();
+    }
 }

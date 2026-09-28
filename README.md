@@ -72,11 +72,14 @@ cargo run -p journey-site -- serve
 
 `JOURNEY_SITE_DB` selects the SQLite file, `JOURNEY_SITE_BIND` selects the
 HTTP listener (default `127.0.0.1:8080`), and `JOURNEY_STORAGE_H2C` selects the
-loopback storage address (default `127.0.0.1:8081`). The bounded feed is
-`GET /api/posts?limit=20`; full content is available at
-`GET /api/posts/{id}` and the normal link `GET /posts/{id}`. Media is served
-only through `GET` or `HEAD /posts/{id}/blocks/{position}/media`, where the
-position is zero-based. Video requests forward one byte range to storage.
+loopback storage address (default `127.0.0.1:8081`). The public feed is
+server-rendered at `GET /`; its browser script loads more previews from
+`GET /api/posts`, which defaults to 10 and accepts a maximum `limit` of 100.
+Feed responses include `posts` and a `next_cursor`; pass that cursor as `after`
+to request the next page. `GET /api/posts/{id}` returns full content as JSON,
+and the normal link `GET /posts/{id}` renders it as HTML. Media is served only
+through `GET` or `HEAD /posts/{id}/blocks/{position}/media`, where the position
+is zero-based. Video requests forward one byte range to storage.
 `journey-site --help` and `journey-site db` list the CLI commands.
 
 ## HTTP/2 object storage

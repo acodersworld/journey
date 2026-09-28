@@ -51,10 +51,25 @@ loopback address. This keeps storage protocol details out of the website
 handlers and leaves room for a later WebSocket-backed implementation without
 changing `journey-storage`.
 
-`GET /api/posts` returns at most 100 published post summaries, newest first.
-`GET /api/posts/{id}` and `GET /posts/{id}` return one post with blocks. Public
-media URLs identify a post and zero-based block position, never a storage key.
-The backend confirms the block belongs to a published post and is an image or
+`GET /api/posts` returns `{ "posts": [...], "next_cursor": string | null }`
+with published summaries ordered by `published_at DESC, id DESC`. The default
+page size is 10 and the maximum is 100. Its optional `after` parameter contains
+the last post's `YYYY-MM-DD` publication date and ID separated by a colon. The
+query uses that pair as a keyset position, including when adjacent posts share
+a publication date. Malformed cursors return `400`. The database fetches one
+extra row to tell whether a following page exists; cursors follow the current
+ordering and do not preserve a snapshot across imports.
+
+`GET /` renders the first ten previews as semantic HTML and embeds the next
+cursor for the browser script. The script loads more previews after downward
+scrolling reaches the sentinel, with a visible **Load more** button as a
+fallback. Expanding a preview fetches only that post from
+`GET /api/posts/{id}` and inserts its blocks inline. The expansion is cached in
+the page after its first successful request. `GET /api/posts/{id}` remains
+JSON, while `GET /posts/{id}` renders a complete HTML post for direct links.
+Both HTML routes escape post text. Image and video blocks use public media URLs
+that identify a post and zero-based block position, never a storage key. The
+backend confirms the block belongs to a published post and is an image or
 video before asking storage for it. It streams response bodies and forwards
 single byte ranges for video. Image ranges are ignored. There are no editing,
 draft, or account routes in this slice.
