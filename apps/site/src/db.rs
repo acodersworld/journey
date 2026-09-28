@@ -1,35 +1,67 @@
-use std::{path::PathBuf, sync::Arc, time::Duration};
+use std::{collections::HashMap, path::PathBuf, sync::Arc, time::Duration};
 
-use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
+use rusqlite::{params, types::Type, Connection, OptionalExtension, TransactionBehavior};
 use serde::Serialize;
 
-const SCHEMA: &str = "\
+const POSTS_SCHEMA: &str = "\
 CREATE TABLE IF NOT EXISTS posts (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     title TEXT NOT NULL CHECK (length(trim(title)) > 0),
     published_at TEXT NOT NULL,
     summary TEXT NOT NULL,
-    published INTEGER NOT NULL DEFAULT 1 CHECK (published IN (0, 1))
+    published INTEGER NOT NULL DEFAULT 1 CHECK (published IN (0, 1)),
+    tags TEXT NOT NULL DEFAULT '[]' CHECK (json_valid(tags) AND json_type(tags) = 'array')
 );
+CREATE INDEX IF NOT EXISTS posts_published_order ON posts(published, published_at DESC, id DESC);
+CREATE TRIGGER IF NOT EXISTS posts_tags_are_strings_insert
+BEFORE INSERT ON posts
+WHEN EXISTS (SELECT 1 FROM json_each(NEW.tags) WHERE type != 'text')
+BEGIN
+    SELECT RAISE(ABORT, 'post tags must be strings');
+END;
+CREATE TRIGGER IF NOT EXISTS posts_tags_are_strings_update
+BEFORE UPDATE OF tags ON posts
+WHEN EXISTS (SELECT 1 FROM json_each(NEW.tags) WHERE type != 'text')
+BEGIN
+    SELECT RAISE(ABORT, 'post tags must be strings');
+END;
+";
+
+const POST_BLOCKS_SCHEMA: &str = "\
 CREATE TABLE IF NOT EXISTS post_blocks (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
     post_id INTEGER NOT NULL REFERENCES posts(id) ON DELETE CASCADE,
+    parent_id INTEGER,
     position INTEGER NOT NULL CHECK (position >= 0),
-    kind TEXT NOT NULL CHECK (kind IN ('paragraph', 'heading', 'image', 'video')),
-    text TEXT,
-    level INTEGER,
+    header TEXT,
+    body TEXT,
     storage_key TEXT,
     content_type TEXT,
     alt_text TEXT,
-    caption TEXT,
-    PRIMARY KEY (post_id, position),
-    CHECK (
-        (kind = 'paragraph' AND text IS NOT NULL AND level IS NULL AND storage_key IS NULL AND content_type IS NULL AND alt_text IS NULL AND caption IS NULL)
-        OR (kind = 'heading' AND text IS NOT NULL AND level BETWEEN 1 AND 6 AND storage_key IS NULL AND content_type IS NULL AND alt_text IS NULL AND caption IS NULL)
-        OR (kind = 'image' AND text IS NULL AND level IS NULL AND storage_key IS NOT NULL AND content_type IS NOT NULL)
-        OR (kind = 'video' AND text IS NULL AND level IS NULL AND storage_key IS NOT NULL AND content_type IS NOT NULL)
-    )
+    UNIQUE (id, post_id),
+    FOREIGN KEY (parent_id, post_id) REFERENCES post_blocks(id, post_id) ON DELETE CASCADE,
+    CHECK (parent_id IS NULL OR parent_id != id),
+    CHECK ((storage_key IS NULL) = (content_type IS NULL))
 );
-CREATE INDEX IF NOT EXISTS posts_published_order ON posts(published, published_at DESC, id DESC);
+CREATE UNIQUE INDEX IF NOT EXISTS post_blocks_sibling_order
+    ON post_blocks(post_id, COALESCE(parent_id, 0), position);
+CREATE TRIGGER IF NOT EXISTS post_blocks_parent_must_be_root_insert
+BEFORE INSERT ON post_blocks
+WHEN NEW.parent_id IS NOT NULL AND EXISTS (
+    SELECT 1 FROM post_blocks WHERE id = NEW.parent_id AND parent_id IS NOT NULL
+)
+BEGIN
+    SELECT RAISE(ABORT, 'post blocks may only be nested one level deep');
+END;
+CREATE TRIGGER IF NOT EXISTS post_blocks_parent_must_be_root_update
+BEFORE UPDATE OF parent_id ON post_blocks
+WHEN NEW.parent_id IS NOT NULL AND (
+    EXISTS (SELECT 1 FROM post_blocks WHERE id = NEW.parent_id AND parent_id IS NOT NULL)
+    OR EXISTS (SELECT 1 FROM post_blocks WHERE parent_id = OLD.id)
+)
+BEGIN
+    SELECT RAISE(ABORT, 'post blocks may only be nested one level deep');
+END;
 ";
 
 #[derive(Clone)]
@@ -59,25 +91,24 @@ pub struct FeedCursor {
 
 #[derive(Clone, Debug, Serialize)]
 pub struct PostBlock {
+    pub id: i64,
     pub position: i64,
-    #[serde(rename = "type")]
-    pub kind: String,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub text: Option<String>,
+    pub header: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub level: Option<i64>,
+    pub body: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub content_type: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub alt: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub caption: Option<String>,
+    pub children: Vec<PostBlock>,
 }
 
 #[derive(Clone, Debug, Serialize)]
 pub struct Post {
     #[serde(flatten)]
     pub summary: PostSummary,
+    pub tags: Vec<String>,
     pub blocks: Vec<PostBlock>,
 }
 
@@ -86,23 +117,22 @@ pub struct NewPost {
     pub title: String,
     pub published_at: String,
     pub summary: String,
+    pub tags: Vec<String>,
     pub blocks: Vec<NewBlock>,
 }
 
 #[derive(Clone, Debug)]
 pub struct NewBlock {
-    pub kind: String,
-    pub text: Option<String>,
-    pub level: Option<i64>,
+    pub header: Option<String>,
+    pub body: Option<String>,
     pub storage_key: Option<String>,
     pub content_type: Option<String>,
     pub alt: Option<String>,
-    pub caption: Option<String>,
+    pub children: Vec<NewBlock>,
 }
 
 #[derive(Clone, Debug)]
 pub struct MediaReference {
-    pub kind: String,
     pub storage_key: String,
     pub content_type: String,
 }
@@ -113,38 +143,33 @@ impl Database {
     }
 
     pub async fn initialize(&self) -> Result<(), String> {
-        self.run(|connection| connection.execute_batch(SCHEMA)).await
+        self.run(initialize_schema).await
     }
 
     pub async fn replace_posts(&self, posts: Vec<NewPost>) -> Result<(), String> {
         self.initialize().await?;
+        let posts = posts
+            .into_iter()
+            .map(|post| {
+                let tags = serde_json::to_string(&post.tags).map_err(|error| error.to_string())?;
+                Ok((post, tags))
+            })
+            .collect::<Result<Vec<_>, String>>()?;
         self.run(move |connection| {
             let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
             transaction.execute("DELETE FROM posts", [])?;
             {
                 let mut insert_post = transaction.prepare(
-                    "INSERT INTO posts (title, published_at, summary, published) VALUES (?1, ?2, ?3, 1)",
+                    "INSERT INTO posts (title, published_at, summary, published, tags) VALUES (?1, ?2, ?3, 1, ?4)",
                 )?;
                 let mut insert_block = transaction.prepare(
-                    "INSERT INTO post_blocks (post_id, position, kind, text, level, storage_key, content_type, alt_text, caption) \
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                    "INSERT INTO post_blocks (post_id, parent_id, position, header, body, storage_key, content_type, alt_text) \
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
                 )?;
-                for post in posts {
-                    insert_post.execute(params![post.title, post.published_at, post.summary])?;
+                for (post, tags) in posts {
+                    insert_post.execute(params![post.title, post.published_at, post.summary, tags])?;
                     let post_id = transaction.last_insert_rowid();
-                    for (position, block) in post.blocks.into_iter().enumerate() {
-                        insert_block.execute(params![
-                            post_id,
-                            position as i64,
-                            block.kind,
-                            block.text,
-                            block.level,
-                            block.storage_key,
-                            block.content_type,
-                            block.alt,
-                            block.caption,
-                        ])?;
-                    }
+                    insert_blocks(&transaction, &mut insert_block, post_id, None, post.blocks)?;
                 }
             }
             transaction.commit()
@@ -205,37 +230,64 @@ impl Database {
     pub async fn post(&self, id: i64) -> Result<Option<Post>, String> {
         self.run(move |connection| {
             let transaction = connection.transaction()?;
-            let summary = transaction
+            let post_row = transaction
                 .query_row(
-                    "SELECT id, title, published_at, summary FROM posts WHERE id = ?1 AND published = 1",
+                    "SELECT id, title, published_at, summary, tags FROM posts WHERE id = ?1 AND published = 1",
                     [id],
-                    post_summary_from_row,
+                    |row| {
+                        let tags_json: String = row.get(4)?;
+                        let tags = serde_json::from_str(&tags_json).map_err(|error| {
+                            rusqlite::Error::FromSqlConversionFailure(
+                                4,
+                                Type::Text,
+                                Box::new(error),
+                            )
+                        })?;
+                        Ok((post_summary_from_row(row)?, tags))
+                    },
                 )
                 .optional()?;
-            let Some(summary) = summary else {
+            let Some((summary, tags)) = post_row else {
                 transaction.commit()?;
                 return Ok(None);
             };
-            let blocks = {
+
+            let (mut blocks, mut children) = {
                 let mut statement = transaction.prepare(
-                    "SELECT position, kind, text, level, content_type, alt_text, caption \
-                     FROM post_blocks WHERE post_id = ?1 ORDER BY position",
+                    "SELECT id, parent_id, position, header, body, content_type, alt_text \
+                     FROM post_blocks WHERE post_id = ?1 \
+                     ORDER BY parent_id IS NOT NULL, parent_id, position",
                 )?;
                 let rows = statement.query_map([id], |row| {
-                    Ok(PostBlock {
-                        position: row.get(0)?,
-                        kind: row.get(1)?,
-                        text: row.get(2)?,
-                        level: row.get(3)?,
-                        content_type: row.get(4)?,
-                        alt: row.get(5)?,
-                        caption: row.get(6)?,
-                    })
+                    let parent_id: Option<i64> = row.get(1)?;
+                    let block = PostBlock {
+                        id: row.get(0)?,
+                        position: row.get(2)?,
+                        header: row.get(3)?,
+                        body: row.get(4)?,
+                        content_type: row.get(5)?,
+                        alt: row.get(6)?,
+                        children: Vec::new(),
+                    };
+                    Ok((parent_id, block))
                 })?;
-                rows.collect::<rusqlite::Result<Vec<_>>>()?
+                let mut blocks = Vec::new();
+                let mut children = HashMap::<i64, Vec<PostBlock>>::new();
+                for row in rows {
+                    let (parent_id, block) = row?;
+                    if let Some(parent_id) = parent_id {
+                        children.entry(parent_id).or_default().push(block);
+                    } else {
+                        blocks.push(block);
+                    }
+                }
+                (blocks, children)
             };
+            for block in &mut blocks {
+                block.children = children.remove(&block.id).unwrap_or_default();
+            }
             transaction.commit()?;
-            Ok(Some(Post { summary, blocks }))
+            Ok(Some(Post { summary, tags, blocks }))
         })
         .await
     }
@@ -243,21 +295,21 @@ impl Database {
     pub async fn media_reference(
         &self,
         post_id: i64,
-        position: i64,
+        block_id: i64,
     ) -> Result<Option<MediaReference>, String> {
         self.run(move |connection| {
             connection
                 .query_row(
-                    "SELECT b.kind, b.storage_key, b.content_type \
+                    "SELECT b.storage_key, b.content_type \
                      FROM post_blocks AS b JOIN posts AS p ON p.id = b.post_id \
-                     WHERE p.id = ?1 AND p.published = 1 AND b.position = ?2 \
-                       AND b.kind IN ('image', 'video')",
-                    params![post_id, position],
+                     WHERE p.id = ?1 AND p.published = 1 AND b.id = ?2 \
+                       AND b.storage_key IS NOT NULL \
+                       AND (b.content_type LIKE 'image/%' OR b.content_type LIKE 'video/%')",
+                    params![post_id, block_id],
                     |row| {
                         Ok(MediaReference {
-                            kind: row.get(0)?,
-                            storage_key: row.get(1)?,
-                            content_type: row.get(2)?,
+                            storage_key: row.get(0)?,
+                            content_type: row.get(1)?,
                         })
                     },
                 )
@@ -313,6 +365,88 @@ impl Database {
     }
 }
 
+fn initialize_schema(connection: &mut Connection) -> rusqlite::Result<()> {
+    let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    transaction.execute_batch(POSTS_SCHEMA)?;
+    if !table_has_column(&transaction, "posts", "tags")? {
+        transaction.execute(
+            "ALTER TABLE posts ADD COLUMN tags TEXT NOT NULL DEFAULT '[]' \
+             CHECK (json_valid(tags) AND json_type(tags) = 'array')",
+            [],
+        )?;
+    }
+
+    if table_exists(&transaction, "post_blocks")? {
+        if table_has_column(&transaction, "post_blocks", "kind")? {
+            transaction.execute("ALTER TABLE post_blocks RENAME TO post_blocks_legacy", [])?;
+            transaction.execute_batch(POST_BLOCKS_SCHEMA)?;
+            transaction.execute_batch(
+                "INSERT INTO post_blocks (post_id, parent_id, position, header, body, storage_key, content_type, alt_text) \
+                 SELECT post_id, NULL, position, \
+                     CASE WHEN kind = 'heading' THEN text END, \
+                     CASE WHEN kind = 'paragraph' THEN text WHEN kind IN ('image', 'video') THEN caption END, \
+                     storage_key, content_type, alt_text \
+                 FROM post_blocks_legacy ORDER BY post_id, position; \
+                 DROP TABLE post_blocks_legacy;",
+            )?;
+        } else {
+            transaction.execute_batch(POST_BLOCKS_SCHEMA)?;
+        }
+    } else {
+        transaction.execute_batch(POST_BLOCKS_SCHEMA)?;
+    }
+    transaction.pragma_update(None, "user_version", 2)?;
+    transaction.commit()
+}
+
+fn table_exists(connection: &Connection, table: &str) -> rusqlite::Result<bool> {
+    connection.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1)",
+        [table],
+        |row| row.get(0),
+    )
+}
+
+fn table_has_column(
+    connection: &Connection,
+    table: &str,
+    column: &str,
+) -> rusqlite::Result<bool> {
+    let mut statement = connection.prepare(&format!("PRAGMA table_info({table})"))?;
+    let columns = statement.query_map([], |row| row.get::<_, String>(1))?;
+    for existing in columns {
+        if existing? == column {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn insert_blocks(
+    connection: &Connection,
+    statement: &mut rusqlite::Statement<'_>,
+    post_id: i64,
+    parent_id: Option<i64>,
+    blocks: Vec<NewBlock>,
+) -> rusqlite::Result<()> {
+    for (position, block) in blocks.into_iter().enumerate() {
+        let NewBlock { header, body, storage_key, content_type, alt, children } = block;
+        statement.execute(params![
+            post_id,
+            parent_id,
+            position as i64,
+            header,
+            body,
+            storage_key,
+            content_type,
+            alt,
+        ])?;
+        let block_id = connection.last_insert_rowid();
+        insert_blocks(connection, statement, post_id, Some(block_id), children)?;
+    }
+    Ok(())
+}
+
 fn post_summary_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<PostSummary> {
     Ok(PostSummary {
         id: row.get(0)?,
@@ -329,7 +463,9 @@ mod tests {
         time::{SystemTime, UNIX_EPOCH},
     };
 
-    use super::{Database, NewPost};
+    use rusqlite::Connection;
+
+    use super::{Database, NewBlock, NewPost};
 
     fn test_database_path() -> PathBuf {
         let nonce = SystemTime::now()
@@ -344,6 +480,7 @@ mod tests {
             title: title.to_owned(),
             published_at: published_at.to_owned(),
             summary: format!("Summary for {title}"),
+            tags: Vec::new(),
             blocks: Vec::new(),
         }
     }
@@ -378,6 +515,207 @@ mod tests {
             .unwrap();
         assert_eq!(second.posts.iter().map(|post| post.id).collect::<Vec<_>>(), vec![10, 9]);
         assert_eq!(second.next_cursor, None);
+
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn migration_maps_flat_blocks_and_adds_empty_tags() {
+        let path = test_database_path();
+        let connection = Connection::open(&path).unwrap();
+        connection.execute_batch(
+            "CREATE TABLE posts (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                title TEXT NOT NULL,
+                published_at TEXT NOT NULL,
+                summary TEXT NOT NULL,
+                published INTEGER NOT NULL DEFAULT 1
+             );
+             CREATE TABLE post_blocks (
+                post_id INTEGER NOT NULL REFERENCES posts(id) ON DELETE CASCADE,
+                position INTEGER NOT NULL,
+                kind TEXT NOT NULL,
+                text TEXT,
+                level INTEGER,
+                storage_key TEXT,
+                content_type TEXT,
+                alt_text TEXT,
+                caption TEXT,
+                PRIMARY KEY (post_id, position)
+             );
+             INSERT INTO posts (id, title, published_at, summary) VALUES (7, 'Old post', '2025-01-02', 'Old summary');
+             INSERT INTO post_blocks VALUES (7, 0, 'heading', 'A heading', 3, NULL, NULL, NULL, NULL);
+             INSERT INTO post_blocks VALUES (7, 1, 'paragraph', 'A paragraph', NULL, NULL, NULL, NULL, NULL);
+             INSERT INTO post_blocks VALUES (7, 2, 'image', NULL, NULL, 'media/image-key', 'image/jpeg', 'An image', 'Image caption');
+             INSERT INTO post_blocks VALUES (7, 3, 'video', NULL, NULL, 'media/video-key', 'video/mp4', NULL, 'Video caption');",
+        )
+        .unwrap();
+        drop(connection);
+
+        let database = Database::new(path.clone());
+        database.initialize().await.unwrap();
+        let migrated = database.post(7).await.unwrap().unwrap();
+        assert!(migrated.tags.is_empty());
+        assert_eq!(migrated.blocks.len(), 4);
+        assert_eq!(migrated.blocks[0].header.as_deref(), Some("A heading"));
+        assert_eq!(migrated.blocks[1].body.as_deref(), Some("A paragraph"));
+        assert_eq!(migrated.blocks[2].body.as_deref(), Some("Image caption"));
+        assert_eq!(migrated.blocks[2].content_type.as_deref(), Some("image/jpeg"));
+        assert_eq!(migrated.blocks[3].body.as_deref(), Some("Video caption"));
+        assert!(migrated.blocks.iter().all(|block| block.children.is_empty()));
+
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn post_reads_tags_sibling_order_and_mixed_group_content() {
+        let path = test_database_path();
+        let database = Database::new(path.clone());
+        let group = NewBlock {
+            header: Some("Morning".to_owned()),
+            body: Some("A quiet start".to_owned()),
+            storage_key: Some("media/group-image".to_owned()),
+            content_type: Some("image/jpeg".to_owned()),
+            alt: Some("A lake at sunrise".to_owned()),
+            children: vec![
+                NewBlock {
+                    header: None,
+                    body: Some("The water was still.".to_owned()),
+                    storage_key: None,
+                    content_type: None,
+                    alt: None,
+                    children: Vec::new(),
+                },
+                NewBlock {
+                    header: None,
+                    body: Some("Birdsong by the dock.".to_owned()),
+                    storage_key: Some("media/child-video".to_owned()),
+                    content_type: Some("video/mp4".to_owned()),
+                    alt: None,
+                    children: Vec::new(),
+                },
+            ],
+        };
+        let mut new_post = post("2026-01-01", "Tagged post");
+        new_post.tags = vec!["Alps".to_owned(), "Morning walk".to_owned()];
+        new_post.blocks = vec![
+            NewBlock {
+                header: None,
+                body: Some("Before the group".to_owned()),
+                storage_key: None,
+                content_type: None,
+                alt: None,
+                children: Vec::new(),
+            },
+            group,
+            NewBlock {
+                header: Some("After the group".to_owned()),
+                body: None,
+                storage_key: None,
+                content_type: None,
+                alt: None,
+                children: Vec::new(),
+            },
+        ];
+        database.replace_posts(vec![new_post]).await.unwrap();
+
+        let connection = Connection::open(&path).unwrap();
+        let first_id = connection.query_row(
+            "SELECT id FROM post_blocks WHERE post_id = 1 AND parent_id IS NULL AND position = 0",
+            [],
+            |row| row.get::<_, i64>(0),
+        ).unwrap();
+        let group_id = connection.query_row(
+            "SELECT id FROM post_blocks WHERE post_id = 1 AND parent_id IS NULL AND position = 1",
+            [],
+            |row| row.get::<_, i64>(0),
+        ).unwrap();
+        let last_id = connection.query_row(
+            "SELECT id FROM post_blocks WHERE post_id = 1 AND parent_id IS NULL AND position = 2",
+            [],
+            |row| row.get::<_, i64>(0),
+        ).unwrap();
+        connection.execute("UPDATE post_blocks SET position = 3 WHERE id = ?1", [first_id]).unwrap();
+        connection.execute("UPDATE post_blocks SET position = 0 WHERE id = ?1", [group_id]).unwrap();
+        connection.execute("UPDATE post_blocks SET position = 1 WHERE id = ?1", [last_id]).unwrap();
+        connection.execute("UPDATE post_blocks SET position = 2 WHERE id = ?1", [first_id]).unwrap();
+        drop(connection);
+
+        let post = database.post(1).await.unwrap().unwrap();
+        assert_eq!(post.tags, vec!["Alps", "Morning walk"]);
+        assert_eq!(post.blocks.len(), 3);
+        assert_eq!(post.blocks[0].id, group_id);
+        assert_eq!(post.blocks[0].position, 0);
+        assert_eq!(post.blocks[0].header.as_deref(), Some("Morning"));
+        assert_eq!(post.blocks[0].body.as_deref(), Some("A quiet start"));
+        assert_eq!(post.blocks[0].content_type.as_deref(), Some("image/jpeg"));
+        assert_eq!(post.blocks[0].children.len(), 2);
+        assert_eq!(post.blocks[0].children[0].position, 0);
+        assert_eq!(post.blocks[0].children[1].position, 1);
+        assert_eq!(post.blocks[0].children[1].content_type.as_deref(), Some("video/mp4"));
+        assert_eq!(post.blocks[1].id, last_id);
+        assert_eq!(post.blocks[1].position, 1);
+        assert_eq!(post.blocks[2].id, first_id);
+        assert_eq!(post.blocks[2].position, 2);
+        assert_eq!(post.blocks[2].body.as_deref(), Some("Before the group"));
+
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn database_rejects_blocks_nested_more_than_one_level() {
+        let path = test_database_path();
+        let database = Database::new(path.clone());
+        database.initialize().await.unwrap();
+        let connection = Connection::open(&path).unwrap();
+        connection.execute_batch("PRAGMA foreign_keys = ON;").unwrap();
+        connection.execute(
+            "INSERT INTO posts (title, published_at, summary) VALUES ('Post', '2026-01-01', 'Summary')",
+            [],
+        ).unwrap();
+        connection.execute(
+            "INSERT INTO post_blocks (post_id, position) VALUES (1, 0)",
+            [],
+        ).unwrap();
+        connection.execute(
+            "INSERT INTO post_blocks (post_id, parent_id, position) VALUES (1, 1, 0)",
+            [],
+        ).unwrap();
+        let error = connection.execute(
+            "INSERT INTO post_blocks (post_id, parent_id, position) VALUES (1, 2, 0)",
+            [],
+        ).unwrap_err();
+        assert!(error.to_string().contains("one level deep"));
+
+        drop(connection);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn media_lookups_use_block_ids_and_require_published_posts() {
+        let path = test_database_path();
+        let database = Database::new(path.clone());
+        let mut media_post = post("2026-01-01", "Published post");
+        media_post.blocks.push(NewBlock {
+            header: None,
+            body: None,
+            storage_key: Some("media/image-key".to_owned()),
+            content_type: Some("image/jpeg".to_owned()),
+            alt: None,
+            children: Vec::new(),
+        });
+        database.replace_posts(vec![media_post]).await.unwrap();
+        let published = database.post(1).await.unwrap().unwrap();
+        let block_id = published.blocks[0].id;
+        assert_eq!(
+            database.media_reference(1, block_id).await.unwrap().unwrap().storage_key,
+            "media/image-key"
+        );
+
+        let connection = Connection::open(&path).unwrap();
+        connection.execute("UPDATE posts SET published = 0 WHERE id = 1", []).unwrap();
+        drop(connection);
+        assert!(database.media_reference(1, block_id).await.unwrap().is_none());
 
         std::fs::remove_file(path).unwrap();
     }

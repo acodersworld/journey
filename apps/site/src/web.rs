@@ -35,7 +35,7 @@ pub fn router<S: StorageClient>(state: AppState<S>) -> Router {
         .route("/api/posts/{id}", get(api_full_post::<S>))
         .route("/posts/{id}", get(post_page::<S>))
         .route(
-            "/posts/{post_id}/blocks/{position}/media",
+            "/posts/{post_id}/blocks/{block_id}/media",
             get(media::<S>).head(media::<S>),
         )
         .with_state(state)
@@ -185,45 +185,64 @@ fn render_preview(post: &PostSummary) -> String {
 
 fn render_full_post(post: &Post) -> String {
     format!(
-        "<!doctype html><html lang=\"en\"><head>{}</head><body><main class=\"site\"><p><a href=\"/\">Journey</a></p><article><h1>{}</h1><time datetime=\"{}\">{}</time><p class=\"summary\">{}</p>{}</article></main></body></html>",
+        "<!doctype html><html lang=\"en\"><head>{}</head><body><main class=\"site\"><p><a href=\"/\">Journey</a></p><article><h1>{}</h1><time datetime=\"{}\">{}</time><p class=\"summary\">{}</p>{}{}</article></main></body></html>",
         html_head(&post.summary.title),
         escape_html(&post.summary.title),
         escape_html(&post.summary.published_at),
         escape_html(&post.summary.published_at),
         escape_html(&post.summary.summary),
+        render_tags_html(&post.tags),
         render_post_blocks_html(post),
     )
 }
 
 fn render_post_blocks_html(post: &Post) -> String {
+    render_blocks_html(&post.blocks, post.summary.id)
+}
+
+fn render_blocks_html(blocks: &[crate::db::PostBlock], post_id: i64) -> String {
     let mut html = String::new();
-    for block in &post.blocks {
-        match block.kind.as_str() {
-            "paragraph" => html.push_str(&format!("<p>{}</p>", escape_html(block.text.as_deref().unwrap_or("")))),
-            "heading" => {
-                let level = block.level.unwrap_or(2).clamp(1, 6);
-                html.push_str(&format!("<h{level}>{}</h{level}>", escape_html(block.text.as_deref().unwrap_or(""))));
-            }
-            "image" => {
-                let media_url = format!("/posts/{}/blocks/{}/media", post.summary.id, block.position);
+    for block in blocks {
+        if let Some(header) = &block.header {
+            html.push_str(&format!("<h2>{}</h2>", escape_html(header)));
+        }
+        match block.content_type.as_deref() {
+            Some(content_type) if content_type.starts_with("image/") => {
+                let media_url = format!("/posts/{post_id}/blocks/{}/media", block.id);
                 html.push_str(&format!(
                     "<figure><img src=\"{media_url}\" alt=\"{}\" loading=\"lazy\">{}</figure>",
                     escape_html(block.alt.as_deref().unwrap_or("")),
-                    render_caption(block.caption.as_deref()),
+                    render_caption(block.body.as_deref()),
                 ));
             }
-            "video" => {
-                let media_url = format!("/posts/{}/blocks/{}/media", post.summary.id, block.position);
+            Some(content_type) if content_type.starts_with("video/") => {
+                let media_url = format!("/posts/{post_id}/blocks/{}/media", block.id);
                 html.push_str(&format!(
                     "<figure><video controls preload=\"metadata\"><source src=\"{media_url}\" type=\"{}\"></video>{}</figure>",
-                    escape_html(block.content_type.as_deref().unwrap_or("application/octet-stream")),
-                    render_caption(block.caption.as_deref()),
+                    escape_html(content_type),
+                    render_caption(block.body.as_deref()),
                 ));
             }
-            _ => {}
+            _ => {
+                if let Some(body) = &block.body {
+                    html.push_str(&format!("<p>{}</p>", escape_html(body)));
+                }
+            }
         }
+        html.push_str(&render_blocks_html(&block.children, post_id));
     }
     html
+}
+
+fn render_tags_html(tags: &[String]) -> String {
+    if tags.is_empty() {
+        String::new()
+    } else {
+        format!(
+            "<p class=\"tags\">Tags: {}</p>",
+            tags.iter().map(|tag| escape_html(tag)).collect::<Vec<_>>().join(", "),
+        )
+    }
 }
 
 fn render_caption(caption: Option<&str>) -> String {
@@ -303,37 +322,44 @@ function makePreview(post) {
   feed.append(article);
 }
 
-function renderBlocks(article, post) {
-  const content = article.querySelector('.post-content');
-  for (const block of post.blocks) {
-    if (block.type === 'paragraph') {
-      content.append(makeElement('p', block.text));
-    } else if (block.type === 'heading') {
-      const level = Math.min(6, Math.max(1, Number(block.level) || 2));
-      content.append(makeElement(`h${level}`, block.text));
-    } else if (block.type === 'image' || block.type === 'video') {
+function renderBlocks(container, blocks, postId) {
+  for (const block of blocks) {
+    if (block.header) container.append(makeElement('h2', block.header));
+    const contentType = block.content_type || '';
+    if (contentType.startsWith('image/')) {
       const figure = makeElement('figure');
-      const url = `/posts/${post.id}/blocks/${block.position}/media`;
-      if (block.type === 'image') {
-        const image = makeElement('img');
-        image.src = url;
-        image.alt = block.alt || '';
-        image.loading = 'lazy';
-        figure.append(image);
-      } else {
-        const video = makeElement('video');
-        video.controls = true;
-        video.preload = 'metadata';
-        const source = makeElement('source');
-        source.src = url;
-        source.type = block.content_type || 'application/octet-stream';
-        video.append(source);
-        figure.append(video);
-      }
-      if (block.caption) figure.append(makeElement('figcaption', block.caption));
-      content.append(figure);
+      const image = makeElement('img');
+      image.src = `/posts/${postId}/blocks/${block.id}/media`;
+      image.alt = block.alt || '';
+      image.loading = 'lazy';
+      figure.append(image);
+      if (block.body) figure.append(makeElement('figcaption', block.body));
+      container.append(figure);
+    } else if (contentType.startsWith('video/')) {
+      const figure = makeElement('figure');
+      const video = makeElement('video');
+      video.controls = true;
+      video.preload = 'metadata';
+      const source = makeElement('source');
+      source.src = `/posts/${postId}/blocks/${block.id}/media`;
+      source.type = contentType;
+      video.append(source);
+      figure.append(video);
+      if (block.body) figure.append(makeElement('figcaption', block.body));
+      container.append(figure);
+    } else if (block.body) {
+      container.append(makeElement('p', block.body));
     }
+    if (Array.isArray(block.children)) renderBlocks(container, block.children, postId);
   }
+}
+
+function renderPostContent(article, post) {
+  const content = article.querySelector('.post-content');
+  if (Array.isArray(post.tags) && post.tags.length > 0) {
+    content.append(makeElement('p', `Tags: ${post.tags.join(', ')}`));
+  }
+  renderBlocks(content, post.blocks, post.id);
 }
 
 async function expandPost(article, button) {
@@ -352,7 +378,7 @@ async function expandPost(article, button) {
     const response = await fetch(`/api/posts/${article.dataset.postId}`);
     if (!response.ok) throw new Error(`HTTP ${response.status}`);
     const post = await response.json();
-    renderBlocks(article, post);
+    renderPostContent(article, post);
     article.dataset.contentLoaded = 'true';
     postStatus.textContent = '';
   } catch (_) {
@@ -418,11 +444,11 @@ if (!nextCursor) status.textContent = 'You have reached the end of the feed.';
 
 async fn media<S: StorageClient>(
     State(state): State<AppState<S>>,
-    Path((post_id, position)): Path<(i64, i64)>,
+    Path((post_id, block_id)): Path<(i64, i64)>,
     method: Method,
     headers: HeaderMap,
 ) -> Response {
-    let media = match state.database.media_reference(post_id, position).await {
+    let media = match state.database.media_reference(post_id, block_id).await {
         Ok(Some(media)) => media,
         Ok(None) => return StatusCode::NOT_FOUND.into_response(),
         Err(error) => {
@@ -431,7 +457,7 @@ async fn media<S: StorageClient>(
         }
     };
     let head = method == Method::HEAD;
-    let range = if media.kind == "video" && !head {
+    let range = if media.content_type.starts_with("video/") && !head {
         let mut values = headers.get_all(header::RANGE).iter();
         let value = values.next();
         if values.next().is_some() {
@@ -553,6 +579,7 @@ mod tests {
                 title: format!("Post {id}"),
                 published_at: "2026-01-01".to_owned(),
                 summary: format!("Summary {id}"),
+                tags: Vec::new(),
                 blocks: Vec::new(),
             })
             .collect();
@@ -580,43 +607,55 @@ mod tests {
                 published_at: "2026-01-01".to_owned(),
                 summary: "A <summary>".to_owned(),
             },
+            tags: vec!["<tag>".to_owned()],
             blocks: vec![
                 PostBlock {
+                    id: 17,
                     position: 0,
-                    kind: "paragraph".to_owned(),
-                    text: Some("<script>body</script>".to_owned()),
-                    level: None,
+                    header: Some("A <header>".to_owned()),
+                    body: Some("<script>body</script>".to_owned()),
                     content_type: None,
                     alt: None,
-                    caption: None,
+                    children: Vec::new(),
                 },
                 PostBlock {
+                    id: 18,
                     position: 1,
-                    kind: "image".to_owned(),
-                    text: None,
-                    level: None,
+                    header: None,
+                    body: Some("<caption>".to_owned()),
                     content_type: Some("image/jpeg".to_owned()),
                     alt: Some("photo\" onerror=\"alert(1)".to_owned()),
-                    caption: Some("<caption>".to_owned()),
+                    children: vec![PostBlock {
+                        id: 19,
+                        position: 0,
+                        header: None,
+                        body: Some("Nested body".to_owned()),
+                        content_type: None,
+                        alt: None,
+                        children: Vec::new(),
+                    }],
                 },
                 PostBlock {
+                    id: 20,
                     position: 2,
-                    kind: "video".to_owned(),
-                    text: None,
-                    level: None,
+                    header: None,
+                    body: None,
                     content_type: Some("video/mp4".to_owned()),
                     alt: None,
-                    caption: None,
+                    children: Vec::new(),
                 },
             ],
         };
         let html = render_full_post(&post);
+        assert!(html.contains("<p class=\"tags\">Tags: &lt;tag&gt;</p>"));
+        assert!(html.contains("<h2>A &lt;header&gt;</h2>"));
         assert!(html.contains("&lt;script&gt;body&lt;/script&gt;"));
         assert!(html.contains("&quot;&gt;&lt;script&gt;alert(1)&lt;/script&gt;"));
         assert!(html.contains("alt=\"photo&quot; onerror=&quot;alert(1)\""));
-        assert!(html.contains("<img src=\"/posts/7/blocks/1/media\""));
-        assert!(html.contains("<video controls preload=\"metadata\"><source src=\"/posts/7/blocks/2/media\""));
+        assert!(html.contains("<img src=\"/posts/7/blocks/18/media\""));
+        assert!(html.contains("<video controls preload=\"metadata\"><source src=\"/posts/7/blocks/20/media\""));
         assert!(html.contains("<figcaption>&lt;caption&gt;</figcaption>"));
+        assert!(html.contains("<p>Nested body</p>"));
         assert!(!html.contains("<script>body</script>"));
         assert_eq!(escape_html("'&\"<>"), "&#39;&amp;&quot;&lt;&gt;");
     }

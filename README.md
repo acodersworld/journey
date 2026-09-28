@@ -51,11 +51,18 @@ Create a manifest next to its local media files, for example:
       "title": "A first journey",
       "published_at": "2026-09-27",
       "summary": "Notes from the road.",
+      "tags": ["coast", "weekend"],
       "blocks": [
-        { "type": "paragraph", "text": "We set out before sunrise." },
-        { "type": "heading", "level": 2, "text": "Along the coast" },
-        { "type": "image", "path": "media/coast.jpg", "alt": "Coast at dawn", "caption": "The first light." },
-        { "type": "video", "path": "media/harbour.mp4", "caption": "A quiet harbour." }
+        {
+          "header": "Along the coast",
+          "body": "We set out before sunrise.",
+          "path": "media/coast.jpg",
+          "alt": "Coast at dawn",
+          "blocks": [
+            { "body": "The first light." },
+            { "path": "media/harbour.mp4", "body": "A quiet harbour." }
+          ]
+        }
       ]
     }
   ]
@@ -76,10 +83,10 @@ loopback storage address (default `127.0.0.1:8081`). The public feed is
 server-rendered at `GET /`; its browser script loads more previews from
 `GET /api/posts`, which defaults to 10 and accepts a maximum `limit` of 100.
 Feed responses include `posts` and a `next_cursor`; pass that cursor as `after`
-to request the next page. `GET /api/posts/{id}` returns full content as JSON,
-and the normal link `GET /posts/{id}` renders it as HTML. Media is served only
-through `GET` or `HEAD /posts/{id}/blocks/{position}/media`, where the position
-is zero-based. Video requests forward one byte range to storage.
+to request the next page. `GET /api/posts/{id}` returns tags and nested full
+content as JSON, and the normal link `GET /posts/{id}` renders it as HTML.
+Media is served only through `GET` or `HEAD /posts/{id}/blocks/{block_id}/media`.
+Video requests forward one byte range to storage.
 `journey-site --help` and `journey-site db` list the CLI commands.
 
 ## HTTP/2 object storage

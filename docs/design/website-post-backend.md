@@ -6,26 +6,33 @@
 ## Runtime data
 
 `journey-site` stores posts in SQLite. `posts` contains an auto-generated ID,
-title, ISO publication date, summary, and a published flag. `post_blocks`
-contains the ordered paragraph, heading, image, and video blocks, with a
-foreign key back to each post. Imported posts are always published. The
-published flag is checked by public post and media lookups so a later draft
-feature can keep unpublished media inaccessible through these routes.
+title, ISO publication date, summary, a published flag, and a JSON array of
+case-preserving string tags. `post_blocks` stores blocks with an auto-generated
+ID, parent ID, sibling position, optional header and body, and optional media
+fields. A row with children is a group; groups can contain only one level of
+children and can also have their own text and media. The content type identifies
+image and video media. A migration maps legacy headings to headers, paragraphs
+to bodies, and media captions to bodies; migrated posts receive empty tag
+arrays. Imported posts are always published. The published flag is checked by
+public post and media lookups so a later draft feature can keep unpublished
+media inaccessible through these routes.
 
-Post IDs are regenerated on each full import. Feed ordering is publication
-date descending, then ID descending. Blocks are ordered by their zero-based
-position.
+Post and block IDs are regenerated on each full import. They remain stable for
+in-place edits. Feed ordering is publication date descending, then ID
+descending. Blocks are ordered by zero-based position among siblings.
 
 ## Manifest import
 
 The JSON manifest is the editable source for this local workflow. Its top
 level contains `posts`; each post has `title`, `published_at` (`YYYY-MM-DD`),
-`summary`, and ordered `blocks`. Blocks use `type` values `paragraph`,
-`heading`, `image`, and `video`. Image and video paths are relative to the
-manifest directory. The importer canonicalizes and confines them to that
-directory and accepts JPEG, PNG, WebP, GIF, and MP4 extensions. It indexes
-media by canonical file path, so multiple blocks that refer to the same file
-share one upload.
+`summary`, optional `tags`, and ordered `blocks`. Each block can have a plain
+text `header`, plain text `body`, a media `path` with optional `alt`, and nested
+`blocks`. Nested blocks are allowed only on top-level blocks. Media type is
+inferred from the path extension and stored as its content type. Image and
+video paths are relative to the manifest directory. The importer canonicalizes
+and confines them to that directory and accepts JPEG, PNG, WebP, GIF, and MP4
+extensions. It indexes media by canonical file path, so multiple blocks that
+refer to the same file share one upload.
 
 The importer validates the manifest and every referenced file before upload.
 For each unique path, it streams the file once to `PUT /objects/media/` with
@@ -75,14 +82,14 @@ cursor for the browser script. The script loads more previews after downward
 scrolling reaches the sentinel, with a visible **Load more** button as a
 fallback. Expanding a preview fetches only that post from
 `GET /api/posts/{id}` and inserts its blocks inline. The expansion is cached in
-the page after its first successful request. `GET /api/posts/{id}` remains
-JSON, while `GET /posts/{id}` renders a complete HTML post for direct links.
-Both HTML routes escape post text. Image and video blocks use public media URLs
-that identify a post and zero-based block position, never a storage key. The
-backend confirms the block belongs to a published post and is an image or
-video before asking storage for it. It streams response bodies and forwards
-single byte ranges for video. Image ranges are ignored. There are no editing,
-draft, or account routes in this slice.
+the page after its first successful request. `GET /api/posts/{id}` returns
+tags and nested blocks in JSON, while `GET /posts/{id}` renders a complete
+HTML post for direct links. Both HTML routes escape post text. Image and video
+blocks use public media URLs that identify a post and block ID, never a storage
+key. The backend confirms the block belongs to a published post and is media
+before asking storage for it. It streams response bodies and forwards single
+byte ranges for video. Image ranges are ignored. There are no editing, draft,
+or account routes in this slice.
 
 The `journey-site import` and `journey-site db` commands provide explicit
 imports and read-only database inspection. `JOURNEY_SITE_DB` selects the

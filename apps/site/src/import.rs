@@ -22,31 +22,24 @@ struct ManifestPost {
     title: String,
     published_at: String,
     summary: String,
+    #[serde(default)]
+    tags: Vec<String>,
     blocks: Vec<ManifestBlock>,
 }
 
 #[derive(Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
-enum ManifestBlock {
-    Paragraph {
-        text: String,
-    },
-    Heading {
-        text: String,
-        level: u8,
-    },
-    Image {
-        path: String,
-        #[serde(default)]
-        alt: Option<String>,
-        #[serde(default)]
-        caption: Option<String>,
-    },
-    Video {
-        path: String,
-        #[serde(default)]
-        caption: Option<String>,
-    },
+#[serde(deny_unknown_fields)]
+struct ManifestBlock {
+    #[serde(default)]
+    header: Option<String>,
+    #[serde(default)]
+    body: Option<String>,
+    #[serde(default)]
+    path: Option<String>,
+    #[serde(default)]
+    alt: Option<String>,
+    #[serde(default)]
+    blocks: Vec<ManifestBlock>,
 }
 
 struct MediaAsset {
@@ -57,18 +50,21 @@ struct PreparedPost {
     title: String,
     published_at: String,
     summary: String,
+    tags: Vec<String>,
     blocks: Vec<PreparedBlock>,
 }
 
-enum PreparedBlock {
-    Ready(NewBlock),
-    Media {
-        kind: String,
-        path: PathBuf,
-        content_type: String,
-        alt: Option<String>,
-        caption: Option<String>,
-    },
+struct PreparedBlock {
+    header: Option<String>,
+    body: Option<String>,
+    media: Option<PreparedMedia>,
+    children: Vec<PreparedBlock>,
+}
+
+struct PreparedMedia {
+    path: PathBuf,
+    content_type: String,
+    alt: Option<String>,
 }
 
 pub struct PreparedImport {
@@ -90,60 +86,24 @@ pub async fn prepare_manifest(manifest_path: &Path) -> AppResult<PreparedImport>
     for post in manifest.posts {
         validate_post(&post)?;
         let mut blocks = Vec::with_capacity(post.blocks.len());
-        for block in post.blocks {
-            match block {
-                ManifestBlock::Paragraph { text } => blocks.push(PreparedBlock::Ready(NewBlock {
-                    kind: "paragraph".to_owned(),
-                    text: Some(text),
-                    level: None,
-                    storage_key: None,
-                    content_type: None,
-                    alt: None,
-                    caption: None,
-                })),
-                ManifestBlock::Heading { text, level } => blocks.push(PreparedBlock::Ready(NewBlock {
-                    kind: "heading".to_owned(),
-                    text: Some(text),
-                    level: Some(i64::from(level)),
-                    storage_key: None,
-                    content_type: None,
-                    alt: None,
-                    caption: None,
-                })),
-                ManifestBlock::Image { path, alt, caption } => {
-                    let (content_type, source_path) =
-                        validate_media_path(&manifest_dir, &path).await?;
-                    assets.entry(source_path.clone()).or_insert(MediaAsset {
-                        content_type: content_type.clone(),
-                    });
-                    blocks.push(PreparedBlock::Media {
-                        kind: "image".to_owned(),
-                        path: source_path,
-                        content_type,
-                        alt,
-                        caption,
-                    });
-                }
-                ManifestBlock::Video { path, caption } => {
-                    let (content_type, source_path) =
-                        validate_media_path(&manifest_dir, &path).await?;
-                    assets.entry(source_path.clone()).or_insert(MediaAsset {
-                        content_type: content_type.clone(),
-                    });
-                    blocks.push(PreparedBlock::Media {
-                        kind: "video".to_owned(),
-                        path: source_path,
-                        content_type,
-                        alt: None,
-                        caption,
-                    });
-                }
+        for mut block in post.blocks {
+            let mut children = Vec::with_capacity(block.blocks.len());
+            for child in std::mem::take(&mut block.blocks) {
+                children.push(prepare_block(child, &manifest_dir, &mut assets).await?);
             }
+            let media = prepare_media(block.path, block.alt, &manifest_dir, &mut assets).await?;
+            blocks.push(PreparedBlock {
+                header: block.header,
+                body: block.body,
+                media,
+                children,
+            });
         }
         posts.push(PreparedPost {
             title: post.title,
             published_at: post.published_at,
             summary: post.summary,
+            tags: post.tags,
             blocks,
         });
     }
@@ -182,14 +142,63 @@ fn validate_post(post: &ManifestPost) -> AppResult<()> {
     }
     validate_publication_date(&post.published_at)?;
     for block in &post.blocks {
-        match block {
-            ManifestBlock::Heading { level, .. } if !(1..=6).contains(level) => {
-                return Err(format!("heading level must be between 1 and 6, got {level}").into());
-            }
-            _ => {}
+        validate_block(block, false)?;
+        for child in &block.blocks {
+            validate_block(child, true)?;
         }
     }
     Ok(())
+}
+
+fn validate_block(block: &ManifestBlock, nested: bool) -> AppResult<()> {
+    if nested && !block.blocks.is_empty() {
+        return Err("post blocks may only be nested one level deep".into());
+    }
+    if block.header.is_none()
+        && block.body.is_none()
+        && block.path.is_none()
+        && block.blocks.is_empty()
+    {
+        return Err("each post block must have a header, body, media path, or child block".into());
+    }
+    if block.alt.is_some() && block.path.is_none() {
+        return Err("alt text requires a media path".into());
+    }
+    Ok(())
+}
+
+async fn prepare_block(
+    block: ManifestBlock,
+    manifest_dir: &Path,
+    assets: &mut BTreeMap<PathBuf, MediaAsset>,
+) -> AppResult<PreparedBlock> {
+    let media = prepare_media(block.path, block.alt, manifest_dir, assets).await?;
+    Ok(PreparedBlock {
+        header: block.header,
+        body: block.body,
+        media,
+        children: Vec::new(),
+    })
+}
+
+async fn prepare_media(
+    path: Option<String>,
+    alt: Option<String>,
+    manifest_dir: &Path,
+    assets: &mut BTreeMap<PathBuf, MediaAsset>,
+) -> AppResult<Option<PreparedMedia>> {
+    let Some(path) = path else {
+        return Ok(None);
+    };
+    let (content_type, source_path) = validate_media_path(manifest_dir, &path).await?;
+    assets.entry(source_path.clone()).or_insert(MediaAsset {
+        content_type: content_type.clone(),
+    });
+    Ok(Some(PreparedMedia {
+        path: source_path,
+        content_type,
+        alt,
+    }))
 }
 
 fn validate_publication_date(value: &str) -> AppResult<()> {
@@ -266,38 +275,41 @@ fn resolve_posts(
     posts
         .into_iter()
         .map(|post| {
-            let blocks = post
-                .blocks
-                .into_iter()
-                .map(|block| match block {
-                    PreparedBlock::Ready(block) => Ok(block),
-                    PreparedBlock::Media {
-                        kind,
-                        path,
-                        content_type,
-                        alt,
-                        caption,
-                    } => {
-                        let storage_key = storage_keys.get(&path).cloned().ok_or_else(|| {
-                            format!("media asset was not uploaded: {}", path.display())
-                        })?;
-                        Ok(NewBlock {
-                            kind,
-                            text: None,
-                            level: None,
-                            storage_key: Some(storage_key),
-                            content_type: Some(content_type),
-                            alt,
-                            caption,
-                        })
-                    }
-                })
-                .collect::<AppResult<Vec<_>>>()?;
+            let blocks = resolve_blocks(post.blocks, storage_keys)?;
             Ok(NewPost {
                 title: post.title,
                 published_at: post.published_at,
                 summary: post.summary,
+                tags: post.tags,
                 blocks,
+            })
+        })
+        .collect()
+}
+
+fn resolve_blocks(
+    blocks: Vec<PreparedBlock>,
+    storage_keys: &BTreeMap<PathBuf, String>,
+) -> AppResult<Vec<NewBlock>> {
+    blocks
+        .into_iter()
+        .map(|block| {
+            let media = block
+                .media
+                .map(|media| -> AppResult<_> {
+                    let storage_key = storage_keys.get(&media.path).cloned().ok_or_else(|| {
+                        format!("media asset was not uploaded: {}", media.path.display())
+                    })?;
+                    Ok((storage_key, media.content_type, media.alt))
+                })
+                .transpose()?;
+            Ok(NewBlock {
+                header: block.header,
+                body: block.body,
+                storage_key: media.as_ref().map(|(storage_key, _, _)| storage_key.clone()),
+                content_type: media.as_ref().map(|(_, content_type, _)| content_type.clone()),
+                alt: media.and_then(|(_, _, alt)| alt),
+                children: resolve_blocks(block.children, storage_keys)?,
             })
         })
         .collect()
@@ -393,7 +405,7 @@ mod tests {
             .iter()
             .map(|path| {
                 fs::write(directory.path().join(path), b"same media bytes").unwrap();
-                serde_json::json!({"type": "image", "path": path})
+                serde_json::json!({"path": path})
             })
             .collect::<Vec<_>>();
         let manifest = serde_json::json!({
@@ -401,6 +413,7 @@ mod tests {
                 "title": "Imported post",
                 "published_at": "2026-01-02",
                 "summary": "Imported summary",
+                "tags": ["Import test", "CASE-sensitive"],
                 "blocks": blocks
             }]
         });
@@ -416,11 +429,49 @@ mod tests {
                 title: "Previous post".to_owned(),
                 published_at: "2025-12-31".to_owned(),
                 summary: "Still available after a failed import".to_owned(),
+                tags: Vec::new(),
                 blocks: Vec::new(),
             }])
             .await
             .unwrap();
         database
+    }
+
+    #[tokio::test]
+    async fn example_manifest_has_tags_and_a_group_with_its_own_media() {
+        let manifest = Path::new(env!("CARGO_MANIFEST_DIR")).join("example/posts.json");
+        let prepared = prepare_manifest(&manifest).await.unwrap();
+        let post = &prepared.posts[0];
+        assert_eq!(post.tags, vec!["alpine", "lake", "morning"]);
+        assert_eq!(post.blocks.len(), 1);
+        assert!(post.blocks[0].media.is_some());
+        assert_eq!(post.blocks[0].children.len(), 2);
+        assert!(post.blocks[0].children[0].media.is_none());
+        assert!(post.blocks[0].children[1].media.is_some());
+    }
+
+    #[tokio::test]
+    async fn manifest_rejects_blocks_nested_more_than_one_level() {
+        let directory = TestDirectory::new();
+        let manifest = serde_json::json!({
+            "posts": [{
+                "title": "Nested post",
+                "published_at": "2026-01-02",
+                "summary": "Nested summary",
+                "blocks": [{
+                    "header": "Group",
+                    "blocks": [{
+                        "body": "Child",
+                        "blocks": [{"body": "Grandchild"}]
+                    }]
+                }]
+            }]
+        });
+        let path = directory.path().join("posts.json");
+        fs::write(&path, serde_json::to_vec(&manifest).unwrap()).unwrap();
+
+        let error = prepare_manifest(&path).await.err().unwrap();
+        assert!(error.to_string().contains("one level deep"));
     }
 
     #[tokio::test]
@@ -435,9 +486,11 @@ mod tests {
         apply_import(prepared, &database, &storage).await.unwrap();
 
         assert_eq!(storage.uploads.lock().unwrap().len(), 1);
-        let post = database.all_summaries().await.unwrap().remove(0);
-        for position in 0..2 {
-            let media = database.media_reference(post.id, position).await.unwrap().unwrap();
+        let summary = database.all_summaries().await.unwrap().remove(0);
+        let post = database.post(summary.id).await.unwrap().unwrap();
+        assert_eq!(post.tags, vec!["Import test", "CASE-sensitive"]);
+        for block in &post.blocks {
+            let media = database.media_reference(summary.id, block.id).await.unwrap().unwrap();
             assert_eq!(media.storage_key, key);
         }
     }
@@ -454,9 +507,10 @@ mod tests {
         apply_import(prepared, &database, &storage).await.unwrap();
 
         assert_eq!(storage.uploads.lock().unwrap().len(), 2);
-        let post = database.all_summaries().await.unwrap().remove(0);
-        for position in 0..2 {
-            let media = database.media_reference(post.id, position).await.unwrap().unwrap();
+        let summary = database.all_summaries().await.unwrap().remove(0);
+        let post = database.post(summary.id).await.unwrap().unwrap();
+        for block in &post.blocks {
+            let media = database.media_reference(summary.id, block.id).await.unwrap().unwrap();
             assert_eq!(media.storage_key, key);
         }
     }
