@@ -36,6 +36,7 @@ does not need h2c support or cross-origin access.
 | `GET /api/objects/<key>` | `GET /objects/<key>` | Optionally send one Range value; show text or JSON, or download binary bytes. |
 | `HEAD /api/objects/<key>` | `HEAD /objects/<key>` | Inspect status and metadata headers. |
 | `PUT /api/objects/<key>` | `PUT /objects/<key>` | Upload bytes with the chosen `Content-Type` and optional create or replace condition. |
+| `PUT /api/objects` or `/api/objects/<encoded-prefix>` | `PUT /objects` or `/objects/<encoded-prefix>` | Upload bytes with a generated SHA-256 key. |
 | `DELETE /api/objects/<key>` | `DELETE /objects/<key>` | Delete a key after browser confirmation. |
 | `POST /api/objects` | `POST /objects` | Exercise the service's `405 Method Not Allowed` response. |
 
@@ -48,6 +49,16 @@ key field. The listing controls encode query values with percent escapes,
 including spaces and literal plus signs. The `prefix` parameter is always
 present, even when it is empty; `limit` and `cursor` are omitted when their
 fields are empty.
+
+For a generated PUT, select **Use generated SHA-256 key** and enter an optional
+prefix in the shared Prefix field. Leave it empty to upload at the root, or end
+a nonempty prefix with `/`; the console encodes it as one path component and
+the storage service appends the payload's lowercase SHA-256 digest. The console
+sends `Object-Key-Mode: sha256`, and the proxy forwards the resulting
+`Object-Name` response header so the generated name is visible in the response
+viewer. It contains only the digest; combine it with the entered prefix to get
+the full logical key, which is also returned in `Object-Key`. `Object-Key` is
+returned for caller-keyed PUTs as well.
 
 PUT sends the selected file's bytes, or UTF-8 text when no file is selected,
 as the entire request body. It does not use multipart encoding. The editable
@@ -67,12 +78,12 @@ and text or JSON bodies. It offers binary GET responses as downloads and
 truncates displayed text after 64 KiB. The browser retains a binary response
 in memory while its download link is available. For object GET only, the Range
 field is sent upstream as a `Range` header; HEAD, DELETE, and LIST do not send
-it. PUT forwards its `Content-Type`, `If-Match`, and `If-None-Match` request
-headers. The proxy streams upstream response bytes to the browser and forwards
-`Content-Type`, `Content-Length`, `Content-Range`, `Accept-Ranges`, and `Allow`,
-while retaining upstream error statuses and bodies. A connection failure
-becomes `502`; an upstream timeout becomes `504`. Neither condition stops the
-browser server.
+it. PUT forwards its `Content-Type`, `If-Match`, `If-None-Match`, and
+`Object-Key-Mode` request headers. The proxy streams upstream response bytes to
+the browser and forwards `Content-Type`, `Content-Length`, `Content-Range`,
+`Accept-Ranges`, `Allow`, `Object-Key`, and `Object-Name`, while retaining
+upstream error statuses and bodies. A connection failure becomes `502`; an
+upstream timeout becomes `504`. Neither condition stops the browser server.
 
 This is a local development tool. It has no authentication or upload quota;
 persistence depends on the selected storage backend.
@@ -128,6 +139,10 @@ Python script. The built-in listener has its independent
 5. PUT a new key using a file and a content type; GET it and compare bytes.
    PUT different bytes and a different content type to the same key, then
    confirm GET and HEAD report the replacement.
+   Select **Use generated SHA-256 key** and upload once with an empty prefix
+   and once with a prefix ending in `/`; confirm each response includes the
+   `Object-Name` is the 64-character digest, `Object-Key` contains the full
+   logical key, and LIST shows the full keys under those locations.
 6. Choose **Create only** and PUT to an absent key; confirm success. Repeat
    with an empty body and confirm `412` while the existing bytes and content
    type remain unchanged. Choose **Replace only** and confirm `412` for a

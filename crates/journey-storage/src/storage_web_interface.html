@@ -16,9 +16,12 @@
     .panel { background: white; border: 1px solid #d3dbe1; border-radius: .6rem; margin: 1rem 0; padding: 1rem; }
     #breadcrumbs { display: flex; flex-wrap: wrap; align-items: center; gap: .4rem; }
     #breadcrumbs span { color: #596977; }
-    #upload-form { display: grid; grid-template-columns: minmax(12rem, 1fr) minmax(12rem, 2fr) auto; gap: .65rem; align-items: end; }
+    #upload-form { display: grid; grid-template-columns: minmax(12rem, 1fr) minmax(12rem, 2fr) auto auto; gap: .65rem; align-items: end; }
     #upload-form label { display: grid; gap: .3rem; font-size: .9rem; }
+    #upload-form label[hidden] { display: none; }
     #upload-form input[type=file] { max-width: 100%; }
+    #upload-form .upload-option { display: flex; align-items: center; gap: .35rem; white-space: nowrap; }
+    #upload-form input[type=checkbox] { padding: 0; }
     #entry-filter { display: flex; flex-wrap: wrap; align-items: end; gap: .65rem 1rem; margin: .25rem 0 .75rem; }
     #entry-filter .filter-query { display: grid; flex: 1 1 16rem; gap: .3rem; }
     #entry-filter .filter-option { align-items: center; display: flex; gap: .35rem; }
@@ -60,6 +63,7 @@
       <label>Object key
         <input id="key" autocomplete="off" required>
       </label>
+      <label class="upload-option"><input id="generated-key" type="checkbox"> Generate SHA-256 key in current folder</label>
       <button id="upload-button" type="submit">Upload</button>
     </form>
   </section>
@@ -110,6 +114,8 @@
     const message = document.querySelector('#message');
     const fileField = document.querySelector('#file');
     const keyField = document.querySelector('#key');
+    const generatedKeyField = document.querySelector('#generated-key');
+    const keyLabel = keyField.closest('label');
     const uploadButton = document.querySelector('#upload-button');
     const nextButton = document.querySelector('#next');
     const previousButton = document.querySelector('#previous');
@@ -256,7 +262,7 @@
       if (metadataRow) rows.append(metadataRow);
     }
 
-    async function loadPage(prefix, cursor) {
+    async function loadPage(prefix, cursor, successMessage = null) {
       const requestId = ++latestPageRequestId;
       folderRows.replaceChildren();
       fileRows.replaceChildren();
@@ -282,7 +288,7 @@
         nextCursor = page.next_cursor || null;
         nextButton.hidden = !nextCursor;
         previousButton.hidden = cursorHistory.length === 0;
-        setMessage(page.entries.length ? (page.entries.length + ' entries') : 'This folder is empty.');
+        setMessage(successMessage || (page.entries.length ? (page.entries.length + ' entries') : 'This folder is empty.'));
       } catch (error) {
         if (requestId === latestPageRequestId) {
           setMessage('Could not list this folder: ' + error.message);
@@ -324,8 +330,16 @@
 
     fileField.addEventListener('change', () => {
       const file = fileField.files[0];
-      if (file) keyField.value = currentPrefix + file.name;
+      if (file && !generatedKeyField.checked) keyField.value = currentPrefix + file.name;
     });
+
+    function updateGeneratedKeyMode() {
+      keyLabel.hidden = generatedKeyField.checked;
+      keyField.required = !generatedKeyField.checked;
+    }
+
+    generatedKeyField.addEventListener('change', updateGeneratedKeyMode);
+    updateGeneratedKeyMode();
 
     entryQuery.addEventListener('input', applyEntryFilter);
     wholeWord.addEventListener('change', applyEntryFilter);
@@ -335,24 +349,33 @@
       event.preventDefault();
       const file = fileField.files[0];
       const key = keyField.value;
-      if (!file || !key) return;
+      const useGeneratedKey = generatedKeyField.checked;
+      if (!file || (!useGeneratedKey && !key)) return;
       const contentType = file.type || 'application/octet-stream';
+      const query = useGeneratedKey ? { prefix: currentPrefix } : { key };
+      const headers = { 'Content-Type': contentType, 'If-None-Match': '*' };
+      if (useGeneratedKey) headers['Object-Key-Mode'] = 'sha256';
       uploadButton.disabled = true;
-      setMessage('Uploading object…');
+      setMessage(useGeneratedKey ? 'Uploading with a generated key…' : 'Uploading object…');
       try {
-        let response = await fetch(apiUrl('/api/object', { key }), {
+        let response = await fetch(apiUrl('/api/object', query), {
           method: 'PUT',
-          headers: { 'Content-Type': contentType, 'If-None-Match': '*' },
+          headers,
           body: file
         });
         if (response.status === 412) {
-          if (!window.confirm('Object “' + key + '” already exists. Replace it?')) {
+          const conflictMessage = useGeneratedKey
+            ? 'An object with this file’s SHA-256 key already exists in the current folder. Replace it?'
+            : 'Object “' + key + '” already exists. Replace it?';
+          if (!window.confirm(conflictMessage)) {
             setMessage('Replacement cancelled; the existing object was kept.');
             return;
           }
-          response = await fetch(apiUrl('/api/object', { key }), {
+          const replaceHeaders = { 'Content-Type': contentType, 'If-Match': '*' };
+          if (useGeneratedKey) replaceHeaders['Object-Key-Mode'] = 'sha256';
+          response = await fetch(apiUrl('/api/object', query), {
             method: 'PUT',
-            headers: { 'Content-Type': contentType, 'If-Match': '*' },
+            headers: replaceHeaders,
             body: file
           });
         }
@@ -360,10 +383,18 @@
           const detail = (await response.text()).slice(0, 512);
           throw new Error(detail || (response.status + ' ' + response.statusText));
         }
+        let uploadedKey = null;
+        if (useGeneratedKey) {
+          const result = await response.json();
+          uploadedKey = result.key;
+        }
         fileField.value = '';
         keyField.value = '';
-        setMessage('Upload complete.');
-        await loadPage(currentPrefix, currentCursor);
+        await loadPage(
+          currentPrefix,
+          currentCursor,
+          uploadedKey ? 'Upload complete: ' + uploadedKey : 'Upload complete.'
+        );
       } catch (error) {
         setMessage('Could not upload object: ' + error.message);
       } finally {

@@ -25,8 +25,9 @@ use subtle::ConstantTimeEq;
 use tokio::net::TcpListener;
 
 use crate::storage_interface::{
-    ContentType, GetResult, Key, ListCursor, ListRequest, ObjectInterface, ObjectMetadata,
-    PutCondition, PutContextInterface, StoreError, StoreErrorKind, StoreInterface,
+    validate_generated_prefix, ContentType, GetResult, Key, ListCursor, ListRequest,
+    ObjectInterface, ObjectMetadata, PutCondition, PutContextInterface, StoreError,
+    StoreErrorKind, StoreInterface,
 };
 
 const INDEX_HTML: &str = include_str!("storage_web_interface.html");
@@ -37,6 +38,30 @@ const FORBIDDEN_BODY: &str = "forbidden\n";
 const NOT_FOUND_BODY: &str = "not found\n";
 const PRECONDITION_FAILED_BODY: &str = "precondition failed\n";
 const STORAGE_ERROR_BODY: &str = "storage error\n";
+
+enum UploadTarget {
+    WithKey(Key),
+    Generated { prefix: String },
+}
+
+enum UploadContext<S: StoreInterface> {
+    WithKey {
+        context: S::PutContextWithKey,
+    },
+    Generated {
+        prefix: String,
+        context: S::PutContextWithGeneratedName,
+    },
+}
+
+impl<S: StoreInterface> PutContextInterface for UploadContext<S> {
+    async fn append(&mut self, bytes: &Bytes) -> Result<(), StoreError> {
+        match self {
+            Self::WithKey { context, .. } => context.append(bytes).await,
+            Self::Generated { context, .. } => context.append(bytes).await,
+        }
+    }
+}
 
 /// Basic-auth credentials for the storage web interface.
 pub struct WebCredentials {
@@ -184,6 +209,13 @@ struct KeyQuery {
     key: String,
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct UploadQuery {
+    key: Option<String>,
+    prefix: Option<String>,
+}
+
 #[derive(Serialize)]
 struct EntriesResponse {
     entries: Vec<EntryResponse>,
@@ -207,6 +239,11 @@ struct MetadataResponse {
     key: String,
     content_type: String,
     size: u64,
+}
+
+#[derive(Serialize)]
+struct UploadResponse {
+    key: String,
 }
 
 async fn entries<S: StoreInterface>(
@@ -246,9 +283,7 @@ async fn entries<S: StoreInterface>(
         };
         let object_key = object.key().as_str();
         let store_next_key = page.next_cursor().map(|cursor| cursor.start_key().clone());
-        let (entry, next_seek, next_is_known) = if object_key == prefix && !prefix.is_empty() {
-            (object_entry(object, object_key.to_owned()), store_next_key, true)
-        } else {
+        let (entry, next_seek, next_is_known) = {
             let remainder = match object_key.strip_prefix(&prefix) {
                 Some(remainder) => remainder,
                 None => return text_response(StatusCode::INTERNAL_SERVER_ERROR, STORAGE_ERROR_BODY),
@@ -465,13 +500,23 @@ async fn upload<S: StoreInterface>(
     if !same_http_origin(request.headers(), request.uri()) {
         return text_response(StatusCode::FORBIDDEN, FORBIDDEN_BODY);
     }
-    let query = match parse_query::<KeyQuery>(request.uri().query()) {
+    let query = match parse_query::<UploadQuery>(request.uri().query()) {
         Ok(query) => query,
         Err(()) => return text_response(StatusCode::BAD_REQUEST, BAD_REQUEST_BODY),
     };
-    let key = match Key::new(&query.key) {
-        Ok(key) => key,
-        Err(_) => return text_response(StatusCode::BAD_REQUEST, BAD_REQUEST_BODY),
+    let generated_mode = match parse_generated_key_mode(request.headers()) {
+        Ok(generated_mode) => generated_mode,
+        Err(()) => return text_response(StatusCode::BAD_REQUEST, BAD_REQUEST_BODY),
+    };
+    let target = match (query.key, query.prefix, generated_mode) {
+        (Some(key), None, false) => match Key::new(&key) {
+            Ok(key) => UploadTarget::WithKey(key),
+            Err(_) => return text_response(StatusCode::BAD_REQUEST, BAD_REQUEST_BODY),
+        },
+        (None, Some(prefix), true) if validate_generated_prefix(&prefix).is_ok() => {
+            UploadTarget::Generated { prefix }
+        }
+        _ => return text_response(StatusCode::BAD_REQUEST, BAD_REQUEST_BODY),
     };
     let condition = match parse_put_condition(request.headers()) {
         Ok(condition) => condition,
@@ -492,9 +537,23 @@ async fn upload<S: StoreInterface>(
             }
         }
     };
-    let mut context = match state.store.put_context(key, content_type, condition).await {
-        Ok(context) => context,
-        Err(error) => return store_error_response("PUT context", error),
+    let mut context: UploadContext<S> = match target {
+        UploadTarget::WithKey(key) => match state
+            .store
+            .put_context_with_key(key.clone(), content_type, condition)
+            .await
+        {
+            Ok(context) => UploadContext::WithKey { context },
+            Err(error) => return store_error_response("PUT context", error),
+        },
+        UploadTarget::Generated { prefix } => match state
+            .store
+            .put_context_with_generated_name(prefix.clone(), content_type, condition)
+            .await
+        {
+            Ok(context) => UploadContext::Generated { prefix, context },
+            Err(error) => return store_error_response("PUT context", error),
+        },
     };
     let mut chunks = request.into_body().into_data_stream();
     while let Some(chunk) = chunks.next().await {
@@ -509,9 +568,35 @@ async fn upload<S: StoreInterface>(
             return store_error_response("PUT append", error);
         }
     }
-    match state.store.put(context).await {
-        Ok(()) => StatusCode::NO_CONTENT.into_response(),
-        Err(error) => store_error_response("PUT commit", error),
+    match context {
+        UploadContext::WithKey { context } => match state.store.put_with_key(context).await {
+            Ok(()) => StatusCode::NO_CONTENT.into_response(),
+            Err(error) => store_error_response("PUT commit", error),
+        },
+        UploadContext::Generated { prefix, context } => {
+            match state.store.put_with_generated_name(context).await {
+                Ok(name) => {
+                    let key = format!("{prefix}{name}");
+                    Json(UploadResponse { key }).into_response()
+                }
+                Err(error) => store_error_response("PUT commit", error),
+            }
+        }
+    }
+}
+
+fn parse_generated_key_mode(headers: &HeaderMap) -> Result<bool, ()> {
+    let mut values = headers.get_all("object-key-mode").iter();
+    let Some(value) = values.next() else {
+        return Ok(false);
+    };
+    if values.next().is_some() {
+        return Err(());
+    }
+    if value.to_str().map_err(|_| ())?.trim_matches([' ', '\t']) == "sha256" {
+        Ok(true)
+    } else {
+        Err(())
     }
 }
 
@@ -679,7 +764,7 @@ mod tests {
         let store = Arc::new(Store::new([
             (Key::new("alpha.txt").unwrap(), Object::new(content_type.clone(), Bytes::from_static(b"alpha"))),
             (Key::new("folder/a.txt").unwrap(), Object::new(content_type.clone(), Bytes::from_static(b"nested"))),
-            (Key::new("folder/").unwrap(), Object::new(content_type, Bytes::from_static(b"slash key"))),
+            (Key::new("folder/b.txt").unwrap(), Object::new(content_type, Bytes::from_static(b"second nested"))),
         ]).unwrap());
         test_router(store)
     }
@@ -705,7 +790,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn listing_derives_folders_and_direct_slash_object_remains_visible() {
+    async fn listing_derives_folders_without_direct_prefix_objects() {
         let app = seeded_router().await;
         let response = app.clone().oneshot(request("GET", "/api/entries?prefix=", true)).await.unwrap();
         assert_eq!(response.status(), StatusCode::OK);
@@ -716,9 +801,9 @@ mod tests {
 
         let response = app.oneshot(request("GET", "/api/entries?prefix=folder%2F", true)).await.unwrap();
         let page: serde_json::Value = serde_json::from_slice(&collect(response).await).unwrap();
-        assert_eq!(page["entries"][0]["key"], "folder/");
-        assert_eq!(page["entries"][0]["kind"], "object");
-        assert_eq!(page["entries"][1]["key"], "folder/a.txt");
+        let keys: Vec<_> = page["entries"].as_array().unwrap().iter()
+            .map(|entry| entry["key"].as_str().unwrap()).collect();
+        assert_eq!(keys, ["folder/a.txt", "folder/b.txt"]);
     }
 
     #[tokio::test]
@@ -804,7 +889,6 @@ mod tests {
             "adjacent-",
             "adjacent.",
             "adjacent/child",
-            "ending/",
             "space +%?#雪",
         ];
         let store = Store::new(keys.into_iter().map(|key| (
@@ -817,7 +901,7 @@ mod tests {
         let root: serde_json::Value = serde_json::from_slice(&collect(root).await).unwrap();
         let root_entries = root["entries"].as_array().unwrap();
         let root_keys: Vec<_> = root_entries.iter().map(|entry| entry["key"].as_str().unwrap()).collect();
-        assert_eq!(root_keys, ["a/", "adjacent", "adjacent-", "adjacent.", "adjacent/", "ending/", "space +%?#雪"]);
+        assert_eq!(root_keys, ["a/", "adjacent", "adjacent-", "adjacent.", "adjacent/", "space +%?#雪"]);
         assert_eq!(root_entries[1]["kind"], "object");
         assert_eq!(root_entries[4]["kind"], "folder");
 

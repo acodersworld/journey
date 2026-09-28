@@ -12,8 +12,10 @@
     fieldset { border: 1px solid #c5ced7; border-radius: .5rem; margin: 1rem 0; padding: 1rem; }
     legend { font-weight: 700; padding: 0 .3rem; }
     label { display: block; font-weight: 600; margin: .75rem 0 .3rem; }
+    label.check-option { align-items: center; display: flex; gap: .5rem; }
     input, select, textarea, button { box-sizing: border-box; font: inherit; }
     input:not([type=file]), select, textarea { border: 1px solid #8c9aa7; border-radius: .3rem; padding: .5rem; width: 100%; }
+    input[type=checkbox] { padding: 0; width: auto; }
     textarea { min-height: 7rem; resize: vertical; }
     button { background: #155f97; border: 0; border-radius: .3rem; color: white; cursor: pointer; padding: .65rem 1rem; }
     button:disabled { cursor: wait; opacity: .6; }
@@ -42,10 +44,13 @@
         <option value="POST_LIST">POST /objects (expect 405)</option>
       </select>
 
-      <div id="list-fields">
+      <div id="prefix-fields" class="hidden">
         <label for="prefix">Prefix</label>
         <input id="prefix" value="" autocomplete="off">
-        <p class="hint">An empty prefix lists every object.</p>
+        <p id="prefix-hint" class="hint">An empty prefix lists every object.</p>
+      </div>
+
+      <div id="list-fields">
         <label for="limit">Page limit</label>
         <input id="limit" type="number" min="1" step="1" value="100">
         <label for="cursor">Cursor</label>
@@ -53,9 +58,11 @@
       </div>
 
       <div id="object-fields" class="hidden">
-        <label for="key">Object key</label>
-        <input id="key" value="image.jpg" autocomplete="off">
-        <p class="hint">Enter the logical key. The console encodes it for the URL; slashes and special characters are supported.</p>
+        <div id="key-fields">
+          <label for="key">Object key</label>
+          <input id="key" value="image.jpg" autocomplete="off">
+          <p class="hint">Enter the logical key. The console encodes it for the URL; slashes and special characters are supported.</p>
+        </div>
         <div id="range-fields" class="hidden">
           <label for="range">Range</label>
           <input id="range" autocomplete="off" placeholder="bytes=0-99">
@@ -64,6 +71,7 @@
       </div>
 
       <div id="put-fields" class="hidden">
+        <label class="check-option"><input id="generated-key" type="checkbox"> Use generated SHA-256 key</label>
         <label for="put-condition">PUT condition</label>
         <select id="put-condition">
           <option value="unconditional">Unconditional</option>
@@ -96,9 +104,15 @@
     const form = document.querySelector('#request-form');
     const method = document.querySelector('#method');
     const listFields = document.querySelector('#list-fields');
+    const prefixFields = document.querySelector('#prefix-fields');
+    const prefixLabel = document.querySelector('label[for="prefix"]');
+    const prefixField = document.querySelector('#prefix');
+    const prefixHint = document.querySelector('#prefix-hint');
     const objectFields = document.querySelector('#object-fields');
+    const keyFields = document.querySelector('#key-fields');
     const rangeFields = document.querySelector('#range-fields');
     const putFields = document.querySelector('#put-fields');
+    const generatedKeyField = document.querySelector('#generated-key');
     const contentTypeField = document.querySelector('#content-type');
     const fileField = document.querySelector('#file');
     const clearFile = document.querySelector('#clear-file');
@@ -116,6 +130,13 @@
       objectFields.classList.toggle('hidden', method.value === 'LIST' || method.value === 'POST_LIST');
       rangeFields.classList.toggle('hidden', method.value !== 'GET');
       putFields.classList.toggle('hidden', method.value !== 'PUT');
+      const generatedUpload = method.value === 'PUT' && generatedKeyField.checked;
+      prefixFields.classList.toggle('hidden', method.value !== 'LIST' && !generatedUpload);
+      keyFields.classList.toggle('hidden', generatedUpload);
+      prefixLabel.textContent = generatedUpload ? 'Generated key prefix' : 'Prefix';
+      prefixHint.textContent = generatedUpload
+        ? 'Leave empty for the root; otherwise end the prefix with /. The digest is appended to this prefix.'
+        : 'An empty prefix lists every object.';
     }
 
     function clearResult() {
@@ -131,7 +152,8 @@
       event.preventDefault();
       const action = method.value;
       const key = document.querySelector('#key').value;
-      if (action !== 'LIST' && action !== 'POST_LIST' && !key) {
+      const useGeneratedKey = action === 'PUT' && generatedKeyField.checked;
+      if (action !== 'LIST' && action !== 'POST_LIST' && !useGeneratedKey && !key) {
         status.textContent = 'Enter an object key.';
         return;
       }
@@ -144,7 +166,7 @@
         let path;
         const options = { method: action === 'LIST' ? 'GET' : action === 'POST_LIST' ? 'POST' : action };
         if (action === 'LIST') {
-          const prefix = document.querySelector('#prefix').value;
+          const prefix = prefixField.value;
           const limit = document.querySelector('#limit').value;
           const cursor = document.querySelector('#cursor').value;
           path = '/api/objects?prefix=' + encodeURIComponent(prefix);
@@ -152,6 +174,9 @@
           if (cursor) path += '&cursor=' + encodeURIComponent(cursor);
         } else if (action === 'POST_LIST') {
           path = '/api/objects';
+        } else if (useGeneratedKey) {
+          const prefix = prefixField.value;
+          path = prefix ? '/api/objects/' + encodeURIComponent(prefix) : '/api/objects';
         } else {
           path = '/api/objects/' + encodeURIComponent(key);
         }
@@ -168,6 +193,7 @@
           if (contentType) options.headers['Content-Type'] = contentType;
           if (condition === 'create-only') options.headers['If-None-Match'] = '*';
           if (condition === 'replace-only') options.headers['If-Match'] = '*';
+          if (useGeneratedKey) options.headers['Object-Key-Mode'] = 'sha256';
         }
 
         const response = await fetch(path, options);
@@ -213,6 +239,7 @@
     }
 
     method.addEventListener('change', updateFields);
+    generatedKeyField.addEventListener('change', updateFields);
     fileField.addEventListener('change', () => {
       const file = fileField.files[0];
       clearFile.classList.toggle('hidden', !file);

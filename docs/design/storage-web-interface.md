@@ -21,7 +21,8 @@ The web listener serves an embedded object manager and these routes:
 | `GET /api/entries?prefix=&cursor=` | Up to 100 immediate folders and objects |
 | `GET /api/metadata?key=` | Key, content type, and payload size |
 | `GET /api/download?key=` | Stream an object as an attachment |
-| `PUT /api/object?key=` | Stream a raw file body into a conditional PUT |
+| `PUT /api/object?key=<key>` | Stream a raw file body into a caller-keyed PUT |
+| `PUT /api/object?prefix=<prefix>` | Stream a raw file body into a generated-key PUT |
 | `DELETE /api/object?key=` | Delete an object |
 
 The public `StoreInterface` and the existing h2c routes are unchanged. The
@@ -40,6 +41,15 @@ PUT and DELETE also require an `Origin` that matches the request's HTTP host
 and port. PUT accepts only `If-None-Match: *` (create-only) or
 `If-Match: *` (replace-only). Storage errors have bounded response bodies;
 internal details are logged locally.
+
+An upload supplies exactly one of `key` or `prefix`. A caller-keyed upload
+uses `key` and cannot include `Object-Key-Mode`. A generated upload supplies
+`prefix` with exactly one `Object-Key-Mode: sha256` header; an empty prefix
+stores at the root, while a nonempty prefix must end in `/` and leave room for
+the 64-character digest within the 1,024-byte key limit. The browser checkbox
+uses the current folder as that prefix. Successful generated uploads return
+the full key as JSON; caller-keyed uploads retain the `204 No Content`
+response.
 
 The example binds its web listener to `0.0.0.0:8082` by default and uses the
 example-only credentials `user` / `pass`. `JOURNEY_STORAGE_WEB_BIND`
@@ -61,8 +71,8 @@ the store's returned cursor. After a folder, the final slash in its prefix is
 replaced with `0` to seek inclusively beyond that subtree. The server returns
 at most 100 visible rows and a Base64URL next seek key only when another row
 exists. This bounds memory and prevents large folders from repeating on later
-pages. An object whose key exactly equals the current folder prefix is shown
-as an object row, including keys ending in `/`.
+pages. A trailing slash is reserved for virtual folder prefixes, so no object
+key can equal a folder prefix or end in `/`.
 
 ## Streaming and browser behavior
 

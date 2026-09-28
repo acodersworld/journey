@@ -16,8 +16,15 @@ FORWARDED_HEADERS = (
     "content-range",
     "accept-ranges",
     "allow",
+    "object-key",
+    "object-name",
 )
-PUT_REQUEST_HEADERS = ("Content-Type", "If-Match", "If-None-Match")
+PUT_REQUEST_HEADERS = (
+    "Content-Type",
+    "If-Match",
+    "If-None-Match",
+    "Object-Key-Mode",
+)
 
 
 class ConsoleServer(ThreadingHTTPServer):
@@ -63,7 +70,9 @@ class ConsoleHandler(BaseHTTPRequestHandler):
         if route.path != "/api/objects" and not route.path.startswith("/api/objects/"):
             self.send_error(404, "Unknown route")
             return
-        if route.path.startswith("/api/objects/") and method == "PUT":
+        if method == "PUT" and (
+            route.path == "/api/objects" or route.path.startswith("/api/objects/")
+        ):
             raw_length = self.headers.get("Content-Length")
             if raw_length is None or not raw_length.isdecimal():
                 self.send_error(411, "PUT requires Content-Length")

@@ -113,6 +113,10 @@ async fn run_server<S: StoreInterface + Sync + Send>(
     println!("  curl --http2-prior-knowledge -X PUT -H 'Content-Type: image/jpeg' --data-binary @crates/journey-storage/examples/assets/image.jpg http://{bound_address}/objects/uploaded.jpg");
     println!("  curl --http2-prior-knowledge http://{bound_address}/objects/uploaded.jpg --output downloaded.jpg");
     println!("  cmp crates/journey-storage/examples/assets/image.jpg downloaded.jpg");
+    println!("Upload with a server-generated SHA-256 key (the response includes Object-Name):");
+    println!("  curl --http2-prior-knowledge -X PUT -H 'Object-Key-Mode: sha256' -H 'Content-Type: image/jpeg' --data-binary @crates/journey-storage/examples/assets/image.jpg -D - http://{bound_address}/objects");
+    println!("Upload into a logical folder with a server-generated key:");
+    println!("  curl --http2-prior-knowledge -X PUT -H 'Object-Key-Mode: sha256' -H 'Content-Type: image/jpeg' --data-binary @crates/journey-storage/examples/assets/image.jpg -D - http://{bound_address}/objects/photos/");
     if seeded_fixtures {
         println!("Get the first 100 bytes of image.jpg:");
         println!("  curl --http2-prior-knowledge -H 'Range: bytes=0-99' -D - http://{bound_address}/objects/image.jpg --output first-100-bytes.bin");

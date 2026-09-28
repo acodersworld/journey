@@ -1,5 +1,6 @@
 # Repository agent instructions
 
+- This project is a work in progress and has not been deployed. Breaking changes are acceptable; do not preserve compatibility solely for existing interfaces or data formats.
 - Do not run `cargo fmt` or `cargo fmt --check` in this repository.
 - Do not run `rustfmt` directly or use any automated source formatter.
 - Preserve the existing formatting and make manual, targeted formatting edits only when needed.

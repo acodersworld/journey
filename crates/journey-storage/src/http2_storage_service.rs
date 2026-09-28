@@ -9,7 +9,7 @@ use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use bytes::{Bytes, BytesMut};
 use http::{
     header,
-    Method, Request, Response, StatusCode, Version,
+    HeaderValue, Method, Request, Response, StatusCode, Version,
 };
 use percent_encoding::percent_decode_str;
 use serde::Serialize;
@@ -17,7 +17,8 @@ use std::sync::Arc;
 
 use crate::storage_interface::{
     ContentType, GetResult, Key, ListCursor, ListRequest, ObjectInterface, ObjectMetadata,
-    PutCondition, PutContextInterface, ReadRange, StoreErrorKind, StoreInterface,
+    validate_generated_prefix, PutCondition, PutContextInterface, ReadRange,
+    StoreError, StoreErrorKind, StoreInterface,
 };
 
 const MAX_DATA_SEGMENT_SIZE: usize = 64 * 1024;
@@ -30,7 +31,7 @@ const INVALID_CONTENT_TYPE: &[u8] = b"invalid content type\n";
 const STORAGE_ERROR_BODY: &[u8] = b"storage error\n";
 const METHOD_NOT_ALLOWED_BODY: &[u8] = b"method not allowed\n";
 const DEFAULT_LIST_LIMIT: usize = 1_000;
-const COLLECTION_ALLOW: &str = "GET";
+const COLLECTION_ALLOW: &str = "GET, PUT";
 const OBJECT_ALLOW: &str = "GET, HEAD, PUT, DELETE";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -39,6 +40,31 @@ enum Route {
     Object(String),
     EmptyKey,
     Unknown,
+}
+
+enum PutTarget {
+    WithKey(Key),
+    Generated { prefix: String },
+}
+
+enum HttpPutContext<S: StoreInterface> {
+    WithKey {
+        key: Key,
+        context: S::PutContextWithKey,
+    },
+    Generated {
+        prefix: String,
+        context: S::PutContextWithGeneratedName,
+    },
+}
+
+impl<S: StoreInterface> PutContextInterface for HttpPutContext<S> {
+    async fn append(&mut self, bytes: &Bytes) -> Result<(), StoreError> {
+        match self {
+            Self::WithKey { context, .. } => context.append(bytes).await,
+            Self::Generated { context, .. } => context.append(bytes).await,
+        }
+    }
 }
 
 fn classify_route(path: &str) -> Route {
@@ -103,12 +129,15 @@ fn decode_query_value(value: &str) -> Result<String, ()> {
         .map_err(|_| ())
 }
 
-fn decode_object_key(value: &str) -> Result<Key, ()> {
+fn decode_object_path(value: &str) -> Result<String, ()> {
     if !has_valid_percent_escapes(value) {
         return Err(());
     }
     let decoded = percent_decode_str(value).decode_utf8().map_err(|_| ())?;
-    Key::new(&decoded).map_err(|_| ())
+    if decoded.is_empty() || decoded.len() > 1_024 {
+        return Err(());
+    }
+    Ok(decoded.into_owned())
 }
 
 fn parse_list_query(raw_query: Option<&str>) -> Result<ListQuery, ()> {
@@ -229,6 +258,22 @@ fn parse_put_condition(headers: &http::HeaderMap) -> Result<PutCondition, ()> {
     }
 }
 
+fn parse_generated_key_mode(headers: &http::HeaderMap) -> Result<bool, ()> {
+    let mut values = headers.get_all("object-key-mode").iter();
+    let Some(value) = values.next() else {
+        return Ok(false);
+    };
+    if values.next().is_some() {
+        return Err(());
+    }
+    let value = value.to_str().map_err(|_| ())?.trim_matches([' ', '\t']);
+    if value == "sha256" {
+        Ok(true)
+    } else {
+        Err(())
+    }
+}
+
 /// Handles one already accepted HTTP/2 request against a shared catalogue.
 #[derive(Debug)]
 pub struct Service<S: StoreInterface> {
@@ -272,6 +317,24 @@ impl<S: StoreInterface> Service<S> {
                     };
                     self.handle_list(query, respond).await
                 }
+                Method::PUT => {
+                    if request.uri().query().is_some()
+                        || parse_generated_key_mode(request.headers()) != Ok(true)
+                    {
+                        return send_text_response(
+                            respond,
+                            StatusCode::BAD_REQUEST,
+                            None,
+                            BAD_REQUEST_BODY,
+                        );
+                    }
+                    self.handle_put(
+                        request,
+                        PutTarget::Generated { prefix: String::new() },
+                        respond,
+                    )
+                    .await
+                }
                 _ => request_error(
                     respond,
                     method == Method::HEAD,
@@ -281,7 +344,7 @@ impl<S: StoreInterface> Service<S> {
                 ),
             },
             Route::Object(raw_key) => {
-                let key = match decode_object_key(&raw_key) {
+                let decoded_key = match decode_object_path(&raw_key) {
                     Ok(key) => key,
                     Err(()) => {
                         return if method == Method::HEAD {
@@ -296,10 +359,49 @@ impl<S: StoreInterface> Service<S> {
                         };
                     }
                 };
+                if method == Method::PUT && decoded_key.ends_with('/') {
+                    let generated_mode = parse_generated_key_mode(request.headers());
+                    if request.uri().query().is_some()
+                        || generated_mode != Ok(true)
+                        || validate_generated_prefix(&decoded_key).is_err()
+                    {
+                        return send_text_response(
+                            respond,
+                            StatusCode::BAD_REQUEST,
+                            None,
+                            BAD_REQUEST_BODY,
+                        );
+                    }
+                    return self
+                        .handle_put(
+                            request,
+                            PutTarget::Generated { prefix: decoded_key },
+                            respond,
+                        )
+                        .await;
+                }
+                let key = match Key::new(&decoded_key) {
+                    Ok(key) => key,
+                    Err(_) => {
+                        return if method == Method::HEAD {
+                            send_empty_response(respond, StatusCode::BAD_REQUEST, None, None, None)
+                        } else {
+                            send_text_response(respond, StatusCode::BAD_REQUEST, None, INVALID_KEY_BODY)
+                        };
+                    }
+                };
                 match method {
                     Method::GET => self.handle_get(&key, request.headers(), respond).await,
                     Method::HEAD => self.handle_head(&key, respond).await,
-                    Method::PUT => self.handle_put(request, &key, respond).await,
+                    Method::PUT => match parse_generated_key_mode(request.headers()) {
+                        Ok(false) => self.handle_put(request, PutTarget::WithKey(key), respond).await,
+                        _ => send_text_response(
+                            respond,
+                            StatusCode::BAD_REQUEST,
+                            None,
+                            BAD_REQUEST_BODY,
+                        ),
+                    },
                     Method::DELETE => self.handle_delete(&key, respond).await,
                     _ => request_error(
                         respond,
@@ -344,7 +446,7 @@ impl<S: StoreInterface> Service<S> {
     async fn handle_put(
         &self,
         request: Request<h2::RecvStream>,
-        key: &Key,
+        target: PutTarget,
         mut respond: h2::server::SendResponse<Bytes>,
     ) -> Result<(), ServiceError> {
         let condition = match parse_put_condition(request.headers()) {
@@ -358,6 +460,16 @@ impl<S: StoreInterface> Service<S> {
                 );
             }
         };
+        if let PutTarget::WithKey(key) = &target
+            && HeaderValue::from_bytes(key.as_str().as_bytes()).is_err()
+        {
+            return send_text_response(
+                respond,
+                StatusCode::BAD_REQUEST,
+                None,
+                BAD_REQUEST_BODY,
+            );
+        }
         let mut content_types = request.headers().get_all(header::CONTENT_TYPE).iter();
         let Some(content_type) = content_types.next() else {
             return send_text_response(
@@ -387,21 +499,39 @@ impl<S: StoreInterface> Service<S> {
             }
         };
 
-        let mut put_context = match self
-            .store
-            .put_context((*key).clone(), content_type, condition)
-            .await
-        {
-            Ok(ctx) => ctx,
-            Err(error) => {
-                eprintln!("storage PUT context creation failed: {error}");
-                return send_text_response(
-                    respond,
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    None,
-                    STORAGE_ERROR_BODY,
-                );
-            }
+        let mut put_context: HttpPutContext<S> = match target {
+            PutTarget::WithKey(key) => match self
+                .store
+                .put_context_with_key(key.clone(), content_type, condition)
+                .await
+            {
+                Ok(context) => HttpPutContext::WithKey { key, context },
+                Err(error) => {
+                    eprintln!("storage PUT context creation failed: {error}");
+                    return send_text_response(
+                        respond,
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        None,
+                        STORAGE_ERROR_BODY,
+                    );
+                }
+            },
+            PutTarget::Generated { prefix } => match self
+                .store
+                .put_context_with_generated_name(prefix.clone(), content_type, condition)
+                .await
+            {
+                Ok(context) => HttpPutContext::Generated { prefix, context },
+                Err(error) => {
+                    eprintln!("storage PUT context creation failed: {error}");
+                    return send_text_response(
+                        respond,
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        None,
+                        STORAGE_ERROR_BODY,
+                    );
+                }
+            },
         };
         let mut body = request.into_body();
 
@@ -422,8 +552,23 @@ impl<S: StoreInterface> Service<S> {
             body.flow_control().release_capacity(length)?;
         }
 
-        if let Err(error) = self.store.put(put_context).await {
-            if error.kind() == StoreErrorKind::PreconditionFailed {
+        let published = match put_context {
+            HttpPutContext::WithKey { key, context } => {
+                self.store.put_with_key(context).await.map(|()| (key, None))
+            }
+            HttpPutContext::Generated { prefix, context } => self
+                .store
+                .put_with_generated_name(context)
+                .await
+                .and_then(|name| {
+                    Key::new(&format!("{prefix}{name}"))
+                        .map(|key| (key, Some(name)))
+                        .map_err(|error| StoreError::new(StoreErrorKind::Internal, error))
+                }),
+        };
+        let (key, object_name) = match published {
+            Ok(published) => published,
+            Err(error) if error.kind() == StoreErrorKind::PreconditionFailed => {
                 return send_text_response(
                     respond,
                     StatusCode::PRECONDITION_FAILED,
@@ -431,20 +576,58 @@ impl<S: StoreInterface> Service<S> {
                     PRECONDITION_FAILED_BODY,
                 );
             }
-            eprintln!("storage PUT commit failed: {error}");
-            return send_text_response(
-                respond,
-                StatusCode::INTERNAL_SERVER_ERROR,
-                None,
-                STORAGE_ERROR_BODY,
-            );
-        }
+            Err(error) => {
+                eprintln!("storage PUT commit failed: {error}");
+                return send_text_response(
+                    respond,
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    None,
+                    STORAGE_ERROR_BODY,
+                );
+            }
+        };
 
-        let response = Response::builder()
+        let key_header = match HeaderValue::from_bytes(key.as_str().as_bytes()) {
+            Ok(value) => value,
+            Err(error) => {
+                eprintln!("published object key cannot be returned in Object-Key: {error}");
+                return send_text_response(
+                    respond,
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    None,
+                    STORAGE_ERROR_BODY,
+                );
+            }
+        };
+        let object_name_header = match object_name {
+            Some(name) => {
+                match HeaderValue::from_bytes(name.as_str().as_bytes()) {
+                    Ok(value) => Some(value),
+                    Err(error) => {
+                        eprintln!(
+                            "published object name cannot be returned in Object-Name: {error}"
+                        );
+                        return send_text_response(
+                            respond,
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            None,
+                            STORAGE_ERROR_BODY,
+                        );
+                    }
+                }
+            }
+            None => None,
+        };
+
+        let mut response_builder = Response::builder()
             .version(Version::HTTP_2)
             .status(StatusCode::OK)
             .header(header::CONTENT_LENGTH, 0)
-            .body(())?;
+            .header("object-key", key_header);
+        if let Some(object_name_header) = object_name_header {
+            response_builder = response_builder.header("object-name", object_name_header);
+        }
+        let response = response_builder.body(())?;
         respond.send_response(response, true)?;
         Ok(())
     }
@@ -875,11 +1058,24 @@ async fn send_object_reader<O: ObjectInterface>(
 mod tests {
     use super::*;
     use crate::{
-        ContentType, GetResult, Key, ListPage, ListRequest, Object, ObjectMetadata,
-        ObjectReader, PutCondition, PutContextInterface, ReadObject, ReadRange, Store, StoreError,
+        ContentType, FilesystemStore, FilesystemStoreConfig, GetResult, Key, ListPage, ListRequest,
+        Object, ObjectMetadata, ObjectName, ObjectReader, PutCondition, PutContextInterface,
+        ReadObject, ReadRange, Store, StoreError,
     };
+    use crate::storage_interface::{key_from_sha256, PutKey};
     use h2::{client, server};
-    use std::{collections::HashMap, future::Future, num::NonZeroUsize, sync::Arc};
+    use sha2::{Digest, Sha256};
+    use std::{
+        collections::HashMap,
+        future::Future,
+        fs,
+        num::NonZeroUsize,
+        path::PathBuf,
+        sync::{
+            atomic::{AtomicU64, Ordering},
+            Arc,
+        },
+    };
     use tokio::{
         io::{duplex, DuplexStream},
         sync::{Notify, RwLock},
@@ -888,6 +1084,17 @@ mod tests {
 
     const IMAGE: &[u8] = b"small jpeg fixture";
     const VIDEO: &[u8] = b"small mp4 fixture";
+    static ROOT_ID: AtomicU64 = AtomicU64::new(1);
+
+    fn lowercase_hex(bytes: &[u8]) -> String {
+        const HEX: &[u8; 16] = b"0123456789abcdef";
+        let mut output = String::with_capacity(bytes.len() * 2);
+        for byte in bytes {
+            output.push(HEX[(byte >> 4) as usize] as char);
+            output.push(HEX[(byte & 0x0f) as usize] as char);
+        }
+        output
+    }
 
     fn validated_content_type(value: &str) -> ContentType {
         ContentType::try_from_header(&value.parse().unwrap()).unwrap()
@@ -1013,12 +1220,16 @@ mod tests {
     }
 
     struct FailurePutContext {
-        key: Key,
+        key: PutKey,
         failure: FailureOperation,
         content_type: ContentType,
         condition: PutCondition,
         contents: Vec<u8>,
     }
+
+    struct FailurePutContextWithKey(FailurePutContext);
+
+    struct FailurePutContextWithGeneratedName(FailurePutContext);
 
     impl PutContextInterface for FailurePutContext {
         async fn append(&mut self, bytes: &Bytes) -> Result<(), StoreError> {
@@ -1031,6 +1242,18 @@ mod tests {
 
             self.contents.extend_from_slice(bytes);
             Ok(())
+        }
+    }
+
+    impl PutContextInterface for FailurePutContextWithKey {
+        async fn append(&mut self, bytes: &Bytes) -> Result<(), StoreError> {
+            self.0.append(bytes).await
+        }
+    }
+
+    impl PutContextInterface for FailurePutContextWithGeneratedName {
+        async fn append(&mut self, bytes: &Bytes) -> Result<(), StoreError> {
+            self.0.append(bytes).await
         }
     }
 
@@ -1070,11 +1293,70 @@ mod tests {
                 read_gate: Arc::new(Notify::new()),
             }
         }
+
+        async fn commit_put(
+            &self,
+            put_context: FailurePutContext,
+        ) -> Result<Option<ObjectName>, StoreError> {
+            if self.failure == FailureOperation::Commit {
+                return Err(StoreError::new(
+                    StoreErrorKind::Internal,
+                    SECRET_STORAGE_ERROR,
+                ));
+            }
+            if self.failure == FailureOperation::PreconditionFailed {
+                return Err(StoreError::new(
+                    StoreErrorKind::PreconditionFailed,
+                    SECRET_STORAGE_ERROR,
+                ));
+            }
+
+            let (key, name) = match put_context.key {
+                PutKey::Supplied(key) => (key, None),
+                PutKey::Sha256 { prefix } => {
+                    let digest = sha2::Sha256::digest(&put_context.contents);
+                    let digest: [u8; 32] = digest.into();
+                    let key = key_from_sha256(&prefix, &digest).map_err(|error| {
+                        StoreError::new(StoreErrorKind::Internal, format!("invalid generated key: {error}"))
+                    })?;
+                    (key, Some(ObjectName::from_sha256(&digest)))
+                }
+            };
+            let mut objects = self.objects.write().await;
+            let key_is_present = objects.contains_key(&key);
+            let condition_satisfied = match put_context.condition {
+                PutCondition::Unconditional => true,
+                PutCondition::CreateOnly => !key_is_present,
+                PutCondition::ReplaceOnly => key_is_present,
+            };
+            if !condition_satisfied {
+                return Err(StoreError::new(
+                    StoreErrorKind::PreconditionFailed,
+                    "test PUT condition failed",
+                ));
+            }
+
+            objects.insert(
+                key,
+                FailureObject {
+                    content_type: put_context.content_type,
+                    contents: put_context.contents.into(),
+                    cursor: 0,
+                    read_failure: false,
+                    early_eof: false,
+                    over_read: false,
+                    read_limit: usize::MAX,
+                    read_gate: None,
+                },
+            );
+            Ok(name)
+        }
     }
 
     impl StoreInterface for FailureStore {
         type Object = FailureObject;
-        type PutContext = FailurePutContext;
+        type PutContextWithKey = FailurePutContextWithKey;
+        type PutContextWithGeneratedName = FailurePutContextWithGeneratedName;
 
         async fn get(
             &self,
@@ -1159,12 +1441,12 @@ mod tests {
             Ok(())
         }
 
-        async fn put_context(
+        async fn put_context_with_key(
             &self,
             key: Key,
             content_type: ContentType,
             condition: PutCondition,
-        ) -> Result<Self::PutContext, StoreError> {
+        ) -> Result<Self::PutContextWithKey, StoreError> {
             if self.failure == FailureOperation::PutContext {
                 return Err(StoreError::new(
                     StoreErrorKind::Internal,
@@ -1172,58 +1454,50 @@ mod tests {
                 ));
             }
 
-            Ok(FailurePutContext {
-                key,
+            Ok(FailurePutContextWithKey(FailurePutContext {
+                key: PutKey::Supplied(key),
                 failure: self.failure,
                 content_type,
                 condition,
                 contents: Vec::new(),
-            })
+            }))
         }
 
-        async fn put(&self, put_context: Self::PutContext) -> Result<(), StoreError> {
-            if self.failure == FailureOperation::Commit {
+        async fn put_with_key(
+            &self,
+            put_context: Self::PutContextWithKey,
+        ) -> Result<(), StoreError> {
+            self.commit_put(put_context.0).await.map(|_| ())
+        }
+
+        async fn put_context_with_generated_name(
+            &self,
+            prefix: String,
+            content_type: ContentType,
+            condition: PutCondition,
+        ) -> Result<Self::PutContextWithGeneratedName, StoreError> {
+            if self.failure == FailureOperation::PutContext {
                 return Err(StoreError::new(
                     StoreErrorKind::Internal,
                     SECRET_STORAGE_ERROR,
                 ));
             }
-            if self.failure == FailureOperation::PreconditionFailed {
-                return Err(StoreError::new(
-                    StoreErrorKind::PreconditionFailed,
-                    SECRET_STORAGE_ERROR,
-                ));
-            }
+            Ok(FailurePutContextWithGeneratedName(FailurePutContext {
+                key: PutKey::Sha256 { prefix },
+                failure: self.failure,
+                content_type,
+                condition,
+                contents: Vec::new(),
+            }))
+        }
 
-            let key = put_context.key;
-            let mut objects = self.objects.write().await;
-            let key_is_present = objects.contains_key(&key);
-            let condition_satisfied = match put_context.condition {
-                PutCondition::Unconditional => true,
-                PutCondition::CreateOnly => !key_is_present,
-                PutCondition::ReplaceOnly => key_is_present,
-            };
-            if !condition_satisfied {
-                return Err(StoreError::new(
-                    StoreErrorKind::PreconditionFailed,
-                    "test PUT condition failed",
-                ));
-            }
-
-            objects.insert(
-                key,
-                FailureObject {
-                    content_type: put_context.content_type,
-                    contents: put_context.contents.into(),
-                    cursor: 0,
-                    read_failure: false,
-                    early_eof: false,
-                    over_read: false,
-                    read_limit: usize::MAX,
-                    read_gate: None,
-                },
-            );
-            Ok(())
+        async fn put_with_generated_name(
+            &self,
+            put_context: Self::PutContextWithGeneratedName,
+        ) -> Result<ObjectName, StoreError> {
+            self.commit_put(put_context.0)
+                .await?
+                .ok_or_else(|| StoreError::new(StoreErrorKind::Internal, "missing test object name"))
         }
     }
 
@@ -1275,16 +1549,20 @@ mod tests {
 
     #[test]
     fn object_key_decoding_is_single_pass_and_validates_utf8_and_length() {
-        assert_eq!(decode_object_key("a%20b").unwrap().as_str(), "a b");
-        assert_eq!(decode_object_key("a%2Fb").unwrap().as_str(), "a/b");
-        assert_eq!(decode_object_key("a+b").unwrap().as_str(), "a+b");
-        assert_eq!(decode_object_key("a%252Fb").unwrap().as_str(), "a%2Fb");
-        assert_eq!(decode_object_key("%E7%8C%AB").unwrap().as_str(), "猫");
+        assert_eq!(decode_object_path("a%20b").unwrap(), "a b");
+        assert_eq!(decode_object_path("a%2Fb").unwrap(), "a/b");
+        assert_eq!(decode_object_path("a+b").unwrap(), "a+b");
+        assert_eq!(decode_object_path("a%252Fb").unwrap(), "a%2Fb");
+        assert_eq!(decode_object_path("%E7%8C%AB").unwrap(), "猫");
+        assert_eq!(decode_object_path("folder%2F").unwrap(), "folder/");
 
         for value in ["%", "%2", "%GG", "%FF"] {
-            assert!(decode_object_key(value).is_err(), "accepted {value:?}");
+            assert!(decode_object_path(value).is_err(), "accepted {value:?}");
         }
-        assert!(decode_object_key(&"x".repeat(1_025)).is_err());
+        assert!(decode_object_path(&"x".repeat(1_025)).is_err());
+        assert!(Key::new("folder/").is_err());
+        assert!(validate_generated_prefix(&format!("{}/", "p".repeat(959))).is_ok());
+        assert!(validate_generated_prefix(&format!("{}/", "p".repeat(960))).is_err());
     }
 
     #[test]
@@ -1467,7 +1745,7 @@ mod tests {
 
         let key = Key::new("new").unwrap();
         let mut first = store
-            .put_context(
+            .put_context_with_key(
                 key.clone(),
                 validated_content_type("text/plain"),
                 PutCondition::Unconditional,
@@ -1475,13 +1753,13 @@ mod tests {
             .await
             .unwrap();
         first.append(&Bytes::from_static(b"first")).await.unwrap();
-        store.put(first).await.unwrap();
+        store.put_with_key(first).await.unwrap();
         assert_eq!(
             collect_stored_object(&clone, "new").await.as_ref(),
             b"first"
         );
         let mut second = clone
-            .put_context(
+            .put_context_with_key(
                 key.clone(),
                 validated_content_type("application/json"),
                 PutCondition::Unconditional,
@@ -1489,7 +1767,7 @@ mod tests {
             .await
             .unwrap();
         second.append(&Bytes::from_static(b"second")).await.unwrap();
-        clone.put(second).await.unwrap();
+        clone.put_with_key(second).await.unwrap();
 
         let mut replaced = stored_object(&store, "new").await;
         assert_eq!(replaced.metadata().content_type().as_header_value().as_bytes(), b"application/json");
@@ -1524,6 +1802,10 @@ mod tests {
             _client_task: client_task,
             _server_task: server_task,
         }
+    }
+
+    async fn new_connection<S: StoreInterface>(store: Arc<S>) -> TestConnection {
+        connection(store, None).await
     }
 
     async fn run_test_server<S: StoreInterface>(io: DuplexStream, service: Service<S>) {
@@ -1675,6 +1957,375 @@ mod tests {
         Ok(payload)
     }
 
+    fn payload_key(payload: &[u8]) -> String {
+        lowercase_hex(&Sha256::digest(payload))
+    }
+
+    async fn close_connection(connection: TestConnection) {
+        let TestConnection { sender, _client_task, _server_task } = connection;
+        drop(sender);
+        _client_task.abort();
+        _server_task.abort();
+        let _ = _client_task.await;
+        let _ = _server_task.await;
+    }
+
+    async fn generated_upload_contract<S: StoreInterface>(store: Arc<S>) {
+        let mut connection = connection(Arc::clone(&store), None).await;
+        let payload = b"generated payload";
+        let key = payload_key(payload);
+        let response = put_with_headers(
+            &mut connection.sender,
+            "/objects",
+            Some("application/octet-stream"),
+            None,
+            &[("Object-Key-Mode", "sha256")],
+            payload,
+        )
+        .await
+        .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.headers()["object-name"], key);
+        assert_eq!(response.headers()["object-key"], key);
+        assert!(!response.headers().contains_key(header::LOCATION));
+        assert_eq!(response.headers()[header::CONTENT_LENGTH], "0");
+        assert!(collect(response.into_body()).await.unwrap().is_empty());
+
+        let object_path = format!("/objects/{key}");
+        let response = get(&mut connection.sender, &object_path).await.unwrap();
+        assert_success_headers(&response, "application/octet-stream", payload.len());
+        assert_eq!(collect(response.into_body()).await.unwrap(), payload);
+
+        let response = request(&mut connection.sender, Method::HEAD, &object_path).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.headers()[header::CONTENT_TYPE], "application/octet-stream");
+        assert_eq!(response.headers()[header::CONTENT_LENGTH], payload.len().to_string());
+        assert!(collect(response.into_body()).await.unwrap().is_empty());
+
+        let response = get(&mut connection.sender, "/objects?prefix=").await.unwrap();
+        let listing: serde_json::Value = serde_json::from_slice(
+            &collect(response.into_body()).await.unwrap(),
+        )
+        .unwrap();
+        assert!(listing["objects"].as_array().unwrap().iter().any(|object| object["key"] == key));
+
+        for prefix in ["photos/", "archive/"] {
+            let expected_key = format!("{prefix}{key}");
+            let response = put_with_headers(
+                &mut connection.sender,
+                &format!("/objects/{prefix}"),
+                Some("application/octet-stream"),
+                None,
+                &[("Object-Key-Mode", "sha256")],
+                payload,
+            )
+            .await
+            .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            assert_eq!(response.headers()["object-name"], key);
+            assert_eq!(response.headers()["object-key"], expected_key);
+            assert!(collect(response.into_body()).await.unwrap().is_empty());
+
+            let response = get(&mut connection.sender, &format!("/objects/{expected_key}")).await.unwrap();
+            assert_success_headers(&response, "application/octet-stream", payload.len());
+            assert_eq!(collect(response.into_body()).await.unwrap(), payload);
+        }
+
+        let longest_prefix = format!("{}/", "p".repeat(959));
+        let longest_key = format!("{longest_prefix}{}", payload_key(b""));
+        let longest_upload = put_with_headers(
+            &mut connection.sender,
+            &format!("/objects/{longest_prefix}"),
+            Some("application/octet-stream"),
+            None,
+            &[("Object-Key-Mode", "sha256")],
+            b"",
+        )
+        .await
+        .unwrap();
+        assert_eq!(longest_upload.status(), StatusCode::OK);
+        assert_eq!(longest_upload.headers()["object-name"], payload_key(b""));
+        assert_eq!(longest_upload.headers()["object-key"], longest_key);
+        assert_eq!(longest_key.len(), 1_024);
+        assert!(collect(longest_upload.into_body()).await.unwrap().is_empty());
+        let response = get(&mut connection.sender, &format!("/objects/{longest_key}")).await.unwrap();
+        assert_success_headers(&response, "application/octet-stream", 0);
+        assert!(collect(response.into_body()).await.unwrap().is_empty());
+
+        let conflict = put_with_headers(
+            &mut connection.sender,
+            "/objects",
+            Some("text/plain"),
+            None,
+            &[("Object-Key-Mode", "sha256"), ("If-None-Match", "*")],
+            payload,
+        )
+        .await
+        .unwrap();
+        assert_eq!(conflict.status(), StatusCode::PRECONDITION_FAILED);
+        assert_eq!(collect(conflict.into_body()).await.unwrap(), PRECONDITION_FAILED_BODY);
+
+        let replaced = put_with_headers(
+            &mut connection.sender,
+            "/objects",
+            Some("text/plain"),
+            None,
+            &[("Object-Key-Mode", "sha256"), ("If-Match", "*")],
+            payload,
+        )
+        .await
+        .unwrap();
+        assert_eq!(replaced.status(), StatusCode::OK);
+        assert_eq!(replaced.headers()["object-name"], key);
+        assert_eq!(replaced.headers()["object-key"], key);
+        assert!(collect(replaced.into_body()).await.unwrap().is_empty());
+        let response = request(&mut connection.sender, Method::HEAD, &object_path).await.unwrap();
+        assert_eq!(response.headers()[header::CONTENT_TYPE], "text/plain");
+
+        let unconditional = put_with_headers(
+            &mut connection.sender,
+            "/objects",
+            Some("image/png"),
+            None,
+            &[("Object-Key-Mode", "sha256")],
+            payload,
+        )
+        .await
+        .unwrap();
+        assert_eq!(unconditional.status(), StatusCode::OK);
+        assert_eq!(unconditional.headers()["object-name"], key);
+        assert_eq!(unconditional.headers()["object-key"], key);
+        assert!(collect(unconditional.into_body()).await.unwrap().is_empty());
+        let response = request(&mut connection.sender, Method::HEAD, &object_path).await.unwrap();
+        assert_eq!(response.headers()[header::CONTENT_TYPE], "image/png");
+
+        let empty_key = payload_key(b"");
+        let empty_upload = put_with_headers(
+            &mut connection.sender,
+            "/objects",
+            Some("application/octet-stream"),
+            None,
+            &[("Object-Key-Mode", "sha256")],
+            b"",
+        )
+        .await
+        .unwrap();
+        assert_eq!(empty_upload.status(), StatusCode::OK);
+        assert_eq!(empty_upload.headers()["object-name"], empty_key);
+        assert_eq!(empty_upload.headers()["object-key"], empty_key);
+        assert!(collect(empty_upload.into_body()).await.unwrap().is_empty());
+        let empty_get = get(&mut connection.sender, &format!("/objects/{empty_key}")).await.unwrap();
+        assert_success_headers(&empty_get, "application/octet-stream", 0);
+        assert!(collect(empty_get.into_body()).await.unwrap().is_empty());
+
+        let keyed = put(
+            &mut connection.sender,
+            "/objects/caller-keyed",
+            Some("text/plain"),
+            None,
+            b"caller payload",
+        )
+        .await
+        .unwrap();
+        assert_eq!(keyed.status(), StatusCode::OK);
+        assert_eq!(keyed.headers()["object-key"], "caller-keyed");
+        assert!(!keyed.headers().contains_key("object-name"));
+        assert!(!keyed.headers().contains_key(header::LOCATION));
+        assert!(collect(keyed.into_body()).await.unwrap().is_empty());
+
+        let oversized_prefix_path = format!("/objects/{}/", "p".repeat(960));
+        for (path, mode_headers) in [
+            ("/objects", vec![]),
+            ("/objects", vec![("Object-Key-Mode", "md5")]),
+            ("/objects?prefix=", vec![("Object-Key-Mode", "sha256")]),
+            ("/objects/photos/", vec![]),
+            ("/objects/photos", vec![("Object-Key-Mode", "sha256")]),
+            ("/objects/photos/?prefix=", vec![("Object-Key-Mode", "sha256")]),
+            (oversized_prefix_path.as_str(), vec![("Object-Key-Mode", "sha256")]),
+        ] {
+            let response = put_with_headers(
+                &mut connection.sender,
+                path,
+                Some("application/octet-stream"),
+                None,
+                &mode_headers,
+                b"",
+            )
+            .await
+            .unwrap();
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+            assert_eq!(collect(response.into_body()).await.unwrap(), BAD_REQUEST_BODY);
+        }
+
+        for method in [Method::GET, Method::HEAD, Method::DELETE] {
+            let response = request(&mut connection.sender, method, "/objects/forbidden%2F")
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        }
+        let response = put(
+            &mut connection.sender,
+            "/objects/forbidden%2F",
+            Some("application/octet-stream"),
+            None,
+            b"",
+        )
+        .await
+        .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(collect(response.into_body()).await.unwrap(), BAD_REQUEST_BODY);
+
+        let missing_content_type = put_with_headers(
+            &mut connection.sender,
+            "/objects",
+            None,
+            None,
+            &[("Object-Key-Mode", "sha256")],
+            b"",
+        )
+        .await
+        .unwrap();
+        assert_eq!(missing_content_type.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(collect(missing_content_type.into_body()).await.unwrap(), BAD_REQUEST_BODY);
+
+        let mut duplicate = Request::builder()
+            .method(Method::PUT)
+            .uri("/objects")
+            .header(header::CONTENT_TYPE, "application/octet-stream")
+            .body(())
+            .unwrap();
+        duplicate.headers_mut().append("object-key-mode", "sha256".parse().unwrap());
+        duplicate.headers_mut().append("object-key-mode", "sha256".parse().unwrap());
+        let (response, _) = connection.sender.send_request(duplicate, true).unwrap();
+        let response = response.await.unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(collect(response.into_body()).await.unwrap(), BAD_REQUEST_BODY);
+
+        let race_payload = b"same bytes in concurrent generated create-only uploads";
+        let race_name = payload_key(race_payload);
+        let race_key = format!("race/{race_name}");
+        let mut first = new_connection(Arc::clone(&store)).await;
+        let mut second = new_connection(Arc::clone(&store)).await;
+        let first_request = put_with_headers(
+            &mut first.sender,
+            "/objects/race/",
+            Some("application/octet-stream"),
+            None,
+            &[("Object-Key-Mode", "sha256"), ("If-None-Match", "*")],
+            race_payload,
+        );
+        let second_request = put_with_headers(
+            &mut second.sender,
+            "/objects/race/",
+            Some("application/octet-stream"),
+            None,
+            &[("Object-Key-Mode", "sha256"), ("If-None-Match", "*")],
+            race_payload,
+        );
+        let (first_result, second_result) = tokio::join!(first_request, second_request);
+        let first_response = first_result.unwrap();
+        let second_response = second_result.unwrap();
+        assert_ne!(first_response.status().is_success(), second_response.status().is_success());
+        assert!(
+            (first_response.status() == StatusCode::PRECONDITION_FAILED)
+                || (second_response.status() == StatusCode::PRECONDITION_FAILED)
+        );
+        assert_eq!(
+            first_response.headers().get("object-name").map(|value| value.as_bytes()),
+            first_response.status().is_success().then_some(race_name.as_bytes())
+        );
+        assert_eq!(
+            second_response.headers().get("object-name").map(|value| value.as_bytes()),
+            second_response.status().is_success().then_some(race_name.as_bytes())
+        );
+        assert_eq!(
+            first_response.headers().get("object-key").map(|value| value.as_bytes()),
+            first_response.status().is_success().then_some(race_key.as_bytes())
+        );
+        assert_eq!(
+            second_response.headers().get("object-key").map(|value| value.as_bytes()),
+            second_response.status().is_success().then_some(race_key.as_bytes())
+        );
+        let first_succeeded = first_response.status().is_success();
+        let second_succeeded = second_response.status().is_success();
+        let first_body = collect(first_response.into_body()).await.unwrap();
+        let second_body = collect(second_response.into_body()).await.unwrap();
+        assert_eq!(first_body, if first_succeeded { &[][..] } else { PRECONDITION_FAILED_BODY });
+        assert_eq!(second_body, if second_succeeded { &[][..] } else { PRECONDITION_FAILED_BODY });
+        close_connection(first).await;
+        close_connection(second).await;
+
+        let mut failed = new_connection(Arc::clone(&store)).await;
+        let partial = b"cancelled generated upload";
+        let request = Request::builder()
+            .method(Method::PUT)
+            .uri("/objects")
+            .header(header::CONTENT_TYPE, "application/octet-stream")
+            .header("Object-Key-Mode", "sha256")
+            .body(())
+            .unwrap();
+        let (response, mut stream) = failed.sender.send_request(request, false).unwrap();
+        send_frame(&mut stream, partial, false).await.unwrap();
+        stream.send_reset(h2::Reason::CANCEL);
+        assert!(response.await.is_err());
+        let partial_key = Key::new(&payload_key(partial)).unwrap();
+        assert_eq!(store.stat(&partial_key).await.unwrap_err().kind(), StoreErrorKind::NotFound);
+        close_connection(failed).await;
+
+        let mut malformed = new_connection(Arc::clone(&store)).await;
+        let rejected_payload = b"length mismatch generated upload";
+        let request = Request::builder()
+            .method(Method::PUT)
+            .uri("/objects")
+            .header(header::CONTENT_TYPE, "application/octet-stream")
+            .header("Object-Key-Mode", "sha256")
+            .header(header::CONTENT_LENGTH, "100")
+            .body(())
+            .unwrap();
+        let (response, mut stream) = malformed.sender.send_request(request, false).unwrap();
+        let send_result = send_body(&mut stream, rejected_payload).await;
+        drop(stream);
+        let response_result = response.await;
+        assert!(send_result.is_err() || response_result.is_err());
+        if let Ok(response) = response_result {
+            assert!(!response.status().is_success());
+        }
+        let rejected_key = Key::new(&payload_key(rejected_payload)).unwrap();
+        assert_eq!(store.stat(&rejected_key).await.unwrap_err().kind(), StoreErrorKind::NotFound);
+        close_connection(malformed).await;
+
+        let response = get(&mut connection.sender, "/objects?prefix=").await.unwrap();
+        let listing: serde_json::Value = serde_json::from_slice(
+            &collect(response.into_body()).await.unwrap(),
+        )
+        .unwrap();
+        assert_eq!(listing["objects"].as_array().unwrap().len(), 7);
+
+        close_connection(connection).await;
+    }
+
+    struct TestFilesystemRoot(PathBuf);
+
+    impl TestFilesystemRoot {
+        fn new() -> Self {
+            let id = ROOT_ID.fetch_add(1, Ordering::Relaxed);
+            let path = std::env::temp_dir().join(format!("journey-http2-fs-{}-{id}", std::process::id()));
+            let _ = fs::remove_dir_all(&path);
+            fs::create_dir_all(&path).unwrap();
+            Self(path)
+        }
+
+        fn config(&self) -> FilesystemStoreConfig {
+            FilesystemStoreConfig::new(&self.0)
+        }
+    }
+
+    impl Drop for TestFilesystemRoot {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
     fn assert_success_headers(
         response: &http::Response<h2::RecvStream>,
         content_type: &str,
@@ -1703,6 +2354,17 @@ mod tests {
             .unwrap();
         assert_success_headers(&video, "video/mp4", VIDEO.len());
         assert_eq!(collect(video.into_body()).await.unwrap(), VIDEO);
+    }
+
+    #[tokio::test]
+    async fn generated_sha256_uploads_work_over_http2_with_both_backends() {
+        generated_upload_contract(Arc::new(Store::default())).await;
+
+        let root = TestFilesystemRoot::new();
+        let store = Arc::new(FilesystemStore::open(root.config()).await.unwrap());
+        generated_upload_contract(Arc::clone(&store)).await;
+        assert_eq!(fs::read_dir(root.0.join("part")).unwrap().count(), 0);
+        drop(store);
     }
 
     #[tokio::test]
@@ -2210,7 +2872,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(collection.status(), StatusCode::METHOD_NOT_ALLOWED);
-        assert_eq!(collection.headers()[header::ALLOW], "GET");
+        assert_eq!(collection.headers()[header::ALLOW], "GET, PUT");
         assert_eq!(collect(collection.into_body()).await.unwrap(), METHOD_NOT_ALLOWED_BODY);
 
         let object = request(&mut connection.sender, Method::POST, "/objects/image.jpg")
@@ -2223,7 +2885,7 @@ mod tests {
         let collection_head = request(&mut connection.sender, Method::HEAD, "/objects")
             .await
             .unwrap();
-        assert_eq!(collection_head.headers()[header::ALLOW], "GET");
+        assert_eq!(collection_head.headers()[header::ALLOW], "GET, PUT");
         assert_empty_response(collection_head, StatusCode::METHOD_NOT_ALLOWED).await;
 
         let object_head = request(&mut connection.sender, Method::HEAD, "/elsewhere")

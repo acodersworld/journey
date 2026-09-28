@@ -9,9 +9,9 @@ use sha2::{Digest, Sha256};
 use tokio::sync::RwLock;
 
 use crate::storage_interface::{
-    ContentType, GetResult, Key, ListCursor, ListPage, ListRequest, ObjectInterface, ObjectMetadata,
-    PutCondition, PutContextInterface, ReadObject, ReadRange, ReadSpan, StoreError,
-    StoreErrorKind, StoreInterface,
+    key_from_sha256, validate_generated_prefix, ContentType, GetResult, Key, ListCursor,
+    ListPage, ListRequest, ObjectInterface, ObjectMetadata, ObjectName, PutCondition, PutKey,
+    PutContextInterface, ReadObject, ReadRange, ReadSpan, StoreError, StoreErrorKind, StoreInterface,
 };
 
 const FIXED_METADATA_LEN: usize = 84;
@@ -157,7 +157,8 @@ impl FilesystemStore {
 
 impl StoreInterface for FilesystemStore {
     type Object = FilesystemObjectReader;
-    type PutContext = FilesystemPutContext;
+    type PutContextWithKey = FilesystemPutContextWithKey;
+    type PutContextWithGeneratedName = FilesystemPutContextWithGeneratedName;
 
     async fn get(
         &self,
@@ -280,99 +281,70 @@ impl StoreInterface for FilesystemStore {
         Ok(())
     }
 
-    async fn put_context(
+    async fn put_context_with_key(
         &self,
         key: Key,
         content_type: ContentType,
         condition: PutCondition,
-    ) -> Result<Self::PutContext, StoreError> {
+    ) -> Result<Self::PutContextWithKey, StoreError> {
         let metadata_len = metadata_length(&key, &content_type)?;
-        let (temp_path, file) = create_part_file(&self.part_dir, metadata_len)?;
-        Ok(FilesystemPutContext {
-            key,
-            content_type,
-            condition,
-            metadata_len,
-            publication_state: PublicationState::Unpublished { temp_path },
-            upload_state: Arc::new(Mutex::new(UploadState::Active(ActiveUpload {
-                file,
-                digest: Sha256::new(),
-                payload_len: 0,
-            }))),
-        })
+        let inner = new_filesystem_put_context(&self.part_dir, metadata_len, content_type, condition)?;
+        Ok(FilesystemPutContextWithKey { key, inner })
     }
 
-    async fn put(&self, mut context: Self::PutContext) -> Result<(), StoreError> {
-        let key = context.key.clone();
-        let content_type = context.content_type.clone();
-        let condition = context.condition;
-        let metadata_len = context.metadata_len as u64;
-        let upload_state = Arc::clone(&context.upload_state);
-        let key_for_finalize = key.clone();
-        let content_type_for_finalize = content_type.clone();
-        let finalized = tokio::task::spawn_blocking(move || {
-            finalize_upload(upload_state, key_for_finalize, content_type_for_finalize)
-        })
-        .await
-        .map_err(|error| unavailable(format!("Upload finalization task failed: {error}")))??;
+    async fn put_with_key(
+        &self,
+        context: FilesystemPutContextWithKey,
+    ) -> Result<(), StoreError> {
+        publish_upload(self, context.inner, PutKey::Supplied(context.key))
+            .await
+            .map(|_| ())
+    }
 
-        let mut entries = self.index.write().await;
-        let present = entries.contains_key(&key);
-        let final_path = self.object_path(&key);
-        match fs::symlink_metadata(&final_path) {
-            Ok(_) if !present => {
-                return Err(StoreError::new(
-                    StoreErrorKind::Corrupt,
-                    format!("Unindexed file occupies object path {}", final_path.display()),
-                ));
-            }
-            Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_file() => {
-                return Err(StoreError::new(
-                    StoreErrorKind::Corrupt,
-                    format!("Non-regular file occupies object path {}", final_path.display()),
-                ));
-            }
-            Ok(_) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => return Err(io_error("inspect object publication path", error)),
-        }
-        let condition_satisfied = match condition {
-            PutCondition::Unconditional => true,
-            PutCondition::CreateOnly => !present,
-            PutCondition::ReplaceOnly => present,
-        };
-        if !condition_satisfied {
-            return Err(StoreError::new(
-                StoreErrorKind::PreconditionFailed,
-                format!("PUT condition failed for key: {key}"),
-            ));
-        }
+    async fn put_context_with_generated_name(
+        &self,
+        prefix: String,
+        content_type: ContentType,
+        condition: PutCondition,
+    ) -> Result<Self::PutContextWithGeneratedName, StoreError> {
+        validate_generated_prefix(&prefix)
+            .map_err(|error| StoreError::new(StoreErrorKind::InvalidRequest, error))?;
+        let metadata_len = metadata_length_for_key_len(prefix.len() + 64, &content_type)?;
+        let inner = new_filesystem_put_context(&self.part_dir, metadata_len, content_type, condition)?;
+        Ok(FilesystemPutContextWithGeneratedName { prefix, inner })
+    }
 
-        let temp_path = match &context.publication_state {
-            PublicationState::Unpublished { temp_path } => temp_path,
-            PublicationState::Published => {
-                return Err(StoreError::new(StoreErrorKind::Internal, "Upload is already published"));
-            }
-        };
-        fs::rename(temp_path, &final_path).map_err(|error| io_error("publish object file", error))?;
-
-        entries.insert(
-            key,
-            IndexEntry::Healthy {
-                metadata: finalized.metadata,
-                metadata_len,
-                file: finalized.file,
-                object_id: finalized.object_id,
-            },
-        );
-        context.publication_state = PublicationState::Published;
-        Ok(())
+    async fn put_with_generated_name(
+        &self,
+        context: FilesystemPutContextWithGeneratedName,
+    ) -> Result<ObjectName, StoreError> {
+        let (_, name) = publish_upload(
+            self,
+            context.inner,
+            PutKey::Sha256 { prefix: context.prefix },
+        )
+        .await?;
+        name.ok_or_else(|| StoreError::new(
+            StoreErrorKind::Internal,
+            "Generated PUT finalization did not produce an object name",
+        ))
     }
 }
 
 #[derive(Debug)]
-pub struct FilesystemPutContext {
+pub struct FilesystemPutContextWithKey {
     key: Key,
+    inner: FilesystemPutContext,
+}
+
+#[derive(Debug)]
+pub struct FilesystemPutContextWithGeneratedName {
+    prefix: String,
+    inner: FilesystemPutContext,
+}
+
+#[derive(Debug)]
+struct FilesystemPutContext {
     content_type: ContentType,
     condition: PutCondition,
     metadata_len: usize,
@@ -386,7 +358,7 @@ enum PublicationState {
     Published,
 }
 
-impl PutContextInterface for FilesystemPutContext {
+impl FilesystemPutContext {
     async fn append(&mut self, bytes: &Bytes) -> Result<(), StoreError> {
         let upload_state = Arc::clone(&self.upload_state);
         let bytes = bytes.clone();
@@ -416,6 +388,18 @@ impl PutContextInterface for FilesystemPutContext {
     }
 }
 
+impl PutContextInterface for FilesystemPutContextWithKey {
+    async fn append(&mut self, bytes: &Bytes) -> Result<(), StoreError> {
+        self.inner.append(bytes).await
+    }
+}
+
+impl PutContextInterface for FilesystemPutContextWithGeneratedName {
+    async fn append(&mut self, bytes: &Bytes) -> Result<(), StoreError> {
+        self.inner.append(bytes).await
+    }
+}
+
 impl Drop for FilesystemPutContext {
     fn drop(&mut self) {
         if let PublicationState::Unpublished { temp_path } = &self.publication_state
@@ -425,6 +409,95 @@ impl Drop for FilesystemPutContext {
             eprintln!("failed to remove unpublished upload {}: {error}", temp_path.display());
         }
     }
+}
+
+fn new_filesystem_put_context(
+    part_dir: &Path,
+    metadata_len: usize,
+    content_type: ContentType,
+    condition: PutCondition,
+) -> Result<FilesystemPutContext, StoreError> {
+    let (temp_path, file) = create_part_file(part_dir, metadata_len)?;
+    Ok(FilesystemPutContext {
+        content_type,
+        condition,
+        metadata_len,
+        publication_state: PublicationState::Unpublished { temp_path },
+        upload_state: Arc::new(Mutex::new(UploadState::Active(ActiveUpload {
+            file,
+            digest: Sha256::new(),
+            payload_len: 0,
+        }))),
+    })
+}
+
+async fn publish_upload(
+    store: &FilesystemStore,
+    mut context: FilesystemPutContext,
+    key_mode: PutKey,
+) -> Result<(Key, Option<ObjectName>), StoreError> {
+    let content_type = context.content_type.clone();
+    let condition = context.condition;
+    let metadata_len = context.metadata_len as u64;
+    let upload_state = Arc::clone(&context.upload_state);
+    let finalized = tokio::task::spawn_blocking(move || {
+        finalize_upload(upload_state, key_mode, content_type)
+    })
+    .await
+    .map_err(|error| unavailable(format!("Upload finalization task failed: {error}")))??;
+
+    let key = finalized.metadata.key().clone();
+    let mut entries = store.index.write().await;
+    let present = entries.contains_key(&key);
+    let final_path = store.object_path(&key);
+    match fs::symlink_metadata(&final_path) {
+        Ok(_) if !present => {
+            return Err(StoreError::new(
+                StoreErrorKind::Corrupt,
+                format!("Unindexed file occupies object path {}", final_path.display()),
+            ));
+        }
+        Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_file() => {
+            return Err(StoreError::new(
+                StoreErrorKind::Corrupt,
+                format!("Non-regular file occupies object path {}", final_path.display()),
+            ));
+        }
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(io_error("inspect object publication path", error)),
+    }
+    let condition_satisfied = match condition {
+        PutCondition::Unconditional => true,
+        PutCondition::CreateOnly => !present,
+        PutCondition::ReplaceOnly => present,
+    };
+    if !condition_satisfied {
+        return Err(StoreError::new(
+            StoreErrorKind::PreconditionFailed,
+            format!("PUT condition failed for key: {key}"),
+        ));
+    }
+
+    let temp_path = match &context.publication_state {
+        PublicationState::Unpublished { temp_path } => temp_path,
+        PublicationState::Published => {
+            return Err(StoreError::new(StoreErrorKind::Internal, "Upload is already published"));
+        }
+    };
+    fs::rename(temp_path, &final_path).map_err(|error| io_error("publish object file", error))?;
+
+    entries.insert(
+        key.clone(),
+        IndexEntry::Healthy {
+            metadata: finalized.metadata,
+            metadata_len,
+            file: finalized.file,
+            object_id: finalized.object_id,
+        },
+    );
+    context.publication_state = PublicationState::Published;
+    Ok((key, finalized.object_name))
 }
 
 #[derive(Debug)]
@@ -444,11 +517,12 @@ struct FinalizedUpload {
     metadata: ObjectMetadata,
     file: Arc<File>,
     object_id: String,
+    object_name: Option<ObjectName>,
 }
 
 fn finalize_upload(
     upload_state: Arc<Mutex<UploadState>>,
-    key: Key,
+    key_mode: PutKey,
     content_type: ContentType,
 ) -> Result<FinalizedUpload, StoreError> {
     let mut upload_state_guard = upload_state.lock().map_err(|_| {
@@ -469,6 +543,15 @@ fn finalize_upload(
     let object_id_bytes = random_object_id()?;
     let object_id = format_uuid(&object_id_bytes);
     let digest: [u8; 32] = active_upload.digest.clone().finalize().into();
+    let (key, object_name) = match key_mode {
+        PutKey::Supplied(key) => (key, None),
+        PutKey::Sha256 { prefix } => {
+            let key = key_from_sha256(&prefix, &digest).map_err(|error| {
+                StoreError::new(StoreErrorKind::Internal, format!("Could not derive SHA-256 key: {error}"))
+            })?;
+            (key, Some(ObjectName::from_sha256(&digest)))
+        }
+    };
     let metadata_len = metadata_length(&key, &content_type)?;
     let metadata = encode_metadata(
         &key,
@@ -488,6 +571,7 @@ fn finalize_upload(
         metadata: ObjectMetadata::new(key, content_type, active_upload.payload_len),
         file: Arc::new(file),
         object_id,
+        object_name,
     })
 }
 
@@ -934,7 +1018,10 @@ fn read_exact_at(file: &File, mut buffer: &mut [u8], mut offset: u64) -> std::io
 }
 
 fn metadata_length(key: &Key, content_type: &ContentType) -> Result<usize, StoreError> {
-    let key_len = key.as_str().len();
+    metadata_length_for_key_len(key.as_str().len(), content_type)
+}
+
+fn metadata_length_for_key_len(key_len: usize, content_type: &ContentType) -> Result<usize, StoreError> {
     let content_type_len = content_type.as_header_value().as_bytes().len();
     if key_len == 0 || key_len > MAX_KEY_LEN || content_type_len == 0 || content_type_len > MAX_CONTENT_TYPE_LEN {
         return Err(StoreError::new(StoreErrorKind::InvalidRequest, "Object metadata exceeds format limits"));
@@ -1208,11 +1295,11 @@ mod tests {
 
     async fn put_bytes(store: &FilesystemStore, key: &str, content_type_value: &str, bytes: &[u8], condition: PutCondition) {
         let mut context = store
-            .put_context(Key::new(key).unwrap(), content_type(content_type_value), condition)
+            .put_context_with_key(Key::new(key).unwrap(), content_type(content_type_value), condition)
             .await
             .unwrap();
         context.append(&Bytes::copy_from_slice(bytes)).await.unwrap();
-        store.put(context).await.unwrap();
+        store.put_with_key(context).await.unwrap();
     }
 
     async fn read_bytes(mut read: ReadObject<FilesystemObjectReader>) -> Vec<u8> {
@@ -1243,6 +1330,76 @@ mod tests {
         assert!(ContentType::try_from_header(&HeaderValue::from_bytes(&[b'a'; 129]).unwrap()).is_err());
     }
 
+    #[tokio::test]
+    async fn generated_name_puts_return_only_the_digest_and_publish_under_full_keys() {
+        let root = TestRoot::new();
+        let store = FilesystemStore::open(root.config()).await.unwrap();
+        let prefix = "uploads/";
+        let payload = b"payload";
+        let expected_name = hex(&Sha256::digest(payload));
+
+        let mut first = store
+            .put_context_with_generated_name(
+                prefix.to_string(),
+                content_type("text/plain"),
+                PutCondition::Unconditional,
+            )
+            .await
+            .unwrap();
+        first.append(&Bytes::from_static(payload)).await.unwrap();
+        let name = store.put_with_generated_name(first).await.unwrap();
+
+        assert_eq!(name.as_str(), expected_name);
+        assert_eq!(name.to_string(), expected_name);
+        assert_eq!(name.as_str().len(), 64);
+        assert!(name.as_str().bytes().all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)));
+        let key = Key::new(&format!("{prefix}{name}")).unwrap();
+        assert_eq!(read_bytes(found(store.get(&key, None).await.unwrap())).await, payload);
+
+        let mut repeated = store
+            .put_context_with_generated_name(
+                prefix.to_string(),
+                content_type("text/plain"),
+                PutCondition::Unconditional,
+            )
+            .await
+            .unwrap();
+        repeated.append(&Bytes::from_static(payload)).await.unwrap();
+        assert_eq!(store.put_with_generated_name(repeated).await.unwrap(), name);
+
+        let mut rejected = store
+            .put_context_with_generated_name(
+                prefix.to_string(),
+                content_type("application/json"),
+                PutCondition::CreateOnly,
+            )
+            .await
+            .unwrap();
+        rejected.append(&Bytes::from_static(payload)).await.unwrap();
+        assert_eq!(
+            store.put_with_generated_name(rejected).await.unwrap_err().kind(),
+            StoreErrorKind::PreconditionFailed
+        );
+        assert_eq!(read_bytes(found(store.get(&key, None).await.unwrap())).await, payload);
+
+        let empty_name = store
+            .put_with_generated_name(
+                store
+                    .put_context_with_generated_name(
+                        String::new(),
+                        content_type("application/octet-stream"),
+                        PutCondition::Unconditional,
+                    )
+                    .await
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(empty_name.as_str(), hex(&Sha256::digest(b"")));
+        let empty_key = Key::new(empty_name.as_str()).unwrap();
+        assert!(read_bytes(found(store.get(&empty_key, None).await.unwrap())).await.is_empty());
+    }
+
     #[test]
     fn crc_uses_iso_hdlc_parameters() {
         assert_eq!(crc32_iso_hdlc(b"123456789"), 0xcbf4_3926);
@@ -1254,6 +1411,48 @@ mod tests {
         let largest_key = Key::new(&"k".repeat(1_024)).unwrap();
         let largest_content_type = ContentType::try_from_header(&HeaderValue::from_bytes(&[b'x'; 128]).unwrap()).unwrap();
         assert_eq!(metadata_length(&largest_key, &largest_content_type).unwrap(), 1_236);
+    }
+
+    #[tokio::test]
+    async fn startup_preserves_and_reports_legacy_keys_ending_in_slash() {
+        let root = TestRoot::new();
+        let store = FilesystemStore::open(root.config()).await.unwrap();
+        put_bytes(&store, "legacy", "text/plain", b"legacy payload", PutCondition::Unconditional).await;
+        let original_path = store.object_path(&Key::new("legacy").unwrap());
+        let original = fs::read(&original_path).unwrap();
+        drop(store);
+
+        let old_metadata_len = u16::from_le_bytes(original[10..12].try_into().unwrap()) as usize;
+        let old_key_len = u16::from_le_bytes(original[80..82].try_into().unwrap()) as usize;
+        let content_type_len = u16::from_le_bytes(original[82..84].try_into().unwrap()) as usize;
+        let new_metadata_len = FIXED_METADATA_LEN + "legacy/".len() + content_type_len;
+        let mut legacy_file = original[..FIXED_METADATA_LEN].to_vec();
+        legacy_file[10..12].copy_from_slice(&(new_metadata_len as u16).to_le_bytes());
+        legacy_file[12..16].fill(0);
+        legacy_file[80..82].copy_from_slice(&("legacy/".len() as u16).to_le_bytes());
+        legacy_file.extend_from_slice(b"legacy/");
+        legacy_file.extend_from_slice(&original[FIXED_METADATA_LEN + old_key_len..old_metadata_len]);
+        let crc = crc32_iso_hdlc(&legacy_file);
+        legacy_file[12..16].copy_from_slice(&crc.to_le_bytes());
+        legacy_file.extend_from_slice(&original[old_metadata_len..]);
+
+        let physical_name = format!("{}.obj", key_digest("legacy/"));
+        let legacy_path = root.0.join("objects").join(&physical_name);
+        fs::remove_file(&original_path).unwrap();
+        fs::write(&legacy_path, &legacy_file).unwrap();
+        let journal_path = root.0.join("events.jsonl");
+        let store = FilesystemStore::open(root.config().with_journal_path(&journal_path)).await.unwrap();
+
+        assert_eq!(fs::read(&legacy_path).unwrap(), legacy_file);
+        let page = store
+            .list(ListRequest::new("", None, NonZeroUsize::new(10).unwrap()))
+            .await
+            .unwrap();
+        assert!(page.objects().is_empty());
+        let event: serde_json::Value = serde_json::from_slice(&fs::read(journal_path).unwrap()).unwrap();
+        assert_eq!(event["event"], "corrupt_file_skipped");
+        assert_eq!(event["file"], physical_name);
+        assert!(event["reason"].as_str().unwrap().contains("Key cannot end with '/'"));
     }
 
     #[tokio::test]
@@ -1304,23 +1503,23 @@ mod tests {
         put_bytes(&store, "present", "text/plain", b"original", PutCondition::Unconditional).await;
 
         let mut rejected = store
-            .put_context(key.clone(), content_type("application/json"), PutCondition::CreateOnly)
+            .put_context_with_key(key.clone(), content_type("application/json"), PutCondition::CreateOnly)
             .await
             .unwrap();
         rejected.append(&Bytes::from_static(b"wrong")).await.unwrap();
-        assert_eq!(store.put(rejected).await.unwrap_err().kind(), StoreErrorKind::PreconditionFailed);
+        assert_eq!(store.put_with_key(rejected).await.unwrap_err().kind(), StoreErrorKind::PreconditionFailed);
         assert_eq!(fs::read_dir(root.0.join("part")).unwrap().count(), 0);
         assert_eq!(read_bytes(found(store.get(&key, None).await.unwrap())).await, b"original");
 
         let first = store
-            .put_context(Key::new("new").unwrap(), content_type("text/plain"), PutCondition::CreateOnly)
+            .put_context_with_key(Key::new("new").unwrap(), content_type("text/plain"), PutCondition::CreateOnly)
             .await
             .unwrap();
         let second = store
-            .put_context(Key::new("new").unwrap(), content_type("text/plain"), PutCondition::CreateOnly)
+            .put_context_with_key(Key::new("new").unwrap(), content_type("text/plain"), PutCondition::CreateOnly)
             .await
             .unwrap();
-        let (first, second) = tokio::join!(store.put(first), store.put(second));
+        let (first, second) = tokio::join!(store.put_with_key(first), store.put_with_key(second));
         assert_ne!(first.is_ok(), second.is_ok());
         assert_eq!(
             [first, second]
@@ -1400,11 +1599,11 @@ mod tests {
         let path = store.object_path(&key);
         fs::write(&path, b"unkeyable external file").unwrap();
         let mut context = store
-            .put_context(key, content_type("text/plain"), PutCondition::ReplaceOnly)
+            .put_context_with_key(key, content_type("text/plain"), PutCondition::ReplaceOnly)
             .await
             .unwrap();
         context.append(&Bytes::from_static(b"replacement")).await.unwrap();
-        assert_eq!(store.put(context).await.unwrap_err().kind(), StoreErrorKind::Corrupt);
+        assert_eq!(store.put_with_key(context).await.unwrap_err().kind(), StoreErrorKind::Corrupt);
         assert_eq!(fs::read(path).unwrap(), b"unkeyable external file");
         assert_eq!(fs::read_dir(root.0.join("part")).unwrap().count(), 0);
     }

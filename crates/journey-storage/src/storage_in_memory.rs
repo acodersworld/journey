@@ -7,12 +7,13 @@ use std::{
 };
 
 use bytes::{Bytes, BytesMut};
+use sha2::{Digest, Sha256};
 use tokio::sync::RwLock;
 
 use crate::storage_interface::{
-    ContentType, Key, ListCursor, ListPage, ListRequest, ObjectMetadata, ObjectInterface, PutCondition,
-    GetResult, PutContextInterface, ReadObject, ReadRange, ReadSpan, StoreError, StoreErrorKind,
-    StoreInterface,
+    ContentType, GetResult, Key, ListCursor, ListPage, ListRequest, ObjectInterface, ObjectMetadata,
+    key_from_sha256, validate_generated_prefix, ObjectName, PutCondition, PutContextInterface,
+    ReadObject, ReadRange, ReadSpan, StoreError, StoreErrorKind, StoreInterface,
 };
 
 /// One immutable object in a [`Store`].
@@ -61,17 +62,38 @@ impl ObjectInterface for ObjectReader {
     }
 }
 
-pub struct PutContext {
-    key: Key,
+struct PutContextData {
     content_type: ContentType,
     condition: PutCondition,
     bytes: Vec<u8>,
 }
 
-impl PutContextInterface for PutContext {
+impl PutContextData {
     async fn append(&mut self, bytes: &Bytes) -> Result<(), StoreError> {
         self.bytes.extend_from_slice(bytes);
         Ok(())
+    }
+}
+
+pub struct PutContextWithKey {
+    key: Key,
+    data: PutContextData,
+}
+
+impl PutContextInterface for PutContextWithKey {
+    async fn append(&mut self, bytes: &Bytes) -> Result<(), StoreError> {
+        self.data.append(bytes).await
+    }
+}
+
+pub struct PutContextWithGeneratedName {
+    prefix: String,
+    data: PutContextData,
+}
+
+impl PutContextInterface for PutContextWithGeneratedName {
+    async fn append(&mut self, bytes: &Bytes) -> Result<(), StoreError> {
+        self.data.append(bytes).await
     }
 }
 
@@ -204,6 +226,31 @@ impl Store {
         })?;
         Ok(offset..end)
     }
+
+    async fn publish(&self, key: Key, data: PutContextData) -> Result<(), StoreError> {
+        let mut objects = self.objects.write().await;
+        let key_is_present = objects.contains_key(&key);
+        let condition_satisfied = match data.condition {
+            PutCondition::Unconditional => true,
+            PutCondition::CreateOnly => !key_is_present,
+            PutCondition::ReplaceOnly => key_is_present,
+        };
+        if !condition_satisfied {
+            return Err(StoreError::new(
+                StoreErrorKind::PreconditionFailed,
+                format!("PUT condition failed for key: {key}"),
+            ));
+        }
+
+        objects.insert(
+            key,
+            Object {
+                content_type: data.content_type,
+                contents: data.bytes.into(),
+            },
+        );
+        Ok(())
+    }
 }
 
 impl Default for Store {
@@ -214,7 +261,8 @@ impl Default for Store {
 
 impl StoreInterface for Store {
     type Object = ObjectReader;
-    type PutContext = PutContext;
+    type PutContextWithKey = PutContextWithKey;
+    type PutContextWithGeneratedName = PutContextWithGeneratedName;
 
     async fn get(
         &self,
@@ -288,44 +336,55 @@ impl StoreInterface for Store {
         Ok(())
     }
 
-    async fn put_context(
+    async fn put_context_with_key(
         &self,
         key: Key,
         content_type: ContentType,
         condition: PutCondition,
-    ) -> Result<PutContext, StoreError> {
-        Ok(PutContext {
+    ) -> Result<PutContextWithKey, StoreError> {
+        Ok(PutContextWithKey {
             key,
-            content_type,
-            condition,
-            bytes: vec![],
+            data: PutContextData {
+                content_type,
+                condition,
+                bytes: vec![],
+            },
         })
     }
 
-    /// Atomically inserts or replaces an object by the key owned by its context.
-    async fn put(&self, put_context: PutContext) -> Result<(), StoreError> {
-        let key = put_context.key;
-        let mut objects = self.objects.write().await;
-        let key_is_present = objects.contains_key(&key);
-        let condition_satisfied = match put_context.condition {
-            PutCondition::Unconditional => true,
-            PutCondition::CreateOnly => !key_is_present,
-            PutCondition::ReplaceOnly => key_is_present,
-        };
-        if !condition_satisfied {
-            return Err(StoreError::new(
-                StoreErrorKind::PreconditionFailed,
-                format!("PUT condition failed for key: {key}"),
-            ));
-        }
+    async fn put_with_key(&self, put_context: PutContextWithKey) -> Result<(), StoreError> {
+        self.publish(put_context.key, put_context.data).await
+    }
 
-        let object = Object {
-            content_type: put_context.content_type,
-            contents: put_context.bytes.into(),
-        };
+    async fn put_context_with_generated_name(
+        &self,
+        prefix: String,
+        content_type: ContentType,
+        condition: PutCondition,
+    ) -> Result<PutContextWithGeneratedName, StoreError> {
+        validate_generated_prefix(&prefix)
+            .map_err(|error| StoreError::new(StoreErrorKind::InvalidRequest, error))?;
+        Ok(PutContextWithGeneratedName {
+            prefix,
+            data: PutContextData {
+                content_type,
+                condition,
+                bytes: vec![],
+            },
+        })
+    }
 
-        objects.insert(key, object);
-        Ok(())
+    async fn put_with_generated_name(
+        &self,
+        put_context: PutContextWithGeneratedName,
+    ) -> Result<ObjectName, StoreError> {
+        let digest: [u8; 32] = Sha256::digest(&put_context.data.bytes).into();
+        let key = key_from_sha256(&put_context.prefix, &digest).map_err(|error| {
+            StoreError::new(StoreErrorKind::Internal, format!("Could not derive SHA-256 key: {error}"))
+        })?;
+        let name = ObjectName::from_sha256(&digest);
+        self.publish(key, put_context.data).await?;
+        Ok(name)
     }
 }
 
@@ -369,6 +428,11 @@ mod tests {
         Bytes::from(contents)
     }
 
+    fn sha256_hex(bytes: &[u8]) -> String {
+        let digest = Sha256::digest(bytes);
+        digest.iter().map(|byte| format!("{byte:02x}")).collect()
+    }
+
     #[test]
     fn default_list_page_limit_is_one_thousand() {
         assert_eq!(
@@ -403,6 +467,77 @@ mod tests {
 
         let empty = store.stat(&Key::new("empty").unwrap()).await.unwrap();
         assert_eq!(empty.payload_length(), 0);
+    }
+
+    #[tokio::test]
+    async fn generated_name_puts_return_only_the_digest_and_publish_under_full_keys() {
+        let store = Store::default();
+        let prefix = "images/";
+        let payload = b"payload";
+        let expected_name = sha256_hex(payload);
+
+        let mut first = store
+            .put_context_with_generated_name(
+                prefix.to_string(),
+                content_type("text/plain"),
+                PutCondition::Unconditional,
+            )
+            .await
+            .unwrap();
+        first.append(&Bytes::from_static(payload)).await.unwrap();
+        let name = store.put_with_generated_name(first).await.unwrap();
+
+        assert_eq!(name.as_str(), expected_name);
+        assert_eq!(name.to_string(), expected_name);
+        assert_eq!(ObjectName::new(&expected_name).unwrap(), name);
+        assert!(ObjectName::new("not-a-digest").is_err());
+        assert_eq!(name.as_str().len(), 64);
+        assert!(name.as_str().bytes().all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)));
+        let key = Key::new(&format!("{prefix}{name}")).unwrap();
+        assert_eq!(collect_object(found(store.get(&key, None).await.unwrap())).await.as_ref(), payload);
+
+        let mut repeated = store
+            .put_context_with_generated_name(
+                prefix.to_string(),
+                content_type("text/plain"),
+                PutCondition::Unconditional,
+            )
+            .await
+            .unwrap();
+        repeated.append(&Bytes::from_static(payload)).await.unwrap();
+        assert_eq!(store.put_with_generated_name(repeated).await.unwrap(), name);
+
+        let mut rejected = store
+            .put_context_with_generated_name(
+                prefix.to_string(),
+                content_type("application/json"),
+                PutCondition::CreateOnly,
+            )
+            .await
+            .unwrap();
+        rejected.append(&Bytes::from_static(payload)).await.unwrap();
+        assert_eq!(
+            store.put_with_generated_name(rejected).await.unwrap_err().kind(),
+            StoreErrorKind::PreconditionFailed
+        );
+        assert_eq!(collect_object(found(store.get(&key, None).await.unwrap())).await.as_ref(), payload);
+
+        let empty_name = store
+            .put_with_generated_name(
+                store
+                    .put_context_with_generated_name(
+                        String::new(),
+                        content_type("application/octet-stream"),
+                        PutCondition::Unconditional,
+                    )
+                    .await
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(empty_name.as_str(), sha256_hex(b""));
+        let empty_key = Key::new(empty_name.as_str()).unwrap();
+        assert!(collect_object(found(store.get(&empty_key, None).await.unwrap())).await.is_empty());
     }
 
     #[tokio::test]
@@ -521,11 +656,11 @@ mod tests {
         };
 
         let mut context = store
-            .put_context(key.clone(), content_type("text/plain"), PutCondition::Unconditional)
+            .put_context_with_key(key.clone(), content_type("text/plain"), PutCondition::Unconditional)
             .await
             .unwrap();
         context.append(&Bytes::from_static(b"new and longer version")).await.unwrap();
-        store.put(context).await.unwrap();
+        store.put_with_key(context).await.unwrap();
 
         assert_eq!(captured.metadata().payload_length(), 11);
         assert_eq!(captured.metadata().content_type().as_header_value(), "application/octet-stream");
@@ -551,11 +686,11 @@ mod tests {
         let store = Store::new([object("item", b"old")]).unwrap();
         let key = Key::new("item").unwrap();
         let mut context = store
-            .put_context(key.clone(), content_type("text/plain"), PutCondition::Unconditional)
+            .put_context_with_key(key.clone(), content_type("text/plain"), PutCondition::Unconditional)
             .await
             .unwrap();
         context.append(&Bytes::from_static(b"replacement")).await.unwrap();
-        store.put(context).await.unwrap();
+        store.put_with_key(context).await.unwrap();
 
         let read = found(store.get(&key, None).await.unwrap());
         assert_eq!(read.metadata().payload_length(), 11);
@@ -571,37 +706,37 @@ mod tests {
         let missing = Key::new("missing").unwrap();
 
         let mut create = store
-            .put_context(absent.clone(), content_type("text/plain"), PutCondition::CreateOnly)
+            .put_context_with_key(absent.clone(), content_type("text/plain"), PutCondition::CreateOnly)
             .await
             .unwrap();
         create.append(&Bytes::from_static(b"created")).await.unwrap();
-        store.put(create).await.unwrap();
+        store.put_with_key(create).await.unwrap();
         assert_eq!(collect_object(found(store.get(&absent, None).await.unwrap())).await.as_ref(), b"created");
 
         let empty_create = store
-            .put_context(present.clone(), content_type("application/json"), PutCondition::CreateOnly)
+            .put_context_with_key(present.clone(), content_type("application/json"), PutCondition::CreateOnly)
             .await
             .unwrap();
-        let error = store.put(empty_create).await.unwrap_err();
+        let error = store.put_with_key(empty_create).await.unwrap_err();
         assert_eq!(error.kind(), StoreErrorKind::PreconditionFailed);
         let unchanged = found(store.get(&present, None).await.unwrap());
         assert_eq!(unchanged.metadata().content_type().as_header_value(), "application/octet-stream");
         assert_eq!(collect_object(unchanged).await.as_ref(), b"original");
 
         let empty_replace = store
-            .put_context(missing.clone(), content_type("text/plain"), PutCondition::ReplaceOnly)
+            .put_context_with_key(missing.clone(), content_type("text/plain"), PutCondition::ReplaceOnly)
             .await
             .unwrap();
-        assert_eq!(store.put(empty_replace).await.unwrap_err().kind(), StoreErrorKind::PreconditionFailed);
+        assert_eq!(store.put_with_key(empty_replace).await.unwrap_err().kind(), StoreErrorKind::PreconditionFailed);
         assert_eq!(store.get(&missing, None).await.unwrap_err().kind(), StoreErrorKind::NotFound);
         assert_eq!(collect_object(found(store.get(&absent, None).await.unwrap())).await.as_ref(), b"created");
 
         let mut replace = store
-            .put_context(present.clone(), content_type("application/json"), PutCondition::ReplaceOnly)
+            .put_context_with_key(present.clone(), content_type("application/json"), PutCondition::ReplaceOnly)
             .await
             .unwrap();
         replace.append(&Bytes::from_static(b"replaced")).await.unwrap();
-        store.put(replace).await.unwrap();
+        store.put_with_key(replace).await.unwrap();
         let replaced = found(store.get(&present, None).await.unwrap());
         assert_eq!(replaced.metadata().content_type().as_header_value(), "application/json");
         assert_eq!(collect_object(replaced).await.as_ref(), b"replaced");
@@ -612,14 +747,14 @@ mod tests {
         let store = Store::default();
         let key = Key::new("race").unwrap();
         let first = store
-            .put_context(key.clone(), content_type("text/plain"), PutCondition::CreateOnly)
+            .put_context_with_key(key.clone(), content_type("text/plain"), PutCondition::CreateOnly)
             .await
             .unwrap();
         let second = store
-            .put_context(key.clone(), content_type("application/json"), PutCondition::CreateOnly)
+            .put_context_with_key(key.clone(), content_type("application/json"), PutCondition::CreateOnly)
             .await
             .unwrap();
-        let (first_result, second_result) = tokio::join!(store.put(first), store.put(second));
+        let (first_result, second_result) = tokio::join!(store.put_with_key(first), store.put_with_key(second));
 
         assert_ne!(first_result.is_ok(), second_result.is_ok());
         assert_eq!(
@@ -637,12 +772,12 @@ mod tests {
         let store = Store::new([object("race", b"original")]).unwrap();
         let key = Key::new("race").unwrap();
         let mut replacement = store
-            .put_context(key.clone(), content_type("text/plain"), PutCondition::Unconditional)
+            .put_context_with_key(key.clone(), content_type("text/plain"), PutCondition::Unconditional)
             .await
             .unwrap();
         replacement.append(&Bytes::from_static(b"replacement")).await.unwrap();
 
-        let (put_result, delete_result) = tokio::join!(store.put(replacement), store.delete(&key));
+        let (put_result, delete_result) = tokio::join!(store.put_with_key(replacement), store.delete(&key));
         put_result.unwrap();
         delete_result.unwrap();
 

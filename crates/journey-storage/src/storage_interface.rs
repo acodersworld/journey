@@ -7,6 +7,9 @@ use std::{
     num::NonZeroUsize,
 };
 
+const MAX_KEY_LENGTH: usize = 1_024;
+const SHA256_HEX_LENGTH: usize = 64;
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ContentType(HeaderValue);
 
@@ -45,8 +48,11 @@ impl Key {
         if key.is_empty() {
             return Err("Empty key".to_string());
         }
-        if key.len() > 1_024 {
+        if key.len() > MAX_KEY_LENGTH {
             return Err("Key exceeds 1024 UTF-8 bytes".to_string());
+        }
+        if key.ends_with('/') {
+            return Err("Key cannot end with '/'".to_string());
         }
 
         Ok(Key { key: key.to_string() })
@@ -86,6 +92,76 @@ pub enum PutCondition {
     Unconditional,
     CreateOnly,
     ReplaceOnly,
+}
+
+/// The generated suffix returned by a content-addressed upload.
+#[derive(Clone, Debug, Hash, PartialEq, Eq, PartialOrd, Ord)]
+pub struct ObjectName(String);
+
+impl ObjectName {
+    /// Creates a generated suffix from a 64-character lowercase hexadecimal digest.
+    pub fn new(name: &str) -> Result<Self, String> {
+        if name.len() != SHA256_HEX_LENGTH
+            || !name
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        {
+            return Err("Object name must be a 64-character lowercase hexadecimal digest".to_string());
+        }
+        Ok(Self(name.to_string()))
+    }
+
+    pub(crate) fn from_sha256(digest: &[u8; 32]) -> Self {
+        const HEX: &[u8; 16] = b"0123456789abcdef";
+        let mut name = String::with_capacity(SHA256_HEX_LENGTH);
+        for &byte in digest {
+            name.push(HEX[(byte >> 4) as usize] as char);
+            name.push(HEX[(byte & 0x0f) as usize] as char);
+        }
+        Self(name)
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Display for ObjectName {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum PutKey {
+    Supplied(Key),
+    Sha256 { prefix: String },
+}
+
+pub(crate) fn validate_generated_prefix(prefix: &str) -> Result<(), String> {
+    if !prefix.is_empty() && !prefix.ends_with('/') {
+        return Err("Generated key prefix must end with '/'".to_string());
+    }
+    let key_length = prefix
+        .len()
+        .checked_add(SHA256_HEX_LENGTH)
+        .ok_or_else(|| "Generated key exceeds 1024 UTF-8 bytes".to_string())?;
+    if key_length > MAX_KEY_LENGTH {
+        return Err("Generated key exceeds 1024 UTF-8 bytes".to_string());
+    }
+    Ok(())
+}
+
+pub(crate) fn key_from_sha256(prefix: &str, digest: &[u8; 32]) -> Result<Key, String> {
+    validate_generated_prefix(prefix)?;
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut key = String::with_capacity(prefix.len() + SHA256_HEX_LENGTH);
+    key.push_str(prefix);
+    for &byte in digest {
+        key.push(HEX[(byte >> 4) as usize] as char);
+        key.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    Key::new(&key)
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -318,7 +394,8 @@ pub trait PutContextInterface {
 
 pub trait StoreInterface: Send + Sync + Sized + 'static {
     type Object: ObjectInterface;
-    type PutContext: PutContextInterface + Send + Sync + 'static;
+    type PutContextWithKey: PutContextInterface + Send + Sync + 'static;
+    type PutContextWithGeneratedName: PutContextInterface + Send + Sync + 'static;
 
     fn get(
         &self,
@@ -332,16 +409,30 @@ pub trait StoreInterface: Send + Sync + Sized + 'static {
 
     fn delete(&self, key: &Key) -> impl Future<Output = Result<(), StoreError>> + Send;
 
-    fn put_context(
+    fn put_context_with_key(
         &self,
         key: Key,
         content_type: ContentType,
         condition: PutCondition,
-    ) -> impl Future<Output = Result<Self::PutContext, StoreError>> + Send;
+    ) -> impl Future<Output = Result<Self::PutContextWithKey, StoreError>> + Send;
 
-    /// Atomically creates or replaces an object by the key owned by its context.
-    fn put(
+    /// Atomically publishes an object at its caller-supplied full key.
+    fn put_with_key(
         &self,
-        put_context: Self::PutContext,
+        put_context: Self::PutContextWithKey,
     ) -> impl Future<Output = Result<(), StoreError>> + Send;
+
+    fn put_context_with_generated_name(
+        &self,
+        prefix: String,
+        content_type: ContentType,
+        condition: PutCondition,
+    ) -> impl Future<Output = Result<Self::PutContextWithGeneratedName, StoreError>> + Send;
+
+    /// Atomically publishes an object at `prefix + payload_sha256` and returns
+    /// the generated suffix.
+    fn put_with_generated_name(
+        &self,
+        put_context: Self::PutContextWithGeneratedName,
+    ) -> impl Future<Output = Result<ObjectName, StoreError>> + Send;
 }
