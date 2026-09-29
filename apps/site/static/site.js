@@ -66,6 +66,187 @@ if (sidebarLayout) {
   });
 }
 
+const shareDialog = document.querySelector('#share-dialog');
+
+if (shareDialog) {
+  const closeShareButton = shareDialog.querySelector('.share-dialog-close');
+  const previewFrame = document.querySelector('#share-preview');
+  const fullPreviewLink = document.querySelector('#share-full-preview');
+  const expiryLabel = document.querySelector('#share-expiry');
+  const copyShareButton = document.querySelector('#share-copy');
+  const revokeShareButton = document.querySelector('#share-revoke');
+  const shareStatus = document.querySelector('#share-status');
+  const shareHeading = document.querySelector('#share-dialog-heading');
+  let activeShareButton = null;
+  let currentPostId = null;
+  let currentLink = null;
+  let shareBusy = false;
+  let panelGeneration = 0;
+  let copiedMessageTimer = null;
+
+  function clearShareStatus() {
+    if (copiedMessageTimer) window.clearTimeout(copiedMessageTimer);
+    copiedMessageTimer = null;
+    shareStatus.classList.remove('is-error');
+    shareStatus.textContent = '';
+  }
+
+  function showShareError(message) {
+    clearShareStatus();
+    shareStatus.classList.add('is-error');
+    shareStatus.textContent = message;
+  }
+
+  function showCopiedMessage() {
+    clearShareStatus();
+    shareStatus.textContent = 'Link copied!';
+    copiedMessageTimer = window.setTimeout(() => {
+      shareStatus.textContent = '';
+      copiedMessageTimer = null;
+    }, 3000);
+  }
+
+  function updateShareControls() {
+    copyShareButton.disabled = shareBusy;
+    revokeShareButton.disabled = shareBusy;
+    revokeShareButton.hidden = !currentLink;
+  }
+
+  function showExpiry(link) {
+    const expiresAt = Number(link.expires_at_unix);
+    if (!Number.isFinite(expiresAt)) {
+      expiryLabel.textContent = 'Expiry unavailable.';
+    } else {
+      const date = new Date(expiresAt * 1000);
+      expiryLabel.textContent = Number.isNaN(date.getTime())
+        ? 'Expiry unavailable.'
+        : `Link expires ${new Intl.DateTimeFormat(undefined, { dateStyle: 'medium', timeStyle: 'short' }).format(date)}.`;
+    }
+    expiryLabel.hidden = false;
+  }
+
+  function resetSharePanel() {
+    currentLink = null;
+    currentPostId = null;
+    expiryLabel.hidden = true;
+    expiryLabel.textContent = '';
+    revokeShareButton.hidden = true;
+    clearShareStatus();
+    fullPreviewLink.href = '#';
+    previewFrame.removeAttribute('src');
+    updateShareControls();
+  }
+
+  async function copyShareLink() {
+    if (shareBusy || !currentPostId) return;
+    shareBusy = true;
+    const generation = panelGeneration;
+    clearShareStatus();
+    updateShareControls();
+
+    try {
+      if (!currentLink) {
+        const response = await fetch(`/api/posts/${encodeURIComponent(currentPostId)}/share-links`, {
+          method: 'POST',
+          headers: { Accept: 'application/json' },
+        });
+        if (generation !== panelGeneration) return;
+        if (response.status === 401) {
+          redirectToLogin();
+          return;
+        }
+        if (!response.ok) throw new Error('create');
+        const link = await response.json();
+        if (generation !== panelGeneration) return;
+        if (typeof link.id !== 'string' || typeof link.url !== 'string' || !link.url) {
+          throw new Error('create');
+        }
+        currentLink = link;
+        showExpiry(link);
+        updateShareControls();
+      }
+
+      try {
+        await navigator.clipboard.writeText(currentLink.url);
+      } catch (_) {
+        if (generation === panelGeneration) {
+          showShareError('Could not copy the link. Check clipboard permissions and try again.');
+        }
+        return;
+      }
+      if (generation === panelGeneration) showCopiedMessage();
+    } catch (_) {
+      if (generation === panelGeneration) showShareError('Could not create the share link. Try again.');
+    } finally {
+      shareBusy = false;
+      updateShareControls();
+    }
+  }
+
+  async function revokeShareLink() {
+    if (shareBusy || !currentLink) return;
+    shareBusy = true;
+    const generation = panelGeneration;
+    clearShareStatus();
+    updateShareControls();
+
+    try {
+      const response = await fetch(`/api/share-links/${encodeURIComponent(currentLink.id)}`, {
+        method: 'DELETE',
+      });
+      if (generation !== panelGeneration) return;
+      if (response.status === 401) {
+        redirectToLogin();
+        return;
+      }
+      if (!response.ok) throw new Error('revoke');
+      currentLink = null;
+      expiryLabel.hidden = true;
+      expiryLabel.textContent = '';
+      revokeShareButton.hidden = true;
+      shareStatus.textContent = 'Link revoked.';
+    } catch (_) {
+      if (generation === panelGeneration) showShareError('Could not revoke the link. Try again.');
+    } finally {
+      shareBusy = false;
+      updateShareControls();
+    }
+  }
+
+  document.addEventListener('click', event => {
+    if (!(event.target instanceof Element)) return;
+    const shareButton = event.target.closest('[data-share-post]');
+    if (!shareButton) return;
+
+    panelGeneration += 1;
+    resetSharePanel();
+    activeShareButton = shareButton;
+    currentPostId = shareButton.dataset.sharePost;
+    const post = shareButton.closest('.post');
+    const title = post?.querySelector('h1')?.textContent?.trim();
+    shareHeading.textContent = title ? `Share “${title}”` : 'Share post';
+    const previewUrl = `/posts/${encodeURIComponent(currentPostId)}/share-preview`;
+    fullPreviewLink.href = previewUrl;
+    previewFrame.src = previewUrl;
+    updateShareControls();
+    shareDialog.showModal();
+    closeShareButton.focus({ preventScroll: true });
+  });
+
+  copyShareButton.addEventListener('click', copyShareLink);
+  revokeShareButton.addEventListener('click', revokeShareLink);
+  closeShareButton.addEventListener('click', () => shareDialog.close());
+  shareDialog.addEventListener('click', event => {
+    if (event.target === shareDialog) shareDialog.close();
+  });
+  shareDialog.addEventListener('close', () => {
+    panelGeneration += 1;
+    resetSharePanel();
+    if (activeShareButton?.isConnected) activeShareButton.focus({ preventScroll: true });
+    activeShareButton = null;
+  });
+}
+
 const feed = document.querySelector('#feed');
 
 if (feed) {

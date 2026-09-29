@@ -245,6 +245,8 @@ pub struct PostBlock {
 pub struct Post {
     #[serde(flatten)]
     pub summary: PostSummary,
+    #[serde(skip)]
+    pub published: bool,
     pub tags: Vec<String>,
     pub blocks: Vec<PostBlock>,
 }
@@ -277,6 +279,7 @@ pub struct MediaReference {
 #[derive(Clone, Debug)]
 pub struct ShareLinkCreated {
     pub id: String,
+    pub expires_at_unix: i64,
 }
 
 #[derive(Clone, Debug)]
@@ -568,7 +571,10 @@ impl Database {
                 params![id, post_id, token_digest, created_at_seconds, expires_at_seconds],
             )?;
             transaction.commit()?;
-            Ok(Some(ShareLinkCreated { id }))
+            Ok(Some(ShareLinkCreated {
+                id,
+                expires_at_unix: expires_at_seconds,
+            }))
         })
         .await
     }
@@ -1024,7 +1030,7 @@ fn load_post(
 ) -> rusqlite::Result<Option<Post>> {
     let post_row = connection
         .query_row(
-            "SELECT id, title, published_at, summary, tags FROM posts WHERE id = ?1 AND (?2 = 1 OR published = 1)",
+            "SELECT id, title, published_at, summary, tags, published FROM posts WHERE id = ?1 AND (?2 = 1 OR published = 1)",
             params![id, access.includes_drafts()],
             |row| {
                 let tags_json: String = row.get(4)?;
@@ -1035,11 +1041,11 @@ fn load_post(
                         Box::new(error),
                     )
                 })?;
-                Ok((post_summary_from_row(row)?, tags))
+                Ok((post_summary_from_row(row)?, tags, row.get::<_, bool>(5)?))
             },
         )
         .optional()?;
-    let Some((summary, tags)) = post_row else {
+    let Some((summary, tags, published)) = post_row else {
         return Ok(None);
     };
 
@@ -1077,7 +1083,12 @@ fn load_post(
     for block in &mut blocks {
         block.children = children.remove(&block.id).unwrap_or_default();
     }
-    Ok(Some(Post { summary, tags, blocks }))
+    Ok(Some(Post {
+        summary,
+        published,
+        tags,
+        blocks,
+    }))
 }
 
 fn account_role_from_db(value: &str) -> rusqlite::Result<AccountRole> {

@@ -378,6 +378,161 @@ body.sidebar-modal-open {
   margin-bottom: 2rem;
 }
 
+.post-date-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.75rem;
+}
+
+.post-share-button,
+.share-copy-button,
+.share-revoke-button {
+  padding: 0.38rem 0.75rem;
+  border: 1px solid #65695f;
+  border-radius: 0.2rem;
+  background: #20231f;
+  color: #f0efe9;
+  font: inherit;
+  font-size: 0.88rem;
+  cursor: pointer;
+}
+
+.post-share-button:hover,
+.share-copy-button:hover,
+.share-revoke-button:hover {
+  border-color: #d2b17b;
+  background: #2a2c26;
+}
+
+.share-dialog {
+  position: fixed;
+  width: min(94vw, 54rem);
+  max-width: none;
+  max-height: 94vh;
+  overflow: auto;
+  padding: 2.6rem 1.25rem 1.25rem;
+  border: 1px solid #50544d;
+  border-radius: 0.3rem;
+  background: #171a17;
+  color: #ecece6;
+  box-shadow: 0 1.5rem 4rem rgb(0 0 0 / 45%);
+}
+
+.share-dialog::backdrop {
+  background: rgb(0 0 0 / 78%);
+}
+
+.share-dialog h2 {
+  margin: 0 0 0.8rem;
+  font-size: 1.35rem;
+  font-weight: 580;
+}
+
+.share-dialog-close {
+  position: absolute;
+  top: 0.45rem;
+  right: 0.5rem;
+  width: 2.2rem;
+  height: 2.2rem;
+  border: 1px solid #555a53;
+  border-radius: 50%;
+  background: #20231f;
+  color: #f0efe9;
+  font-size: 1.4rem;
+  line-height: 1;
+  cursor: pointer;
+}
+
+.share-dialog-close:hover {
+  border-color: #d2b17b;
+  background: #2a2c26;
+}
+
+.share-preview-actions {
+  margin: 0 0 0.55rem;
+  font-size: 0.9rem;
+}
+
+.share-preview-frame {
+  height: min(45vh, 30rem);
+  min-height: 14rem;
+  overflow: hidden;
+  border: 1px solid #3f443e;
+  background: #111311;
+}
+
+.share-preview-frame iframe {
+  display: block;
+  width: 100%;
+  height: 100%;
+  border: 0;
+  background: #111311;
+}
+
+.share-expiry-slot {
+  box-sizing: border-box;
+  min-height: 2.5rem;
+  padding-top: 0.75rem;
+}
+
+.share-expiry {
+  margin: 0;
+  color: #b8bbb4;
+  font-size: 0.86rem;
+}
+
+.share-controls {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 0.75rem;
+  margin-top: 1rem;
+}
+
+.share-copy-row {
+  display: flex;
+  align-items: center;
+  gap: 0.7rem;
+  width: 100%;
+}
+
+.share-copy-button {
+  padding: 0.55rem 0.9rem;
+  font-size: 0.95rem;
+}
+
+.share-copy-button:disabled,
+.share-revoke-button:disabled {
+  color: #858981;
+  cursor: wait;
+}
+
+.share-revoke-button {
+  border-color: #77564d;
+  color: #e8b8aa;
+}
+
+.share-revoke-slot {
+  min-height: 2.25rem;
+}
+
+.share-revoke-button:hover {
+  border-color: #ce8f80;
+  background: #2b211f;
+}
+
+.share-status {
+  min-width: 0;
+  min-height: 1.5em;
+  color: #c9d8b9;
+  font-size: 0.9rem;
+}
+
+.share-status.is-error {
+  color: #f0b6a8;
+}
+
 h1,
 h2,
 h3 {

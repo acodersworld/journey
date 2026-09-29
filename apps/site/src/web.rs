@@ -4,7 +4,7 @@ use axum::{
     http::{header, HeaderMap, HeaderValue, Method, StatusCode, Uri},
     middleware::{self, Next},
     response::{Html, IntoResponse, Response},
-    routing::{get, post},
+    routing::{delete, get, post},
     Json, Router,
 };
 use serde::{Deserialize, Serialize};
@@ -68,6 +68,13 @@ struct LoginPageQuery {
 struct CurrentAccountResponse {
     username: String,
     role: AccountRole,
+}
+
+#[derive(Serialize)]
+struct CreatedShareLinkResponse {
+    id: String,
+    url: String,
+    expires_at_unix: i64,
 }
 
 #[derive(Deserialize)]
@@ -145,7 +152,10 @@ pub fn router<S: StorageClient>(state: AppState<S>) -> Router {
         .route("/archive/{month}", get(archive_page::<S>))
         .route("/api/posts", get(feed::<S>))
         .route("/api/posts/{id}", get(api_full_post::<S>))
+        .route("/api/posts/{id}/share-links", post(create_share_link::<S>))
+        .route("/api/share-links/{id}", delete(revoke_share_link::<S>))
         .route("/posts/{id}/fragment", get(post_fragment::<S>))
+        .route("/posts/{id}/share-preview", get(share_preview::<S>))
         .route("/posts/{id}", get(post_page::<S>))
         .route(
             "/posts/{post_id}/blocks/{block_id}/media",
@@ -285,6 +295,99 @@ async fn shared_media<S: StorageClient>(
         }
     };
     no_store(proxy_media(&state.storage, media, method, headers).await)
+}
+
+async fn share_preview<S: StorageClient>(
+    State(state): State<AppState<S>>,
+    Path(id): Path<i64>,
+    Extension(principal): Extension<AuthPrincipal>,
+) -> Response {
+    if principal.role != AccountRole::Owner {
+        return no_store(StatusCode::FORBIDDEN.into_response());
+    }
+    match state.database.post_with_access(id, PostAccess::Owner).await {
+        Ok(Some(post)) if post.published => {
+            no_store(Html(render_shared_post(&post, "")).into_response())
+        }
+        Ok(_) => no_store(StatusCode::NOT_FOUND.into_response()),
+        Err(error) => {
+            eprintln!("website share preview lookup failed: {error}");
+            no_store(StatusCode::INTERNAL_SERVER_ERROR.into_response())
+        }
+    }
+}
+
+async fn create_share_link<S: StorageClient>(
+    State(state): State<AppState<S>>,
+    Path(post_id): Path<i64>,
+    Extension(principal): Extension<AuthPrincipal>,
+    headers: HeaderMap,
+) -> Response {
+    let Some(origin) = validated_request_origin(&headers, &state.security) else {
+        return no_store((StatusCode::FORBIDDEN, "origin not allowed\n").into_response());
+    };
+    if principal.role != AccountRole::Owner {
+        return no_store(StatusCode::FORBIDDEN.into_response());
+    }
+
+    let link_id = auth::new_share_link_id();
+    let secret = auth::new_share_link_secret();
+    match state
+        .database
+        .create_share_link(
+            link_id,
+            post_id,
+            auth::session_token_digest(&secret),
+            unix_time(),
+        )
+        .await
+    {
+        Ok(Some(link)) => no_store(
+            Json(CreatedShareLinkResponse {
+                url: format!("{}/share/{}/{}", origin.key, link.id, secret),
+                id: link.id,
+                expires_at_unix: link.expires_at_unix,
+            })
+            .into_response(),
+        ),
+        Ok(None) => no_store(StatusCode::NOT_FOUND.into_response()),
+        Err(error) => {
+            eprintln!("website share-link creation failed: {error}");
+            no_store(StatusCode::INTERNAL_SERVER_ERROR.into_response())
+        }
+    }
+}
+
+async fn revoke_share_link<S: StorageClient>(
+    State(state): State<AppState<S>>,
+    Path(id): Path<String>,
+    Extension(principal): Extension<AuthPrincipal>,
+    headers: HeaderMap,
+) -> Response {
+    if !origin_allowed(&headers, &state.security) {
+        return no_store((StatusCode::FORBIDDEN, "origin not allowed\n").into_response());
+    }
+    if principal.role != AccountRole::Owner {
+        return no_store(StatusCode::FORBIDDEN.into_response());
+    }
+    if !valid_share_link_id(&id) {
+        return no_store(StatusCode::NOT_FOUND.into_response());
+    }
+    match state.database.revoke_share_link(id, unix_time()).await {
+        Ok(true) => no_store(StatusCode::NO_CONTENT.into_response()),
+        Ok(false) => no_store(StatusCode::NOT_FOUND.into_response()),
+        Err(error) => {
+            eprintln!("website share-link revocation failed: {error}");
+            no_store(StatusCode::INTERNAL_SERVER_ERROR.into_response())
+        }
+    }
+}
+
+fn valid_share_link_id(id: &str) -> bool {
+    id.len() == 22
+        && id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
 }
 
 fn share_not_found() -> Response {
@@ -627,20 +730,25 @@ fn expire_session_cookie(response: &mut Response, security: &SiteSecurity) {
     }
 }
 
-fn origin_allowed(headers: &HeaderMap, security: &SiteSecurity) -> bool {
+fn validated_request_origin(headers: &HeaderMap, security: &SiteSecurity) -> Option<ParsedOrigin> {
     let Some(origin_header) = headers.get(header::ORIGIN) else {
-        return false;
+        return None;
     };
     let Ok(origin_value) = origin_header.to_str() else {
-        return false;
+        return None;
     };
     let Some(origin) = parse_origin(origin_value) else {
-        return false;
+        return None;
     };
     match &security.public_origin {
-        Some(configured) => origin.key == configured.key,
-        None => origin.scheme == "http" && origin.is_loopback(),
+        Some(configured) if origin.key == configured.key => Some(origin),
+        None if origin.scheme == "http" && origin.is_loopback() => Some(origin),
+        _ => None,
     }
+}
+
+fn origin_allowed(headers: &HeaderMap, security: &SiteSecurity) -> bool {
+    validated_request_origin(headers, security).is_some()
 }
 
 fn parse_origin(value: &str) -> Option<ParsedOrigin> {
@@ -848,6 +956,7 @@ async fn home<S: StorageClient>(
                 initial_post.as_ref(),
                 next_cursor,
                 &principal.username,
+                principal.role == AccountRole::Owner,
             ))
             .into_response()
         }
@@ -891,6 +1000,7 @@ async fn tag_page<S: StorageClient>(
                 initial_post.as_ref(),
                 next_cursor,
                 &principal.username,
+                principal.role == AccountRole::Owner,
             ))
                 .into_response()
         }
@@ -955,7 +1065,13 @@ async fn post_page<S: StorageClient>(
                     return StatusCode::INTERNAL_SERVER_ERROR.into_response();
                 }
             };
-            Html(render_full_post(&sidebar, &post, &principal.username)).into_response()
+            Html(render_full_post(
+                &sidebar,
+                &post,
+                &principal.username,
+                principal.role == AccountRole::Owner,
+            ))
+            .into_response()
         }
         Ok(None) => StatusCode::NOT_FOUND.into_response(),
         Err(error) => {
@@ -971,7 +1087,12 @@ async fn post_fragment<S: StorageClient>(
     Extension(principal): Extension<AuthPrincipal>,
 ) -> Response {
     match state.database.post_with_access(id, principal.post_access()).await {
-        Ok(Some(post)) => Html(pretty_html(&render_post(&post, false))).into_response(),
+        Ok(Some(post)) => Html(pretty_html(&render_post(
+            &post,
+            false,
+            principal.role == AccountRole::Owner,
+        )))
+        .into_response(),
         Ok(None) => StatusCode::NOT_FOUND.into_response(),
         Err(error) => {
             eprintln!("website post fragment query failed: {error}");
@@ -1042,10 +1163,10 @@ fn valid_archive_month(value: &str) -> bool {
         && value[5..7].parse::<u32>().is_ok_and(|month| (1..=12).contains(&month))
 }
 
-fn render_full_post(sidebar: &SidebarData, post: &Post, username: &str) -> String {
+fn render_full_post(sidebar: &SidebarData, post: &Post, username: &str, is_owner: bool) -> String {
     let content = format!(
         "<main class=\"site site-post\"><p class=\"back-link\"><a href=\"/\">All posts</a></p>{}</main>",
-        render_post(post, true),
+        render_post(post, true, is_owner),
     );
     render_site_page(&post.summary.title, sidebar, &content, true, username)
 }
@@ -1053,7 +1174,7 @@ fn render_full_post(sidebar: &SidebarData, post: &Post, username: &str) -> Strin
 fn render_shared_post(post: &Post, share_prefix: &str) -> String {
     let content = format!(
         "<main class=\"site site-feed\">{}</main>",
-        render_post_with_media_prefix(post, true, Some(share_prefix)),
+        render_post_with_media_prefix(post, true, Some(share_prefix), false),
     );
     pretty_html(&format!(
         "<!doctype html><html lang=\"en\"><head>{}</head><body><div class=\"site-layout\">{content}</div>{}</body></html>",
@@ -1067,13 +1188,14 @@ fn render_home(
     initial_post: Option<&Post>,
     next_cursor: Option<&str>,
     username: &str,
+    is_owner: bool,
 ) -> String {
     let mut feed = format!(
         "<section id=\"feed\" aria-label=\"Posts\" data-next-cursor=\"{}\">",
         escape_html(next_cursor.unwrap_or("")),
     );
     if let Some(post) = initial_post {
-        feed.push_str(&render_post(post, true));
+        feed.push_str(&render_post(post, true, is_owner));
     } else {
         feed.push_str("<p class=\"empty-feed\">No published posts yet.</p>");
     }
@@ -1088,6 +1210,7 @@ fn render_tag_feed(
     initial_post: Option<&Post>,
     next_cursor: Option<&str>,
     username: &str,
+    is_owner: bool,
 ) -> String {
     let mut feed = format!(
         "<section id=\"feed\" aria-label=\"Posts tagged {}\" data-next-cursor=\"{}\" data-tag=\"{}\">",
@@ -1096,7 +1219,7 @@ fn render_tag_feed(
         escape_html(tag),
     );
     if let Some(post) = initial_post {
-        feed.push_str(&render_post(post, true));
+        feed.push_str(&render_post(post, true, is_owner));
     } else {
         feed.push_str("<p class=\"empty-feed\">No published posts have this tag.</p>");
     }
@@ -1164,12 +1287,13 @@ fn render_site_page(
 ) -> String {
     let slideshow = if include_slideshow { SLIDESHOW_HTML } else { "" };
     let html = format!(
-        "<!doctype html><html lang=\"en\"><head>{}</head><body><div class=\"site-layout\" id=\"site-layout\"><button class=\"sidebar-toggle\" id=\"sidebar-toggle\" type=\"button\" aria-controls=\"site-sidebar\" aria-expanded=\"false\" aria-label=\"Open sidebar\"><span aria-hidden=\"true\">›</span></button><button class=\"sidebar-backdrop\" id=\"sidebar-backdrop\" type=\"button\" aria-label=\"Close sidebar\" hidden></button>{}{}{}</div>{}</body></html>",
+        "<!doctype html><html lang=\"en\"><head>{}</head><body><div class=\"site-layout\" id=\"site-layout\"><button class=\"sidebar-toggle\" id=\"sidebar-toggle\" type=\"button\" aria-controls=\"site-sidebar\" aria-expanded=\"false\" aria-label=\"Open sidebar\"><span aria-hidden=\"true\">›</span></button><button class=\"sidebar-backdrop\" id=\"sidebar-backdrop\" type=\"button\" aria-label=\"Close sidebar\" hidden></button>{}{}{}</div>{}{}</body></html>",
         html_head(title),
         render_sidebar(sidebar),
         render_account_controls(username),
         content,
         slideshow,
+        SHARE_DIALOG_HTML,
     );
     pretty_html(&html)
 }
@@ -1265,21 +1389,31 @@ fn encode_url_component(value: &str) -> String {
     encoded
 }
 
-fn render_post(post: &Post, prioritize_first_image: bool) -> String {
-    render_post_with_media_prefix(post, prioritize_first_image, None)
+fn render_post(post: &Post, prioritize_first_image: bool, is_owner: bool) -> String {
+    render_post_with_media_prefix(post, prioritize_first_image, None, is_owner)
 }
 
 fn render_post_with_media_prefix(
     post: &Post,
     prioritize_first_image: bool,
     media_prefix: Option<&str>,
+    is_owner: bool,
 ) -> String {
+    let share_control = if is_owner && post.published {
+        format!(
+            "<button class=\"post-share-button\" type=\"button\" data-share-post=\"{}\" aria-haspopup=\"dialog\" aria-controls=\"share-dialog\">Share</button>",
+            post.summary.id,
+        )
+    } else {
+        String::new()
+    };
     format!(
-        "<article class=\"post\" data-post-id=\"{}\"><header class=\"post-header\"><h1>{}</h1><time datetime=\"{}\">{}</time><p class=\"summary\">{}</p></header>{}{}</article>",
+        "<article class=\"post\" data-post-id=\"{}\"><header class=\"post-header\"><h1>{}</h1><div class=\"post-date-row\"><time datetime=\"{}\">{}</time>{}</div><p class=\"summary\">{}</p></header>{}{}</article>",
         post.summary.id,
         escape_html(&post.summary.title),
         escape_html(&post.summary.published_at),
         escape_html(&post.summary.published_at),
+        share_control,
         escape_html(&post.summary.summary),
         render_tags_html(&post.tags, media_prefix.is_some()),
         render_post_blocks_html(post, prioritize_first_image, media_prefix),
@@ -1628,6 +1762,8 @@ fn pretty_html(markup: &str) -> String {
 }
 
 const SLIDESHOW_HTML: &str = "<dialog id=\"slideshow\" class=\"slideshow\" aria-label=\"Photo slideshow\"><button class=\"slideshow-close\" type=\"button\" aria-label=\"Close slideshow\">×</button><div class=\"slideshow-stage\"><button class=\"slideshow-nav slideshow-previous\" type=\"button\" aria-label=\"Previous item\">‹</button><div class=\"slideshow-media\" id=\"slideshow-media\"></div><button class=\"slideshow-nav slideshow-next\" type=\"button\" aria-label=\"Next item\">›</button></div><p class=\"slideshow-label\" id=\"slideshow-label\"></p><p class=\"slideshow-caption\" id=\"slideshow-caption\"></p></dialog>";
+
+const SHARE_DIALOG_HTML: &str = "<dialog id=\"share-dialog\" class=\"share-dialog\" aria-labelledby=\"share-dialog-heading\"><button class=\"share-dialog-close\" type=\"button\" aria-label=\"Close share panel\">×</button><h2 id=\"share-dialog-heading\">Share post</h2><div class=\"share-preview-actions\"><a id=\"share-full-preview\" href=\"#\" target=\"_blank\" rel=\"noopener\">Open full preview</a></div><div class=\"share-preview-frame\"><iframe id=\"share-preview\" title=\"Guest page preview\" loading=\"lazy\"></iframe></div><div class=\"share-expiry-slot\"><p class=\"share-expiry\" id=\"share-expiry\" hidden></p></div><div class=\"share-controls\"><div class=\"share-copy-row\"><button class=\"share-copy-button\" id=\"share-copy\" type=\"button\">Copy share link</button><span class=\"share-status\" id=\"share-status\" role=\"status\" aria-live=\"polite\"></span></div><div class=\"share-revoke-slot\"><button class=\"share-revoke-button\" id=\"share-revoke\" type=\"button\" hidden>Revoke link</button></div></div></dialog>";
 
 const SITE_CSS: &str = include_str!("../static/site.css");
 const SITE_JS: &str = include_str!("../static/site.js");
@@ -2129,6 +2265,7 @@ mod tests {
                 published_at: "2026-01-01".to_owned(),
                 summary: "A <summary>".to_owned(),
             },
+            published: true,
             tags: vec!["<tag>".to_owned()],
             blocks: vec![
                 PostBlock {
@@ -2177,7 +2314,7 @@ mod tests {
                 },
             ],
         };
-        let html = render_full_post(&SidebarData::default(), &post, "owner");
+        let html = render_full_post(&SidebarData::default(), &post, "owner", true);
         assert!(html.contains("<p class=\"tags\">"));
         assert!(html.contains("class=\"tag-label\">Tags:</span>"));
         assert!(html.contains("href=\"/tags?tag=%3Ctag%3E\">&lt;tag&gt;</a>"));
