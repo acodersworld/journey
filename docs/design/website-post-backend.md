@@ -1,6 +1,6 @@
 # Website post backend
 
-**Status:** Implemented local backend and account authentication
+**Status:** Implemented local backend and authenticated website UI
 **Updated:** 29 September 2026
 
 ## Runtime data
@@ -13,9 +13,10 @@ fields. A row with children is a group; groups can contain only one level of
 children and can also have their own text and media. The content type identifies
 image and video media. A migration maps legacy headings to headers, paragraphs
 to bodies, and media captions to bodies; migrated posts receive empty tag
-arrays. Imported posts are always published. The published flag is checked by
-public post and media lookups so a later draft feature can keep unpublished
-media inaccessible through these routes.
+arrays. Imported posts are always published. All post and media lookups require
+a session: readers can access published posts, while the owner can also access
+drafts through direct post and media URLs. Feeds and navigation lists contain
+published posts only.
 
 Post and block IDs are regenerated on each full import. They remain stable for
 in-place edits. Feed ordering is publication date descending, then ID
@@ -87,11 +88,12 @@ pagination path, passing the selected tag through every API request. Post tags
 link to their exact-case filtered feed. `/archive/{YYYY-MM}` lists published
 post titles, dates, and summaries for the selected month.
 
-Every public HTML page shares a server-rendered navigation sidebar. It lists the
-five newest published posts, distinct published archive months in descending
-order, and distinct published tags in case-insensitive alphabetical order
-while preserving their stored spelling. The archive list starts with six
-months and the tag list with twelve entries; browser controls reveal the rest.
+Every signed-in HTML page shares a server-rendered navigation sidebar. It
+lists the five newest published posts, distinct published archive months in
+descending order, and distinct published tags in case-insensitive alphabetical
+order while preserving their stored spelling. The archive list starts with
+six months and the tag list with twelve entries; browser controls reveal the
+rest.
 The sidebar starts closed on each page load. At every screen width it opens as
 a fixed drawer over the page, leaving the reading column and chevron in place.
 A backdrop dims the page; the chevron, backdrop, and Escape close the drawer.
@@ -112,7 +114,7 @@ first image and lazy-load later images. Direct pages and fragments reuse the
 same original-media URLs; image resizing, format conversion, and variants are
 deferred.
 
-HTML text and attributes are escaped. Image and video blocks use public media
+HTML text and attributes are escaped. Image and video blocks use site media
 URLs that identify a post and block ID, never a storage key. The backend
 confirms the block belongs to an accessible post and is media before asking
 storage for it. It streams response bodies and forwards single byte ranges for

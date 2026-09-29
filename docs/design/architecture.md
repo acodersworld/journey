@@ -6,6 +6,15 @@
 **First implementation:** [Vertical Slice 01: HTTP/2 over WebSocket Object Download](vertical-slice-01-http2-over-websocket.md)  
 **Later transport work:** [Deferred crate extraction](../deferred/h2-over-websocket-crate-extraction.md)
 
+The current local website differs from parts of this exploratory draft: every
+post and media request requires an account session, published posts are visible
+to signed-in readers, and drafts are owner-only. Its server-rendered sign-in
+page, feed, and sidebar are described in the
+[implemented website design](website-post-backend.md). References below to a
+public post feed or public-media cache describe earlier or possible future
+architecture, not anonymous access in the current site. The media cache and
+production WebSocket integration are not implemented in `journey-site`.
+
 ## 1. Project idea
 
 Journey is an online publishing system conceptually similar to WordPress. It will use a small public-facing AWS server for the website and a more capable home server for durable picture and video storage.

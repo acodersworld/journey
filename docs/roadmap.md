@@ -3,8 +3,9 @@
 **Status:** Active planning
 **Created:** 23 September 2026
 **Current position:** The transport, filesystem-backed object store, SQLite
-post backend, and public scrolling feed are implemented. The sidebar is next;
-storage diagnostics and administration remain deferred.
+post backend, scrolling feed, sidebar, and account sign-in UI are implemented
+locally. The authoring backend is next; storage diagnostics and administration
+remain deferred.
 
 ## 1. Direction
 
@@ -22,8 +23,9 @@ major milestones:
    HTTPS with HTTP/2.
 
 The storage interface and filesystem-backed implementation are documented in
-the completed plans below. Earlier evaluation of existing storage software
-preceded the decision to build this store.
+the [current storage design](design/current-object-storage.md). Earlier
+evaluation of existing storage software preceded the decision to build this
+store.
 
 ## 2. Transport boundary
 
@@ -222,10 +224,13 @@ Milestone 1 is complete when:
 - Cancellation and storage-unavailable behavior are predictable.
 - No object-storage behavior has leaked into `journey-websocket`.
 
-## 4. Milestone 2: basic HTML website over HTTP/2
+## 4. Original milestone 2: basic HTML website over HTTP/2
 
-Build the smallest public website demonstrating that the object-storage
-service is useful.
+This section records the original fixed-page prototype scope. The current
+website is an authenticated post feed with a sidebar and account sign-in;
+[its implemented design](design/website-post-backend.md) supersedes the
+fixed-page behavior below. Posts and their media are not anonymously
+accessible.
 
 ### 4.1 Website boundary
 
@@ -296,25 +301,24 @@ operations to public browsers.
 
 ## 5. Next website work
 
-The initial fixed-page milestone has grown into a SQLite-backed post backend
-and a server-rendered, scrolling public feed. The next work is ordered as
-follows:
+The local site now has a SQLite-backed post backend, a server-rendered scrolling
+feed, a sidebar, and owner/reader sessions with a browser sign-in form. Every
+post and media request requires a session. Readers see published posts; the
+owner can also open drafts directly. The next work is ordered as follows:
 
-1. **Sidebar — next.** Add public navigation within the existing website UI.
-   Settle its contents and responsive behavior in a focused plan before
-   implementation.
-2. **Users and authentication.** Establish account identity, sessions, and
-   authorization rules, including access to unpublished posts and their media.
-3. **Post creation and editing.** Build the draft, media-upload, and publish
-   workflow using those authorization rules.
-4. **Video thumbnail previews.** Generate or store preview images and show
+1. **Post creation and editing backend — next.** Define draft creation and
+   updates, media uploads and references, and publish/unpublish operations
+   under the existing owner authorization. Plan how this coexists with the
+   current manifest importer before implementing it.
+2. **Authoring UI.** Add the browser workflow for drafting, uploading, editing,
+   and publishing on top of the authoring backend.
+3. **Video thumbnail previews.** Generate or store preview images and show
    them on gallery tiles; videos remain playable without previews meanwhile.
-5. **Automatic gallery slideshow.** Add optional timed advance to the existing
+4. **Automatic gallery slideshow.** Add optional timed advance to the existing
    manual slideshow, with pause controls and sensible video behavior.
 
-The sidebar and video thumbnails have no dependency on the authentication
-design. Post creation does: draft and unpublished-media access must be defined
-before editing routes are exposed.
+Temporary links granting access to one published post remain future work;
+they must not grant draft access.
 
 ## 6. Later horizons
 
@@ -337,7 +341,8 @@ before editing routes are exposed.
   backup.
 - The filesystem-backed object store and its write semantics are documented in
   the current object-storage design.
-- The public website uses server-rendered HTML and small browser scripts.
-- Published posts are public; draft editing and unpublished-media access await
-  the user and authentication design.
-- Initial media is streamed from home without an AWS cache.
+- The website uses server-rendered HTML and small browser scripts.
+- Every post and media request requires a session. Readers see published posts;
+  only the owner can access drafts by direct URL. There is no post editor yet.
+- The local website streams original media from the storage service and has no
+  AWS media cache.

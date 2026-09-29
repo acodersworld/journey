@@ -2,10 +2,10 @@
 
 This workspace contains the bounded HTTP/2-over-WebSocket transport, the
 disposable gateway/home validation applications, and a separate local
-`journey-site` post backend. The gateway owns public validation routes, site
-Basic Authentication, and proxy backpressure. The home agent owns the
-read-only media fixtures and digest-named upload storage. Application routes
-and storage behavior remain outside `journey-websocket`.
+`journey-site` website and post backend. The validation gateway owns its
+prototype routes, Basic Authentication, and proxy backpressure. The home agent
+owns the read-only media fixtures and digest-named upload storage. Application
+routes and storage behavior remain outside `journey-websocket`.
 
 The deployment bundle and teardown procedure are in `deploy/README.md`.
 Use `scripts/aws-home-real-world-validation.sh` with the browser and lifecycle
@@ -30,7 +30,7 @@ local development. The AWS bundle uses Nginx, TLS, HTTP/2, and WSS instead.
 Use credentials from the environment file when calling `/health` or the media
 routes.
 
-## Website post backend
+## Website post backend and UI
 
 The `journey-site` application imports a JSON manifest into SQLite and serves
 post and media routes to authenticated accounts. Start the storage example
@@ -75,10 +75,15 @@ Import and run the website backend in another terminal:
 cargo run -p journey-site -- import ./posts.json
 cargo run -p journey-site -- db posts
 cargo run -p journey-site -- users create owner owner
-cargo run -p journey-site -- users create reader alice
+cargo run -p journey-site -- users create alice reader
 cargo run -p journey-site -- users list
 cargo run -p journey-site -- serve
 ```
+
+Open `http://127.0.0.1:8080/` and sign in with the owner or reader account.
+The server-rendered sign-in form works without JavaScript. After sign-in, the
+browser returns to the requested post or feed page. Signed-in pages show the
+username and a Sign out button at the top right.
 
 Account creation and password changes prompt for a password twice without
 echoing it. Passwords are not accepted as command-line arguments. The CLI also
@@ -111,17 +116,24 @@ an `Origin` matching the configured public origin (or a loopback HTTP origin
 for local development). Login accepts a JSON object with `username` and
 `password`, returns the current account JSON, and sets the session cookie.
 `GET /api/auth/current` returns that account, and logout returns `204` after
-revoking the cookie's session. All content and media routes require the cookie;
-anonymous requests receive `401`. Readers see published content, while the
-owner can also read drafts by direct post, fragment, API, and media URLs.
-Feeds, tags, archives, and sidebar lists include published posts only.
+revoking the cookie's session. The browser also has `GET` and `POST /login` and
+`POST /logout` form routes. All content and media require the session cookie.
+Unauthenticated HTML page requests redirect to `/login` with a validated local
+return path. Protected APIs, post fragments, and media requests return `401`.
+The login page, CSS, and JavaScript load without a session. Readers see
+published content, while the owner can also read drafts by direct post,
+fragment, API, and media URLs. Feeds, tags, archives, and sidebar lists include
+published posts only. There is no anonymous access to posts or
+their media.
 
 The authenticated feed is server-rendered at `GET /`; its browser script loads
-more previews from `GET /api/posts`, which defaults to 10 and accepts a maximum
-`limit` of 100.
-Feed responses include `posts` and a `next_cursor`; pass that cursor as `after`
-to request the next page. `GET /api/posts/{id}` returns tags and nested full
-content as JSON, and the normal link `GET /posts/{id}` renders it as HTML.
+additional full posts near the end of the page. It uses `GET /api/posts` to find
+the next post and `GET /posts/{id}/fragment` to append its HTML. The API
+defaults to 10 summaries and accepts a maximum `limit` of 100. Feed responses
+include `posts` and a `next_cursor`; pass that cursor as `after` to request the
+next page. `GET /api/posts/{id}` returns tags and nested full content as JSON,
+and the normal link `GET /posts/{id}` renders it as HTML. The collapsible
+sidebar links to recent posts, monthly archives, and tag-filtered feeds.
 Media is served only through `GET` or `HEAD /posts/{id}/blocks/{block_id}/media`.
 Video requests forward one byte range to storage.
 `journey-site --help`, `journey-site db`, and `journey-site users --help` list
