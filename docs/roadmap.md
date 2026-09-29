@@ -2,9 +2,9 @@
 
 **Status:** Active planning
 **Created:** 23 September 2026
-**Current position:** AWS-to-home transport validation and the filesystem-backed
-object-storage HTTP interface are implemented; diagnostics and administration
-remain deferred
+**Current position:** The transport, filesystem-backed object store, SQLite
+post backend, and public scrolling feed are implemented. The sidebar is next;
+storage diagnostics and administration remain deferred.
 
 ## 1. Direction
 
@@ -294,30 +294,50 @@ operations to public browsers.
 - Restoring the home connection restores media without restarting the public
   web service.
 
-## 5. Later horizons
+## 5. Next website work
 
-Do not design these in detail until the first two milestones are complete:
+The initial fixed-page milestone has grown into a SQLite-backed post backend
+and a server-rendered, scrolling public feed. The next work is ordered as
+follows:
 
-1. SQLite-backed posts and server-rendered post pages.
-2. Authoring, uploads, and attaching stored media to posts.
-3. A bounded AWS media cache and duplicate-request coalescing.
-4. Strong home-client challenge authentication and key rotation.
-5. Home storage backup and restore.
-6. Image variants and optional media processing.
-7. A React administration interface if it becomes useful.
-8. Operational hardening, observability, and recovery testing.
+1. **Sidebar — next.** Add public navigation within the existing website UI.
+   Settle its contents and responsive behavior in a focused plan before
+   implementation.
+2. **Users and authentication.** Establish account identity, sessions, and
+   authorization rules, including access to unpublished posts and their media.
+3. **Post creation and editing.** Build the draft, media-upload, and publish
+   workflow using those authorization rules.
+4. **Video thumbnail previews.** Generate or store preview images and show
+   them on gallery tiles; videos remain playable without previews meanwhile.
+5. **Automatic gallery slideshow.** Add optional timed advance to the existing
+   manual slideshow, with pause controls and sensible video behavior.
 
-## 6. Current assumptions
+The sidebar and video thumbnails have no dependency on the authentication
+design. Post creation does: draft and unpublished-media access must be defined
+before editing routes are exposed.
+
+## 6. Later horizons
+
+- A bounded AWS media cache and duplicate-request coalescing.
+- Strong home-client challenge authentication and key rotation.
+- Home storage backup and restore.
+- [Image variants and optional media processing](deferred/website-image-variants.md).
+- Operational hardening, observability, and recovery testing.
+
+## 7. Current assumptions
 
 - The successful real AWS prototype closes the transport feasibility question.
 - `journey-websocket` remains isolated but in this repository for now.
-- Object keys are opaque and supplied by clients.
+- Object keys are opaque; clients may supply a key or request a generated name
+  within a chosen prefix.
 - SHA-256 keys are an application convention, not a storage requirement.
 - The first interface uses one logical store with prefix-based organization.
 - Basic immutable object metadata is in scope for interface discussion.
 - The first deployment is a single home storage server without replication or
   backup.
-- Backend choice and detailed write semantics are intentionally deferred to
-  the interface and research milestone.
-- The first website is a fixed, read-only, server-rendered HTML page.
+- The filesystem-backed object store and its write semantics are documented in
+  the current object-storage design.
+- The public website uses server-rendered HTML and small browser scripts.
+- Published posts are public; draft editing and unpublished-media access await
+  the user and authentication design.
 - Initial media is streamed from home without an AWS cache.
