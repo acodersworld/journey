@@ -1,5 +1,11 @@
 const sidebarLayout = document.querySelector('#site-layout');
 
+function redirectToLogin() {
+  const loginUrl = new URL('/login', window.location.origin);
+  loginUrl.searchParams.set('return_to', window.location.pathname + window.location.search);
+  window.location.assign(loginUrl);
+}
+
 if (sidebarLayout) {
   const sidebar = document.querySelector('#site-sidebar');
   const toggle = document.querySelector('#sidebar-toggle');
@@ -79,6 +85,10 @@ if (feed) {
       const feedQuery = new URLSearchParams({ limit: '1', after: nextCursor });
       if (feed.hasAttribute('data-tag')) feedQuery.set('tag', feed.dataset.tag);
       const feedResponse = await fetch(`/api/posts?${feedQuery}`);
+      if (feedResponse.status === 401) {
+        redirectToLogin();
+        return;
+      }
       if (!feedResponse.ok) throw new Error(`Feed request failed: ${feedResponse.status}`);
       const page = await feedResponse.json();
       if (!Array.isArray(page.posts)) throw new Error('Invalid feed response');
@@ -88,6 +98,10 @@ if (feed) {
       } else {
         const post = page.posts[0];
         const postResponse = await fetch(`/posts/${encodeURIComponent(post.id)}/fragment`);
+        if (postResponse.status === 401) {
+          redirectToLogin();
+          return;
+        }
         if (!postResponse.ok) throw new Error(`Post request failed: ${postResponse.status}`);
         const markup = await postResponse.text();
         const template = document.createElement('template');

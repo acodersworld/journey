@@ -1,6 +1,6 @@
 use axum::{
     body::Body,
-    extract::{ConnectInfo, Extension, Path, Query, Request, State},
+    extract::{ConnectInfo, Extension, Form, Path, Query, Request, State},
     http::{header, HeaderMap, HeaderValue, Method, StatusCode, Uri},
     middleware::{self, Next},
     response::{Html, IntoResponse, Response},
@@ -42,6 +42,7 @@ struct ParsedOrigin {
 
 #[derive(Clone)]
 struct AuthPrincipal {
+    username: String,
     role: AccountRole,
 }
 
@@ -49,6 +50,18 @@ struct AuthPrincipal {
 struct LoginRequest {
     username: String,
     password: String,
+}
+
+#[derive(Deserialize)]
+struct LoginForm {
+    username: String,
+    password: String,
+    return_to: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct LoginPageQuery {
+    return_to: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -105,8 +118,6 @@ pub fn router<S: StorageClient>(state: AppState<S>) -> Router {
         .route("/", get(home::<S>))
         .route("/tags", get(tag_page::<S>))
         .route("/archive/{month}", get(archive_page::<S>))
-        .route("/site.css", get(site_css))
-        .route("/site.js", get(site_js))
         .route("/api/posts", get(feed::<S>))
         .route("/api/posts/{id}", get(api_full_post::<S>))
         .route("/posts/{id}/fragment", get(post_fragment::<S>))
@@ -118,6 +129,10 @@ pub fn router<S: StorageClient>(state: AppState<S>) -> Router {
         .route_layer(middleware::from_fn_with_state(state.clone(), authenticate::<S>));
 
     Router::new()
+        .route("/login", get(login_page::<S>).post(login_form::<S>))
+        .route("/logout", post(logout_form::<S>))
+        .route("/site.css", get(site_css))
+        .route("/site.js", get(site_js))
         .route("/api/auth/login", post(login::<S>))
         .route("/api/auth/current", get(current_account::<S>))
         .route("/api/auth/logout", post(logout::<S>))
@@ -132,11 +147,11 @@ async fn authenticate<S: StorageClient>(
 ) -> Response {
     let token = cookie_token(request.headers());
     let Some(token) = token else {
-        return no_store(StatusCode::UNAUTHORIZED.into_response());
+        return unauthenticated_response(&request);
     };
     let account = match lookup_session(&state, &token).await {
         Ok(Some(account)) => account,
-        Ok(None) => return no_store(StatusCode::UNAUTHORIZED.into_response()),
+        Ok(None) => return unauthenticated_response(&request),
         Err(error) => {
             eprintln!("website session lookup failed: {error}");
             return no_store(StatusCode::INTERNAL_SERVER_ERROR.into_response());
@@ -152,13 +167,109 @@ async fn login<S: StorageClient>(
     headers: HeaderMap,
     Json(credentials): Json<LoginRequest>,
 ) -> Response {
-    if !origin_allowed(&headers, &state.security) {
-        return no_store((StatusCode::FORBIDDEN, "origin not allowed\n").into_response());
+    let (account, token) = match authenticate_and_issue_session(
+        &state,
+        &headers,
+        peer_address,
+        credentials.username,
+        credentials.password,
+    )
+    .await
+    {
+        Ok(result) => result,
+        Err(response) => return response,
+    };
+
+    let mut response = Json(CurrentAccountResponse {
+        username: account.username,
+        role: account.role,
+    })
+    .into_response();
+    set_session_cookie(&mut response, &state.security, &token);
+    no_store(response)
+}
+
+async fn login_page<S: StorageClient>(
+    State(state): State<AppState<S>>,
+    query: Result<Query<LoginPageQuery>, axum::extract::rejection::QueryRejection>,
+    headers: HeaderMap,
+) -> Response {
+    let return_to = query
+        .ok()
+        .and_then(|Query(query)| query.return_to)
+        .as_deref()
+        .and_then(valid_return_target)
+        .unwrap_or_else(|| "/".to_owned());
+    if let Some(token) = cookie_token(&headers) {
+        match lookup_session(&state, &token).await {
+            Ok(Some(_)) => return redirect_to(&return_to),
+            Ok(None) => {}
+            Err(error) => {
+                eprintln!("website login-page session lookup failed: {error}");
+                return no_store(StatusCode::INTERNAL_SERVER_ERROR.into_response());
+            }
+        }
     }
-    if credentials.username.len() > 64 || credentials.password.len() > 1024 {
-        return login_failure();
+    no_store(Html(render_login_page(&return_to, "", None)).into_response())
+}
+
+async fn login_form<S: StorageClient>(
+    State(state): State<AppState<S>>,
+    ConnectInfo(peer_address): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    Form(form): Form<LoginForm>,
+) -> Response {
+    let return_to = form
+        .return_to
+        .as_deref()
+        .and_then(valid_return_target)
+        .unwrap_or_else(|| "/".to_owned());
+    let username = form.username.clone();
+    let (_account, token) = match authenticate_and_issue_session(
+        &state,
+        &headers,
+        peer_address,
+        form.username,
+        form.password,
+    )
+    .await
+    {
+        Ok(result) => result,
+        Err(response) if response.status() == StatusCode::UNAUTHORIZED => {
+            return no_store((
+                StatusCode::UNAUTHORIZED,
+                Html(render_login_page(
+                    &return_to,
+                    &username,
+                    Some("Invalid username or password."),
+                )),
+            )
+                .into_response());
+        }
+        Err(response) => return response,
+    };
+
+    let mut response = redirect_to(&return_to);
+    set_session_cookie(&mut response, &state.security, &token);
+    no_store(response)
+}
+
+async fn authenticate_and_issue_session<S: StorageClient>(
+    state: &AppState<S>,
+    headers: &HeaderMap,
+    peer_address: SocketAddr,
+    username: String,
+    password: String,
+) -> Result<(crate::db::LoginAccount, String), Response> {
+    if !origin_allowed(headers, &state.security) {
+        return Err(no_store(
+            (StatusCode::FORBIDDEN, "origin not allowed\n").into_response(),
+        ));
     }
-    let username_throttle_key = auth::username_throttle_key(&credentials.username);
+    if username.len() > 64 || password.len() > 1024 {
+        return Err(login_failure());
+    }
+    let username_throttle_key = auth::username_throttle_key(&username);
     let address_throttle_key = auth::address_throttle_key(&peer_address.ip().to_string());
     let now = unix_time_seconds();
     for (key, maximum_attempts) in [
@@ -171,40 +282,40 @@ async fn login<S: StorageClient>(
             .await
         {
             Ok(true) => {}
-            Ok(false) => return login_failure(),
+            Ok(false) => return Err(login_failure()),
             Err(error) => {
                 eprintln!("website login throttle failed: {error}");
-                return no_store(StatusCode::INTERNAL_SERVER_ERROR.into_response());
+                return Err(no_store(StatusCode::INTERNAL_SERVER_ERROR.into_response()));
             }
         }
     }
 
-    let account = match state.database.login_account(credentials.username.clone()).await {
+    let account = match state.database.login_account(username.clone()).await {
         Ok(account) => account,
         Err(error) => {
             eprintln!("website account lookup failed: {error}");
-            return no_store(StatusCode::INTERNAL_SERVER_ERROR.into_response());
+            return Err(no_store(StatusCode::INTERNAL_SERVER_ERROR.into_response()));
         }
     };
-    let valid_username = auth::validate_username(&credentials.username).is_ok();
+    let valid_username = auth::validate_username(&username).is_ok();
     let authenticated = match account.as_ref() {
         Some(account) => {
-            let password_matches = auth::verify_password(&credentials.password, &account.password_hash);
+            let password_matches = auth::verify_password(&password, &account.password_hash);
             valid_username && account.enabled && password_matches
         }
         None => {
-            auth::dummy_verify_password(&credentials.password);
+            auth::dummy_verify_password(&password);
             false
         }
     };
     if !authenticated {
-        return login_failure();
+        return Err(login_failure());
     }
     let account = account.expect("successful authentication has an account");
     for key in [username_throttle_key, address_throttle_key] {
         if let Err(error) = state.database.clear_login_attempts(key).await {
             eprintln!("website login throttle reset failed: {error}");
-            return no_store(StatusCode::INTERNAL_SERVER_ERROR.into_response());
+            return Err(no_store(StatusCode::INTERNAL_SERVER_ERROR.into_response()));
         }
     }
 
@@ -222,16 +333,9 @@ async fn login<S: StorageClient>(
         .await
     {
         eprintln!("website session creation failed: {error}");
-        return no_store(StatusCode::INTERNAL_SERVER_ERROR.into_response());
+        return Err(no_store(StatusCode::INTERNAL_SERVER_ERROR.into_response()));
     }
-
-    let mut response = Json(CurrentAccountResponse {
-        username: account.username,
-        role: account.role,
-    })
-    .into_response();
-    set_session_cookie(&mut response, &state.security, &token);
-    no_store(response)
+    Ok((account, token))
 }
 
 async fn current_account<S: StorageClient>(
@@ -258,22 +362,46 @@ async fn logout<S: StorageClient>(
     State(state): State<AppState<S>>,
     headers: HeaderMap,
 ) -> Response {
-    if !origin_allowed(&headers, &state.security) {
-        return no_store((StatusCode::FORBIDDEN, "origin not allowed\n").into_response());
+    if let Err(response) = revoke_current_session(&state, &headers).await {
+        return response;
     }
-    if let Some(token) = cookie_token(&headers) {
+    let mut response = StatusCode::NO_CONTENT.into_response();
+    expire_session_cookie(&mut response, &state.security);
+    no_store(response)
+}
+
+async fn logout_form<S: StorageClient>(
+    State(state): State<AppState<S>>,
+    headers: HeaderMap,
+) -> Response {
+    if let Err(response) = revoke_current_session(&state, &headers).await {
+        return response;
+    }
+    let mut response = redirect_to("/login");
+    expire_session_cookie(&mut response, &state.security);
+    no_store(response)
+}
+
+async fn revoke_current_session<S: StorageClient>(
+    state: &AppState<S>,
+    headers: &HeaderMap,
+) -> Result<(), Response> {
+    if !origin_allowed(headers, &state.security) {
+        return Err(no_store(
+            (StatusCode::FORBIDDEN, "origin not allowed\n").into_response(),
+        ));
+    }
+    if let Some(token) = cookie_token(headers) {
         if let Err(error) = state
             .database
             .revoke_session(auth::session_token_digest(&token))
             .await
         {
             eprintln!("website logout failed: {error}");
-            return no_store(StatusCode::INTERNAL_SERVER_ERROR.into_response());
+            return Err(no_store(StatusCode::INTERNAL_SERVER_ERROR.into_response()));
         }
     }
-    let mut response = StatusCode::NO_CONTENT.into_response();
-    expire_session_cookie(&mut response, &state.security);
-    no_store(response)
+    Ok(())
 }
 
 async fn lookup_session<S: StorageClient>(
@@ -396,7 +524,10 @@ impl ParsedOrigin {
 
 impl From<AuthenticatedAccount> for AuthPrincipal {
     fn from(account: AuthenticatedAccount) -> Self {
-        Self { role: account.role }
+        Self {
+            username: account.username,
+            role: account.role,
+        }
     }
 }
 
@@ -415,6 +546,75 @@ fn no_store(mut response: Response) -> Response {
         HeaderValue::from_static("private, no-store"),
     );
     response
+}
+
+fn unauthenticated_response(request: &Request) -> Response {
+    if request.method() == Method::GET {
+        if is_content_page_path(request.uri().path()) {
+            let return_to = request
+                .uri()
+                .path_and_query()
+                .and_then(|path_and_query| valid_return_target(path_and_query.as_str()))
+                .unwrap_or_else(|| "/".to_owned());
+            return redirect_to(&format!("/login?return_to={}", encode_url_component(&return_to)));
+        }
+    }
+    no_store(StatusCode::UNAUTHORIZED.into_response())
+}
+
+fn valid_return_target(candidate: &str) -> Option<String> {
+    if candidate.len() > 2048
+        || !candidate.starts_with('/')
+        || candidate.starts_with("//")
+        || candidate.contains('\\')
+        || candidate.contains('#')
+        || candidate.chars().any(char::is_control)
+    {
+        return None;
+    }
+    let uri = candidate.parse::<Uri>().ok()?;
+    if uri.scheme().is_some() || uri.authority().is_some() {
+        return None;
+    }
+    is_content_page_path(uri.path()).then(|| candidate.to_owned())
+}
+
+fn is_content_page_path(path: &str) -> bool {
+    path == "/"
+        || path == "/tags"
+        || path
+            .strip_prefix("/archive/")
+            .is_some_and(valid_archive_month)
+        || path.strip_prefix("/posts/").is_some_and(|id| {
+            id.bytes().all(|byte| byte.is_ascii_digit())
+                && id.parse::<i64>().is_ok_and(|parsed_id| {
+                    parsed_id > 0 && parsed_id.to_string() == id
+                })
+        })
+}
+
+fn redirect_to(location: &str) -> Response {
+    let mut response = StatusCode::SEE_OTHER.into_response();
+    if let Ok(location) = HeaderValue::from_str(location) {
+        response.headers_mut().insert(header::LOCATION, location);
+    }
+    no_store(response)
+}
+
+fn render_login_page(return_to: &str, username: &str, error: Option<&str>) -> String {
+    let error_html = error
+        .map(|error| format!("<p class=\"login-error\" role=\"alert\">{}</p>", escape_html(error)))
+        .unwrap_or_default();
+    let content = format!(
+        "<main class=\"login-page\"><section class=\"login-card\" aria-labelledby=\"login-heading\"><header class=\"login-header\"><h1 id=\"login-heading\">Journey</h1><p>Stories from the road.</p></header>{error_html}<form action=\"/login\" method=\"post\"><input type=\"hidden\" name=\"return_to\" value=\"{}\"><div class=\"login-field\"><label for=\"login-username\">Username</label><input id=\"login-username\" name=\"username\" type=\"text\" value=\"{}\" autocomplete=\"username\" autocapitalize=\"none\" spellcheck=\"false\" maxlength=\"64\" required></div><div class=\"login-field\"><label for=\"login-password\">Password</label><input id=\"login-password\" name=\"password\" type=\"password\" autocomplete=\"current-password\" maxlength=\"1024\" required></div><button class=\"login-submit\" type=\"submit\">Sign in</button></form></section></main>",
+        escape_html(return_to),
+        escape_html(username),
+    );
+    pretty_html(&format!(
+        "<!doctype html><html lang=\"en\"><head>{}</head><body>{}</body></html>",
+        html_head("Sign in · Journey"),
+        content,
+    ))
 }
 
 fn unix_time_seconds() -> i64 {
@@ -449,7 +649,10 @@ async fn feed<S: StorageClient>(
     }
 }
 
-async fn home<S: StorageClient>(State(state): State<AppState<S>>) -> Response {
+async fn home<S: StorageClient>(
+    State(state): State<AppState<S>>,
+    Extension(principal): Extension<AuthPrincipal>,
+) -> Response {
     match state.database.feed(1, None).await {
         Ok(page) => {
             let initial_post = match page.posts.first() {
@@ -472,7 +675,13 @@ async fn home<S: StorageClient>(State(state): State<AppState<S>>) -> Response {
                     return StatusCode::INTERNAL_SERVER_ERROR.into_response();
                 }
             };
-            Html(render_home(&sidebar, initial_post.as_ref(), next_cursor)).into_response()
+            Html(render_home(
+                &sidebar,
+                initial_post.as_ref(),
+                next_cursor,
+                &principal.username,
+            ))
+            .into_response()
         }
         Err(error) => {
             eprintln!("website home query failed: {error}");
@@ -484,6 +693,7 @@ async fn home<S: StorageClient>(State(state): State<AppState<S>>) -> Response {
 async fn tag_page<S: StorageClient>(
     State(state): State<AppState<S>>,
     Query(query): Query<TagPageQuery>,
+    Extension(principal): Extension<AuthPrincipal>,
 ) -> Response {
     match state.database.feed_filtered(1, None, Some(query.tag.clone())).await {
         Ok(page) => {
@@ -507,7 +717,13 @@ async fn tag_page<S: StorageClient>(
                     return StatusCode::INTERNAL_SERVER_ERROR.into_response();
                 }
             };
-            Html(render_tag_feed(&sidebar, &query.tag, initial_post.as_ref(), next_cursor))
+            Html(render_tag_feed(
+                &sidebar,
+                &query.tag,
+                initial_post.as_ref(),
+                next_cursor,
+                &principal.username,
+            ))
                 .into_response()
         }
         Err(error) => {
@@ -520,6 +736,7 @@ async fn tag_page<S: StorageClient>(
 async fn archive_page<S: StorageClient>(
     State(state): State<AppState<S>>,
     Path(month): Path<String>,
+    Extension(principal): Extension<AuthPrincipal>,
 ) -> Response {
     if !valid_archive_month(&month) {
         return StatusCode::NOT_FOUND.into_response();
@@ -538,7 +755,7 @@ async fn archive_page<S: StorageClient>(
             return StatusCode::INTERNAL_SERVER_ERROR.into_response();
         }
     };
-    Html(render_archive(&sidebar, &month, &posts)).into_response()
+    Html(render_archive(&sidebar, &month, &posts, &principal.username)).into_response()
 }
 
 async fn api_full_post<S: StorageClient>(
@@ -570,7 +787,7 @@ async fn post_page<S: StorageClient>(
                     return StatusCode::INTERNAL_SERVER_ERROR.into_response();
                 }
             };
-            Html(render_full_post(&sidebar, &post)).into_response()
+            Html(render_full_post(&sidebar, &post, &principal.username)).into_response()
         }
         Ok(None) => StatusCode::NOT_FOUND.into_response(),
         Err(error) => {
@@ -657,18 +874,19 @@ fn valid_archive_month(value: &str) -> bool {
         && value[5..7].parse::<u32>().is_ok_and(|month| (1..=12).contains(&month))
 }
 
-fn render_full_post(sidebar: &SidebarData, post: &Post) -> String {
+fn render_full_post(sidebar: &SidebarData, post: &Post, username: &str) -> String {
     let content = format!(
         "<main class=\"site site-post\"><p class=\"back-link\"><a href=\"/\">All posts</a></p>{}</main>",
         render_post(post, true),
     );
-    render_site_page(&post.summary.title, sidebar, &content, true)
+    render_site_page(&post.summary.title, sidebar, &content, true, username)
 }
 
 fn render_home(
     sidebar: &SidebarData,
     initial_post: Option<&Post>,
     next_cursor: Option<&str>,
+    username: &str,
 ) -> String {
     let mut feed = format!(
         "<section id=\"feed\" aria-label=\"Posts\" data-next-cursor=\"{}\">",
@@ -681,7 +899,7 @@ fn render_home(
     }
     feed.push_str("</section>");
     let content = render_feed_controls("<main class=\"site site-feed\">", &feed, next_cursor);
-    render_site_page("Journey", sidebar, &content, true)
+    render_site_page("Journey", sidebar, &content, true, username)
 }
 
 fn render_tag_feed(
@@ -689,6 +907,7 @@ fn render_tag_feed(
     tag: &str,
     initial_post: Option<&Post>,
     next_cursor: Option<&str>,
+    username: &str,
 ) -> String {
     let mut feed = format!(
         "<section id=\"feed\" aria-label=\"Posts tagged {}\" data-next-cursor=\"{}\" data-tag=\"{}\">",
@@ -711,7 +930,7 @@ fn render_tag_feed(
         &feed,
         next_cursor,
     );
-    render_site_page(&format!("Posts tagged {tag}"), sidebar, &content, true)
+    render_site_page(&format!("Posts tagged {tag}"), sidebar, &content, true, username)
 }
 
 fn render_feed_controls(main_open: &str, feed: &str, next_cursor: Option<&str>) -> String {
@@ -727,7 +946,12 @@ fn render_feed_controls(main_open: &str, feed: &str, next_cursor: Option<&str>) 
     content
 }
 
-fn render_archive(sidebar: &SidebarData, month: &str, posts: &[PostSummary]) -> String {
+fn render_archive(
+    sidebar: &SidebarData,
+    month: &str,
+    posts: &[PostSummary],
+    username: &str,
+) -> String {
     let mut content = format!(
         "<main class=\"site site-archive\"><p class=\"back-link\"><a href=\"/\">All posts</a></p><h1>{}</h1><section class=\"archive-posts\" aria-label=\"Posts from {}\">",
         escape_html(&month_label(month)),
@@ -748,19 +972,33 @@ fn render_archive(sidebar: &SidebarData, month: &str, posts: &[PostSummary]) -> 
         }
     }
     content.push_str("</section></main>");
-    render_site_page(&month_label(month), sidebar, &content, false)
+    render_site_page(&month_label(month), sidebar, &content, false, username)
 }
 
-fn render_site_page(title: &str, sidebar: &SidebarData, content: &str, include_slideshow: bool) -> String {
+fn render_site_page(
+    title: &str,
+    sidebar: &SidebarData,
+    content: &str,
+    include_slideshow: bool,
+    username: &str,
+) -> String {
     let slideshow = if include_slideshow { SLIDESHOW_HTML } else { "" };
     let html = format!(
-        "<!doctype html><html lang=\"en\"><head>{}</head><body><div class=\"site-layout\" id=\"site-layout\"><button class=\"sidebar-toggle\" id=\"sidebar-toggle\" type=\"button\" aria-controls=\"site-sidebar\" aria-expanded=\"false\" aria-label=\"Open sidebar\"><span aria-hidden=\"true\">›</span></button><button class=\"sidebar-backdrop\" id=\"sidebar-backdrop\" type=\"button\" aria-label=\"Close sidebar\" hidden></button>{}{}</div>{}</body></html>",
+        "<!doctype html><html lang=\"en\"><head>{}</head><body><div class=\"site-layout\" id=\"site-layout\"><button class=\"sidebar-toggle\" id=\"sidebar-toggle\" type=\"button\" aria-controls=\"site-sidebar\" aria-expanded=\"false\" aria-label=\"Open sidebar\"><span aria-hidden=\"true\">›</span></button><button class=\"sidebar-backdrop\" id=\"sidebar-backdrop\" type=\"button\" aria-label=\"Close sidebar\" hidden></button>{}{}{}</div>{}</body></html>",
         html_head(title),
         render_sidebar(sidebar),
+        render_account_controls(username),
         content,
         slideshow,
     );
     pretty_html(&html)
+}
+
+fn render_account_controls(username: &str) -> String {
+    format!(
+        "<div class=\"account-controls\"><span>Signed in as <strong>{}</strong></span><form action=\"/logout\" method=\"post\"><button type=\"submit\">Sign out</button></form></div>",
+        escape_html(username),
+    )
 }
 
 fn render_sidebar(sidebar: &SidebarData) -> String {
@@ -1288,22 +1526,29 @@ pub fn state_with_security<S: StorageClient>(
 #[cfg(test)]
 mod tests {
     use std::{
+        net::{IpAddr, Ipv4Addr, SocketAddr},
         path::{Path, PathBuf},
         time::{SystemTime, UNIX_EPOCH},
     };
 
+    use rusqlite::Connection;
+
     use super::{
-        escape_html, feed, home, parse_cursor, render_full_post, state, FeedQuery,
+        escape_html, feed, home, parse_cursor, render_full_post, router, state,
+        valid_return_target, AuthPrincipal, FeedQuery,
     };
     use crate::{
-        db::{Database, NewPost, Post, PostBlock, PostSummary, SidebarData},
+        auth,
+        db::{AccountRole, Database, NewPost, Post, PostBlock, PostSummary, SidebarData},
         storage::{StorageClient, StorageResponse},
     };
     use axum::{
-        body::to_bytes,
-        extract::{Query, State},
-        http::StatusCode,
+        body::{to_bytes, Body},
+        extract::{ConnectInfo, Extension, Query, State},
+        http::{header, Request, StatusCode},
+        response::Response,
     };
+    use tower::ServiceExt;
 
     #[derive(Clone)]
     struct UnusedStorage;
@@ -1323,6 +1568,18 @@ mod tests {
         }
     }
 
+    async fn get_route(app: &axum::Router, target: &str) -> Response {
+        app.clone()
+            .oneshot(
+                Request::builder()
+                    .uri(target)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+    }
+
     #[tokio::test]
     async fn malformed_feed_cursor_returns_bad_request() {
         let response = feed(
@@ -1338,6 +1595,269 @@ mod tests {
         assert!(parse_cursor("2026-02-28:4").is_some());
         assert!(parse_cursor("2026-02-28:04").is_none());
         assert!(parse_cursor("2026-02-28:4:5").is_none());
+    }
+
+    #[tokio::test]
+    async fn login_assets_are_public_and_content_data_stays_protected() {
+        let app = router(state(
+            Database::new(PathBuf::from("unused-route-test-database")),
+            UnusedStorage,
+        ));
+
+        for path in [
+            "/login?return_to=https%3A%2F%2Fexample.com%2F",
+            "/login?return_to=%",
+            "/site.css",
+            "/site.js",
+        ] {
+            assert_eq!(get_route(&app, path).await.status(), StatusCode::OK);
+        }
+
+        let login = get_route(&app, "/login?return_to=https%3A%2F%2Fexample.com%2F").await;
+        let body = to_bytes(login.into_body(), usize::MAX).await.unwrap();
+        let html = String::from_utf8(body.to_vec()).unwrap();
+        assert!(html.contains("name=\"return_to\" value=\"/\""));
+
+        let home = get_route(&app, "/").await;
+        assert_eq!(home.status(), StatusCode::SEE_OTHER);
+        assert_eq!(
+            home.headers().get("location").unwrap(),
+            "/login?return_to=%2F"
+        );
+        let oversized_page_query = format!("/?q={}", "x".repeat(2050));
+        let oversized_page = get_route(&app, &oversized_page_query).await;
+        assert_eq!(oversized_page.status(), StatusCode::SEE_OTHER);
+        assert_eq!(
+            oversized_page.headers().get("location").unwrap(),
+            "/login?return_to=%2F"
+        );
+
+        for path in [
+            "/api/posts",
+            "/posts/9/fragment",
+            "/posts/9/blocks/1/media",
+        ] {
+            assert_eq!(get_route(&app, path).await.status(), StatusCode::UNAUTHORIZED);
+        }
+    }
+
+    #[tokio::test]
+    async fn html_login_logout_and_draft_access_use_the_shared_sessions() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "journey-site-auth-ui-{}-{nonce}.sqlite3",
+            std::process::id()
+        ));
+        let database = Database::new(path.clone());
+        database.initialize().await.unwrap();
+        database
+            .create_account(
+                "reader".to_owned(),
+                AccountRole::Reader,
+                auth::hash_password("reader-secret").unwrap(),
+            )
+            .await
+            .unwrap();
+        database
+            .create_account(
+                "owner".to_owned(),
+                AccountRole::Owner,
+                auth::hash_password("owner-secret").unwrap(),
+            )
+            .await
+            .unwrap();
+        let connection = Connection::open(&path).unwrap();
+        connection
+            .execute(
+                "INSERT INTO posts (title, published_at, summary, published, tags) VALUES ('Draft', '2026-09-01', 'A draft', 0, '[]')",
+                [],
+            )
+            .unwrap();
+        drop(connection);
+        let app = router(state(database.clone(), UnusedStorage));
+        let peer_address = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8080);
+
+        let mut wrong_login = Request::builder()
+            .method("POST")
+            .uri("/login")
+            .header(header::ORIGIN, "http://127.0.0.1")
+            .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+            .body(Body::from("username=reader&password=wrong&return_to=%2Fposts%2F1"))
+            .unwrap();
+        wrong_login
+            .extensions_mut()
+            .insert(ConnectInfo(peer_address));
+        let failure = app.clone().oneshot(wrong_login).await.unwrap();
+        assert_eq!(failure.status(), StatusCode::UNAUTHORIZED);
+        let body = to_bytes(failure.into_body(), usize::MAX).await.unwrap();
+        let html = String::from_utf8(body.to_vec()).unwrap();
+        assert!(html.contains("Invalid username or password."));
+        assert!(html.contains("<form action=\"/login\" method=\"post\">"));
+        assert!(html.contains("<label for=\"login-username\">Username</label>"));
+        assert!(html.contains("name=\"username\" type=\"text\" value=\"reader\""));
+        assert!(html.contains("name=\"password\" type=\"password\" autocomplete=\"current-password\""));
+        assert!(html.contains("autocomplete=\"username\""));
+        assert!(html.contains("maxlength=\"1024\" required"));
+        assert!(!html.contains("name=\"password\" type=\"password\" value="));
+
+        async fn sign_in(
+            app: &axum::Router,
+            username: &str,
+            password: &str,
+            peer_address: SocketAddr,
+        ) -> (String, Response) {
+            let mut request = Request::builder()
+                .method("POST")
+                .uri("/login")
+                .header(header::ORIGIN, "http://127.0.0.1")
+                .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+                .body(Body::from(format!(
+                    "username={username}&password={password}&return_to=%2Fposts%2F1"
+                )))
+                .unwrap();
+            request
+                .extensions_mut()
+                .insert(ConnectInfo(peer_address));
+            let response = app.clone().oneshot(request).await.unwrap();
+            let cookie = response
+                .headers()
+                .get(header::SET_COOKIE)
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .split(';')
+                .next()
+                .unwrap()
+                .to_owned();
+            (cookie, response)
+        }
+
+        let (reader_cookie, reader_login) =
+            sign_in(&app, "reader", "reader-secret", peer_address).await;
+        assert_eq!(reader_login.status(), StatusCode::SEE_OTHER);
+        assert_eq!(reader_login.headers().get(header::LOCATION).unwrap(), "/posts/1");
+        let already_signed_in = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/login?return_to=%2Fposts%2F1")
+                    .header(header::COOKIE, reader_cookie.as_str())
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(already_signed_in.status(), StatusCode::SEE_OTHER);
+        assert_eq!(
+            already_signed_in.headers().get(header::LOCATION).unwrap(),
+            "/posts/1"
+        );
+        let draft_as_reader = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/posts/1")
+                    .header(header::COOKIE, reader_cookie.as_str())
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(draft_as_reader.status(), StatusCode::NOT_FOUND);
+
+        let (owner_cookie, owner_login) =
+            sign_in(&app, "owner", "owner-secret", peer_address).await;
+        assert_eq!(owner_login.status(), StatusCode::SEE_OTHER);
+        let draft_as_owner = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/posts/1")
+                    .header(header::COOKIE, owner_cookie.as_str())
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(draft_as_owner.status(), StatusCode::OK);
+        let owner_body = to_bytes(draft_as_owner.into_body(), usize::MAX).await.unwrap();
+        assert!(String::from_utf8(owner_body.to_vec()).unwrap().contains("Draft"));
+
+        let logout = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/logout")
+                    .header(header::ORIGIN, "http://127.0.0.1")
+                    .header(header::COOKIE, reader_cookie.as_str())
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(logout.status(), StatusCode::SEE_OTHER);
+        assert_eq!(logout.headers().get(header::LOCATION).unwrap(), "/login");
+        assert!(logout
+            .headers()
+            .get(header::SET_COOKIE)
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .contains("Max-Age=0"));
+
+        let current = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/auth/current")
+                    .header(header::COOKIE, reader_cookie.as_str())
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(current.status(), StatusCode::UNAUTHORIZED);
+
+        let expired_token = "a".repeat(43);
+        let reader = database.login_account("reader".to_owned()).await.unwrap().unwrap();
+        database
+            .issue_session(
+                reader.id,
+                auth::session_token_digest(&expired_token),
+                1,
+                2,
+            )
+            .await
+            .unwrap();
+        let expired = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/")
+                    .header(header::COOKIE, format!("journey_session={expired_token}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(expired.status(), StatusCode::SEE_OTHER);
+        let expired_api = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/posts")
+                    .header(header::COOKIE, format!("journey_session={expired_token}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(expired_api.status(), StatusCode::UNAUTHORIZED);
+
+        std::fs::remove_file(path).unwrap();
     }
 
     #[tokio::test]
@@ -1362,7 +1882,14 @@ mod tests {
             .collect();
         database.replace_posts(posts).await.unwrap();
 
-        let response = home(State(state(database, UnusedStorage))).await;
+        let response = home(
+            State(state(database, UnusedStorage)),
+            Extension(AuthPrincipal {
+                username: "reader".to_owned(),
+                role: AccountRole::Reader,
+            }),
+        )
+        .await;
         assert_eq!(response.status(), StatusCode::OK);
         let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
         let html = String::from_utf8(body.to_vec()).unwrap();
@@ -1432,8 +1959,10 @@ mod tests {
                 },
             ],
         };
-        let html = render_full_post(&SidebarData::default(), &post);
-        assert!(html.contains("<p class=\"tags\"><span class=\"tag-label\">Tags:</span> <a class=\"tag\" href=\"/tags?tag=%3Ctag%3E\">&lt;tag&gt;</a></p>"));
+        let html = render_full_post(&SidebarData::default(), &post, "owner");
+        assert!(html.contains("<p class=\"tags\">"));
+        assert!(html.contains("class=\"tag-label\">Tags:</span>"));
+        assert!(html.contains("href=\"/tags?tag=%3Ctag%3E\">&lt;tag&gt;</a>"));
         assert!(html.contains("<h2>A &lt;header&gt;</h2>"));
         assert!(html.contains("&lt;script&gt;body&lt;/script&gt;"));
         assert!(html.contains("&quot;&gt;&lt;script&gt;alert(1)&lt;/script&gt;"));
@@ -1445,6 +1974,27 @@ mod tests {
         assert!(html.contains("<p>Nested body</p>"));
         assert!(!html.contains("/posts/7/blocks/18/media"));
         assert!(!html.contains("<script>body</script>"));
+        assert!(html.contains("Signed in as <strong>owner</strong>"));
+        assert!(html.contains("action=\"/logout\" method=\"post\""));
         assert_eq!(escape_html("'&\"<>"), "&#39;&amp;&quot;&lt;&gt;");
+    }
+
+    #[test]
+    fn return_targets_are_limited_to_local_content_pages() {
+        assert_eq!(valid_return_target("/"), Some("/".to_owned()));
+        assert_eq!(
+            valid_return_target("/tags?tag=coast%20walks"),
+            Some("/tags?tag=coast%20walks".to_owned())
+        );
+        assert_eq!(
+            valid_return_target("/archive/2026-09"),
+            Some("/archive/2026-09".to_owned())
+        );
+        assert_eq!(valid_return_target("/posts/42"), Some("/posts/42".to_owned()));
+        assert!(valid_return_target("https://example.com/").is_none());
+        assert!(valid_return_target("//example.com/").is_none());
+        assert!(valid_return_target("/api/posts").is_none());
+        assert!(valid_return_target("/posts/42/fragment").is_none());
+        assert!(valid_return_target("/archive/2026-13").is_none());
     }
 }

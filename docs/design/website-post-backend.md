@@ -161,3 +161,13 @@ and media database lookups: readers receive published-only access and owners
 can include drafts. A future post-scoped link can map to published-only access
 without creating an account session or gaining draft access. Feeds, tags,
 archives, and sidebar data remain published-only for every account.
+
+The browser uses a server-rendered `GET`/`POST /login` form and `POST /logout`;
+the form works without JavaScript and reuses the JSON endpoints' credential,
+throttle, origin, session, and cookie rules. `GET /login`, `/site.css`, and
+`/site.js` are public. Unauthenticated `GET` requests for content pages redirect
+to sign-in with a `return_to` value restricted to `/`, `/tags`, `/archive/YYYY-MM`,
+or `/posts/<id>` paths. Invalid targets fall back to `/`. API, fragment, and
+media requests continue to return `401`. Content pages show the signed-in
+username and submit logout through a native form. If feed loading receives
+`401`, the browser returns to sign-in with the current content path and query.
