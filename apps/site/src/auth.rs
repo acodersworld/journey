@@ -12,6 +12,7 @@ const PASSWORD_MEMORY_KIB: u32 = 19 * 1024;
 const PASSWORD_ITERATIONS: u32 = 2;
 const PASSWORD_LANES: u32 = 1;
 const SESSION_TOKEN_BYTES: usize = 32;
+const SHARE_LINK_ID_BYTES: usize = 16;
 
 pub(crate) fn validate_username(username: &str) -> Result<(), &'static str> {
     if !(3..=32).contains(&username.len())
@@ -59,6 +60,16 @@ pub(crate) fn dummy_verify_password(password: &str) {
 
 pub(crate) fn new_session_token() -> String {
     let mut bytes = [0_u8; SESSION_TOKEN_BYTES];
+    rand::rngs::OsRng.fill_bytes(&mut bytes);
+    URL_SAFE_NO_PAD.encode(bytes)
+}
+
+pub(crate) fn new_share_link_secret() -> String {
+    new_session_token()
+}
+
+pub(crate) fn new_share_link_id() -> String {
+    let mut bytes = [0_u8; SHARE_LINK_ID_BYTES];
     rand::rngs::OsRng.fill_bytes(&mut bytes);
     URL_SAFE_NO_PAD.encode(bytes)
 }

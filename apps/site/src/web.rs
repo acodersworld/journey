@@ -12,7 +12,7 @@ use std::{net::{IpAddr, SocketAddr}, time::{SystemTime, UNIX_EPOCH}};
 
 use crate::{
     auth,
-    db::{AccountRole, AuthenticatedAccount, Database, FeedCursor, Post, PostAccess, PostSummary, SidebarData},
+    db::{AccountRole, AuthenticatedAccount, Database, FeedCursor, MediaReference, Post, PostAccess, PostSummary, SidebarData},
     storage::StorageClient,
 };
 
@@ -83,7 +83,10 @@ struct TagPageQuery {
 }
 
 impl SiteSecurity {
-    pub fn from_env(bind_address: SocketAddr) -> Result<Self, String> {
+    pub fn from_env(bind_address: SocketAddr, allow_insecure_cookies: bool) -> Result<Self, String> {
+        if allow_insecure_cookies && !bind_address.ip().is_loopback() {
+            return Err("--allow-insecure-cookies is only permitted when binding to loopback".to_owned());
+        }
         let public_origin = match std::env::var("JOURNEY_SITE_PUBLIC_ORIGIN") {
             Ok(value) => {
                 let origin = parse_origin(&value)
@@ -106,10 +109,28 @@ impl SiteSecurity {
         if session_lifetime_seconds <= 0 {
             return Err("JOURNEY_SITE_SESSION_TTL_SECONDS must be a positive integer".to_owned());
         }
-        let secure_cookie = public_origin
-            .as_ref()
-            .is_some_and(|origin| origin.scheme == "https");
+        let secure_cookie = !allow_insecure_cookies;
         Ok(Self { public_origin, secure_cookie, session_lifetime_seconds })
+    }
+}
+
+pub fn share_link_origin(bind_address: SocketAddr) -> Result<String, String> {
+    match std::env::var("JOURNEY_SITE_PUBLIC_ORIGIN") {
+        Ok(value) => {
+            let origin = parse_origin(&value)
+                .ok_or_else(|| "JOURNEY_SITE_PUBLIC_ORIGIN must be an origin URL".to_owned())?;
+            if origin.scheme == "http" && !origin.is_loopback() {
+                return Err("JOURNEY_SITE_PUBLIC_ORIGIN may use HTTP only for loopback hosts".to_owned());
+            }
+            Ok(origin.key)
+        }
+        Err(std::env::VarError::NotPresent) if bind_address.ip().is_loopback() => {
+            Ok(format!("http://{bind_address}"))
+        }
+        Err(std::env::VarError::NotPresent) => {
+            Err("JOURNEY_SITE_PUBLIC_ORIGIN is required to create a link when binding outside loopback".to_owned())
+        }
+        Err(error) => Err(format!("could not read JOURNEY_SITE_PUBLIC_ORIGIN: {error}")),
     }
 }
 
@@ -136,6 +157,12 @@ pub fn router<S: StorageClient>(state: AppState<S>) -> Router {
         .route("/api/auth/login", post(login::<S>))
         .route("/api/auth/current", get(current_account::<S>))
         .route("/api/auth/logout", post(logout::<S>))
+        .route("/share/{share_link_id}/{secret}", get(open_share_link::<S>))
+        .route("/share/{share_link_id}/posts/{post_id}", get(shared_post_page::<S>))
+        .route(
+            "/share/{share_link_id}/posts/{post_id}/blocks/{block_id}/media",
+            get(shared_media::<S>).head(shared_media::<S>),
+        )
         .merge(content_routes)
         .with_state(state)
 }
@@ -159,6 +186,105 @@ async fn authenticate<S: StorageClient>(
     };
     request.extensions_mut().insert(AuthPrincipal::from(account));
     no_store(next.run(request).await)
+}
+
+async fn open_share_link<S: StorageClient>(
+    State(state): State<AppState<S>>,
+    Path((share_link_id, secret)): Path<(String, String)>,
+) -> Response {
+    let now = unix_time_seconds();
+    let session_token = auth::new_session_token();
+    match state
+        .database
+        .issue_share_session(
+            share_link_id.clone(),
+            auth::session_token_digest(&secret),
+            auth::session_token_digest(&session_token),
+            now,
+        )
+        .await
+    {
+        Ok(Some((post_id, expires_at))) => {
+            let mut response = redirect_to(&format!("/share/{share_link_id}/posts/{post_id}"));
+            set_share_cookie(
+                &mut response,
+                &state.security,
+                &share_link_id,
+                &session_token,
+                expires_at.saturating_sub(unix_time_seconds()),
+            );
+            no_store(response)
+        }
+        Ok(None) => share_not_found(),
+        Err(error) => {
+            eprintln!("website share-link session creation failed: {error}");
+            no_store(StatusCode::INTERNAL_SERVER_ERROR.into_response())
+        }
+    }
+}
+
+async fn shared_post_page<S: StorageClient>(
+    State(state): State<AppState<S>>,
+    Path((share_link_id, post_id)): Path<(String, i64)>,
+    headers: HeaderMap,
+) -> Response {
+    let Some(token) = share_cookie_token(&headers, &share_link_id) else {
+        return share_not_found();
+    };
+    match state
+        .database
+        .shared_post(
+            share_link_id.clone(),
+            auth::session_token_digest(&token),
+            post_id,
+            unix_time_seconds(),
+        )
+        .await
+    {
+        Ok(Some(post)) => {
+            let prefix = format!("/share/{share_link_id}");
+            no_store(Html(render_shared_post(&post, &prefix)).into_response())
+        }
+        Ok(None) => share_not_found(),
+        Err(error) => {
+            eprintln!("website shared-post lookup failed: {error}");
+            no_store(StatusCode::INTERNAL_SERVER_ERROR.into_response())
+        }
+    }
+}
+
+async fn shared_media<S: StorageClient>(
+    State(state): State<AppState<S>>,
+    Path((share_link_id, post_id, block_id)): Path<(String, i64, i64)>,
+    method: Method,
+    headers: HeaderMap,
+) -> Response {
+    let Some(token) = share_cookie_token(&headers, &share_link_id) else {
+        return share_not_found();
+    };
+    let media = match state
+        .database
+        .shared_media_reference(
+            share_link_id,
+            auth::session_token_digest(&token),
+            post_id,
+            block_id,
+            unix_time_seconds(),
+        )
+        .await
+    {
+        Ok(Some(media)) => media,
+        Ok(None) => return share_not_found(),
+        Err(error) => {
+            eprintln!("website shared-media lookup failed: {error}");
+            return no_store(StatusCode::INTERNAL_SERVER_ERROR.into_response());
+        }
+    };
+    no_store(proxy_media(&state.storage, media, method, headers).await)
+}
+
+fn share_not_found() -> Response {
+    no_store((StatusCode::NOT_FOUND, "share link not found\n").into_response())
 }
 
 async fn login<S: StorageClient>(
@@ -437,6 +563,29 @@ fn cookie_token(headers: &HeaderMap) -> Option<String> {
     None
 }
 
+fn share_cookie_token(headers: &HeaderMap, share_link_id: &str) -> Option<String> {
+    let cookie_name = format!("journey_share_{share_link_id}=");
+    for cookie_header in headers.get_all(header::COOKIE) {
+        let Ok(cookie_header) = cookie_header.to_str() else {
+            continue;
+        };
+        for cookie in cookie_header.split(';').map(str::trim) {
+            let Some(token) = cookie.strip_prefix(&cookie_name) else {
+                continue;
+            };
+            if valid_token(token) {
+                return Some(token.to_owned());
+            }
+        }
+    }
+    None
+}
+
+fn valid_token(token: &str) -> bool {
+    token.len() == 43
+        && token.bytes().all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
+}
+
 fn set_session_cookie(response: &mut Response, security: &SiteSecurity, token: &str) {
     let secure = if security.secure_cookie { "; Secure" } else { "" };
     let value = format!(
@@ -445,6 +594,22 @@ fn set_session_cookie(response: &mut Response, security: &SiteSecurity, token: &
     );
     if let Ok(value) = HeaderValue::from_str(&value) {
         response.headers_mut().insert(header::SET_COOKIE, value);
+    }
+}
+
+fn set_share_cookie(
+    response: &mut Response,
+    security: &SiteSecurity,
+    share_link_id: &str,
+    token: &str,
+    max_age: i64,
+) {
+    let secure = if security.secure_cookie { "; Secure" } else { "" };
+    let value = format!(
+        "journey_share_{share_link_id}={token}; Path=/share/{share_link_id}; HttpOnly; SameSite=Lax; Max-Age={max_age}{secure}"
+    );
+    if let Ok(value) = HeaderValue::from_str(&value) {
+        response.headers_mut().append(header::SET_COOKIE, value);
     }
 }
 
@@ -882,6 +1047,18 @@ fn render_full_post(sidebar: &SidebarData, post: &Post, username: &str) -> Strin
     render_site_page(&post.summary.title, sidebar, &content, true, username)
 }
 
+fn render_shared_post(post: &Post, share_prefix: &str) -> String {
+    let content = format!(
+        "<main class=\"site site-feed\">{}</main>",
+        render_post_with_media_prefix(post, true, Some(share_prefix)),
+    );
+    pretty_html(&format!(
+        "<!doctype html><html lang=\"en\"><head>{}</head><body><div class=\"site-layout\">{content}</div>{}</body></html>",
+        html_head(&format!("{} · Journey", post.summary.title)),
+        SLIDESHOW_HTML,
+    ))
+}
+
 fn render_home(
     sidebar: &SidebarData,
     initial_post: Option<&Post>,
@@ -1086,6 +1263,14 @@ fn encode_url_component(value: &str) -> String {
 }
 
 fn render_post(post: &Post, prioritize_first_image: bool) -> String {
+    render_post_with_media_prefix(post, prioritize_first_image, None)
+}
+
+fn render_post_with_media_prefix(
+    post: &Post,
+    prioritize_first_image: bool,
+    media_prefix: Option<&str>,
+) -> String {
     format!(
         "<article class=\"post\" data-post-id=\"{}\"><header class=\"post-header\"><h1>{}</h1><time datetime=\"{}\">{}</time><p class=\"summary\">{}</p></header>{}{}</article>",
         post.summary.id,
@@ -1093,27 +1278,37 @@ fn render_post(post: &Post, prioritize_first_image: bool) -> String {
         escape_html(&post.summary.published_at),
         escape_html(&post.summary.published_at),
         escape_html(&post.summary.summary),
-        render_tags_html(&post.tags),
-        render_post_blocks_html(post, prioritize_first_image),
+        render_tags_html(&post.tags, media_prefix.is_some()),
+        render_post_blocks_html(post, prioritize_first_image, media_prefix),
     )
 }
 
-fn render_post_blocks_html(post: &Post, prioritize_first_image: bool) -> String {
+fn render_post_blocks_html(
+    post: &Post,
+    prioritize_first_image: bool,
+    media_prefix: Option<&str>,
+) -> String {
     let mut prioritize_first_image = prioritize_first_image;
-    render_blocks_html(&post.blocks, post.summary.id, &mut prioritize_first_image)
+    render_blocks_html(
+        &post.blocks,
+        post.summary.id,
+        &mut prioritize_first_image,
+        media_prefix,
+    )
 }
 
 fn render_blocks_html(
     blocks: &[crate::db::PostBlock],
     post_id: i64,
     prioritize_first_image: &mut bool,
+    media_prefix: Option<&str>,
 ) -> String {
     let mut html = String::new();
     for block in blocks {
         if block.children.is_empty() {
-            html.push_str(&render_standalone_block(block, post_id, prioritize_first_image));
+            html.push_str(&render_standalone_block(block, post_id, prioritize_first_image, media_prefix));
         } else {
-            html.push_str(&render_group(block, post_id, prioritize_first_image));
+            html.push_str(&render_group(block, post_id, prioritize_first_image, media_prefix));
         }
     }
     html
@@ -1123,11 +1318,12 @@ fn render_standalone_block(
     block: &crate::db::PostBlock,
     post_id: i64,
     prioritize_first_image: &mut bool,
+    media_prefix: Option<&str>,
 ) -> String {
     let mut html = String::new();
     match block.content_type.as_deref() {
         Some(content_type) if content_type.starts_with("image/") => {
-            let media_url = format!("/posts/{post_id}/blocks/{}/media", block.id);
+            let media_url = media_url(media_prefix, post_id, block.id);
             let loading = image_loading(prioritize_first_image);
             let alt = block.alt.as_deref().unwrap_or("");
             let label = media_accessible_label(block.header.as_deref(), block.body.as_deref(), alt);
@@ -1149,7 +1345,7 @@ fn render_standalone_block(
             ));
         }
         Some(content_type) if content_type.starts_with("video/") => {
-            let media_url = format!("/posts/{post_id}/blocks/{}/media", block.id);
+            let media_url = media_url(media_prefix, post_id, block.id);
             html.push_str(&format!(
                 "<figure class=\"single-media\">{}<video controls preload=\"metadata\" aria-label=\"{}\"><source src=\"{}\" type=\"{}\"></video>{}</figure>",
                 render_media_label(block.header.as_deref()),
@@ -1175,6 +1371,7 @@ fn render_group(
     group: &crate::db::PostBlock,
     post_id: i64,
     prioritize_first_image: &mut bool,
+    media_prefix: Option<&str>,
 ) -> String {
     let mut html = String::from("<section class=\"post-group\">");
     if let Some(header) = &group.header {
@@ -1196,6 +1393,7 @@ fn render_group(
                 &group.children[start..index],
                 post_id,
                 prioritize_first_image,
+                media_prefix,
             ));
         } else {
             if child.header.is_some() || child.body.is_some() {
@@ -1219,12 +1417,13 @@ fn render_gallery(
     blocks: &[crate::db::PostBlock],
     post_id: i64,
     prioritize_first_image: &mut bool,
+    media_prefix: Option<&str>,
 ) -> String {
     let gallery_id = format!("gallery-{post_id}-{}", blocks[0].id);
     let mut html = format!("<div class=\"gallery\" data-gallery-run=\"{gallery_id}\">");
     for block in blocks {
         let content_type = block.content_type.as_deref().unwrap_or("");
-        let media_url = format!("/posts/{post_id}/blocks/{}/media", block.id);
+        let media_url = media_url(media_prefix, post_id, block.id);
         let alt = block.alt.as_deref().unwrap_or("");
         let header = block.header.as_deref().unwrap_or("");
         let caption = block.body.as_deref().unwrap_or("");
@@ -1304,19 +1503,30 @@ fn render_caption_span(caption: Option<&str>) -> String {
         .unwrap_or_default()
 }
 
-fn render_tags_html(tags: &[String]) -> String {
+fn media_url(media_prefix: Option<&str>, post_id: i64, block_id: i64) -> String {
+    match media_prefix {
+        Some(prefix) => format!("{prefix}/posts/{post_id}/blocks/{block_id}/media"),
+        None => format!("/posts/{post_id}/blocks/{block_id}/media"),
+    }
+}
+
+fn render_tags_html(tags: &[String], guest: bool) -> String {
     if tags.is_empty() {
         String::new()
     } else {
         format!(
-                "<p class=\"tags\"><span class=\"tag-label\">Tags:</span> {}</p>",
+            "<p class=\"tags\"><span class=\"tag-label\">Tags:</span> {}</p>",
             tags.iter()
                 .map(|tag| {
-                    format!(
-                        "<a class=\"tag\" href=\"/tags?tag={}\">{}</a>",
-                        encode_url_component(tag),
-                        escape_html(tag),
-                    )
+                    if guest {
+                        format!("<span class=\"tag\">{}</span>", escape_html(tag))
+                    } else {
+                        format!(
+                            "<a class=\"tag\" href=\"/tags?tag={}\">{}</a>",
+                            encode_url_component(tag),
+                            escape_html(tag),
+                        )
+                    }
                 })
                 .collect::<Vec<_>>()
                 .join(" "),
@@ -1453,6 +1663,15 @@ async fn media<S: StorageClient>(
             return StatusCode::INTERNAL_SERVER_ERROR.into_response();
         }
     };
+    proxy_media(&state.storage, media, method, headers).await
+}
+
+async fn proxy_media<S: StorageClient>(
+    storage: &S,
+    media: MediaReference,
+    method: Method,
+    headers: HeaderMap,
+) -> Response {
     let head = method == Method::HEAD;
     let range = if media.content_type.starts_with("video/") && !head {
         let mut values = headers.get_all(header::RANGE).iter();
@@ -1471,11 +1690,7 @@ async fn media<S: StorageClient>(
         None
     };
 
-    let stored = match state
-        .storage
-        .get(&media.storage_key, range, head)
-        .await
-    {
+    let stored = match storage.get(&media.storage_key, range, head).await {
         Ok(stored) => stored,
         Err(error) => {
             eprintln!("website storage request failed: {error}");

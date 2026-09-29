@@ -4,7 +4,12 @@ mod import;
 mod storage;
 mod web;
 
-use std::{error::Error, net::SocketAddr, path::PathBuf};
+use std::{
+    error::Error,
+    net::SocketAddr,
+    path::PathBuf,
+    time::{SystemTime, UNIX_EPOCH},
+};
 
 use db::Database;
 use storage::H2cStorageClient;
@@ -16,7 +21,7 @@ const HELP: &str = "\
 journey-site — read-only post backend and manifest importer
 
 Usage:
-  journey-site serve
+  journey-site serve [--allow-insecure-cookies]
   journey-site import <manifest.json>
   journey-site db tables
   journey-site db schema
@@ -27,6 +32,10 @@ Usage:
   journey-site users password <username>
   journey-site users disable <username>
   journey-site users enable <username>
+  journey-site share-links lifetime [seconds]
+  journey-site share-links create <published-post-id>
+  journey-site share-links list
+  journey-site share-links revoke <link-id>
   journey-site --help
 
 Environment:
@@ -50,6 +59,13 @@ Usage:
   journey-site users password <username>
   journey-site users disable <username>
   journey-site users enable <username>
+";
+const SHARE_LINKS_HELP: &str = "\
+Usage:
+  journey-site share-links lifetime [seconds]
+  journey-site share-links create <published-post-id>
+  journey-site share-links list
+  journey-site share-links revoke <link-id>
 ";
 
 #[tokio::main]
@@ -202,6 +218,113 @@ async fn main() -> AppResult<()> {
                 _ => Err("usage: journey-site users <create|list|password|disable|enable>".into()),
             }
         }
+        Some("share-links") => {
+            let subcommand = args.next().ok_or("share-links requires a subcommand")?;
+            if subcommand == "--help" || subcommand == "-h" {
+                if args.next().is_some() {
+                    return Err("share-links help does not take arguments".into());
+                }
+                print!("{SHARE_LINKS_HELP}");
+                return Ok(());
+            }
+            database.initialize().await.map_err(std::io::Error::other)?;
+            match subcommand.to_str() {
+                Some("lifetime") => {
+                    match args.next() {
+                        Some(value) => {
+                            let seconds = value
+                                .into_string()
+                                .map_err(|_| "share link lifetime must be UTF-8")?
+                                .parse::<i64>()?;
+                            if args.next().is_some() {
+                                return Err("usage: journey-site share-links lifetime [seconds]".into());
+                            }
+                            database
+                                .set_share_link_lifetime_seconds(seconds)
+                                .await
+                                .map_err(std::io::Error::other)?;
+                            println!("share link lifetime set to {seconds} seconds");
+                        }
+                        None => println!("{}", database.share_link_lifetime_seconds().await.map_err(std::io::Error::other)?),
+                    }
+                    Ok(())
+                }
+                Some("create") => {
+                    let post_id = args
+                        .next()
+                        .ok_or("share-links create requires a published post ID")?
+                        .into_string()
+                        .map_err(|_| "post ID must be UTF-8")?
+                        .parse::<i64>()?;
+                    if args.next().is_some() || post_id <= 0 {
+                        return Err("usage: journey-site share-links create <published-post-id>".into());
+                    }
+                    let bind = std::env::var("JOURNEY_SITE_BIND")
+                        .unwrap_or_else(|_| "127.0.0.1:8080".to_owned());
+                    let bind_address = bind.parse::<SocketAddr>()?;
+                    let origin = web::share_link_origin(bind_address).map_err(std::io::Error::other)?;
+                    let link_id = auth::new_share_link_id();
+                    let secret = auth::new_share_link_secret();
+                    let created_at = unix_time_seconds();
+                    match database
+                        .create_share_link(
+                            link_id.clone(),
+                            post_id,
+                            auth::session_token_digest(&secret),
+                            created_at,
+                        )
+                        .await
+                        .map_err(std::io::Error::other)?
+                    {
+                        Some(link) => {
+                            println!("{}", link_url(&origin, &link.id, &secret));
+                            Ok(())
+                        }
+                        None => Err(format!("published post {post_id} was not found").into()),
+                    }
+                }
+                Some("list") if args.next().is_none() => {
+                    let now = unix_time_seconds();
+                    println!("Link ID\tPost ID\tExpires (epoch seconds)\tExpires (UTC)\tRevocation status");
+                    for link in database.share_links().await.map_err(std::io::Error::other)? {
+                        let status = match link.revoked_at {
+                            Some(revoked_at) => format!("revoked at {revoked_at}"),
+                            None if link.expires_at <= now => "expired, not revoked".to_owned(),
+                            None => "not revoked".to_owned(),
+                        };
+                        println!(
+                            "{}\t{}\t{}\t{}\t{}",
+                            link.id,
+                            link.post_id,
+                            link.expires_at,
+                            link.expires_at_utc.as_deref().unwrap_or("out of range"),
+                            status,
+                        );
+                    }
+                    Ok(())
+                }
+                Some("revoke") => {
+                    let link_id = args
+                        .next()
+                        .ok_or("share-links revoke requires a link ID")?
+                        .into_string()
+                        .map_err(|_| "share link ID must be UTF-8")?;
+                    if args.next().is_some() {
+                        return Err("usage: journey-site share-links revoke <link-id>".into());
+                    }
+                    if !database
+                        .revoke_share_link(link_id.clone(), unix_time_seconds())
+                        .await
+                        .map_err(std::io::Error::other)?
+                    {
+                        return Err(format!("share link {link_id} was not found").into());
+                    }
+                    println!("revoked share link {link_id}");
+                    Ok(())
+                }
+                _ => Err("usage: journey-site share-links <lifetime|create|list|revoke>".into()),
+            }
+        }
         Some("serve") => {
             let next = args.next();
             if next.as_deref() == Some(std::ffi::OsStr::new("--help"))
@@ -210,19 +333,27 @@ async fn main() -> AppResult<()> {
                 if args.next().is_some() {
                     return Err("serve help does not take arguments".into());
                 }
-                println!("Usage: journey-site serve");
+                println!("Usage: journey-site serve [--allow-insecure-cookies]");
                 return Ok(());
             }
-            if next.is_some() {
-                return Err("serve does not take arguments".into());
+            let allow_insecure_cookies = match next.as_deref() {
+                None => false,
+                Some(flag) if flag == std::ffi::OsStr::new("--allow-insecure-cookies") => true,
+                Some(_) => return Err("usage: journey-site serve [--allow-insecure-cookies]".into()),
+            };
+            if args.next().is_some() {
+                return Err("usage: journey-site serve [--allow-insecure-cookies]".into());
             }
-            database.initialize().await.map_err(std::io::Error::other)?;
-            let storage = connect_storage().await?;
             let bind = std::env::var("JOURNEY_SITE_BIND")
                 .unwrap_or_else(|_| "127.0.0.1:8080".to_owned());
             let bind_address = bind.parse::<SocketAddr>()?;
-            let security = web::SiteSecurity::from_env(bind_address)
+            if allow_insecure_cookies && !bind_address.ip().is_loopback() {
+                return Err("--allow-insecure-cookies is only permitted when binding to loopback".into());
+            }
+            let security = web::SiteSecurity::from_env(bind_address, allow_insecure_cookies)
                 .map_err(std::io::Error::other)?;
+            database.initialize().await.map_err(std::io::Error::other)?;
+            let storage = connect_storage().await?;
             let listener = TcpListener::bind(&bind).await?;
             println!("journey-site HTTP listener on {}", listener.local_addr()?);
             axum::serve(
@@ -242,6 +373,18 @@ fn next_username(args: &mut impl Iterator<Item = std::ffi::OsString>) -> AppResu
         .ok_or_else(|| std::io::Error::other("users command requires a username"))?
         .into_string()
         .map_err(|_| std::io::Error::other("username must be UTF-8").into())
+}
+
+fn unix_time_seconds() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+        .min(i64::MAX as u64) as i64
+}
+
+fn link_url(origin: &str, link_id: &str, secret: &str) -> String {
+    format!("{origin}/share/{link_id}/{secret}")
 }
 
 fn read_new_password() -> AppResult<String> {

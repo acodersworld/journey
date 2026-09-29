@@ -90,6 +90,33 @@ CREATE TABLE IF NOT EXISTS login_throttles (
 );
 ";
 
+const SHARE_SCHEMA: &str = "\
+CREATE TABLE IF NOT EXISTS site_settings (
+    name TEXT PRIMARY KEY,
+    integer_value INTEGER NOT NULL CHECK (integer_value > 0)
+);
+INSERT OR IGNORE INTO site_settings (name, integer_value)
+VALUES ('share_link_lifetime_seconds', 86400);
+CREATE TABLE IF NOT EXISTS share_links (
+    id TEXT PRIMARY KEY,
+    post_id INTEGER NOT NULL REFERENCES posts(id) ON DELETE CASCADE,
+    token_digest TEXT NOT NULL UNIQUE CHECK (length(token_digest) = 64),
+    created_at INTEGER NOT NULL,
+    expires_at INTEGER NOT NULL CHECK (expires_at > created_at),
+    revoked_at INTEGER
+);
+CREATE INDEX IF NOT EXISTS share_links_post ON share_links(post_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS share_links_expiry ON share_links(expires_at);
+CREATE TABLE IF NOT EXISTS share_sessions (
+    token_digest TEXT PRIMARY KEY CHECK (length(token_digest) = 64),
+    share_link_id TEXT NOT NULL REFERENCES share_links(id) ON DELETE CASCADE,
+    created_at INTEGER NOT NULL,
+    expires_at INTEGER NOT NULL CHECK (expires_at > created_at)
+);
+CREATE INDEX IF NOT EXISTS share_sessions_expiry ON share_sessions(expires_at);
+CREATE INDEX IF NOT EXISTS share_sessions_link ON share_sessions(share_link_id);
+";
+
 #[derive(Clone)]
 pub struct Database {
     path: Arc<PathBuf>,
@@ -245,6 +272,20 @@ pub struct NewBlock {
 pub struct MediaReference {
     pub storage_key: String,
     pub content_type: String,
+}
+
+#[derive(Clone, Debug)]
+pub struct ShareLinkCreated {
+    pub id: String,
+}
+
+#[derive(Clone, Debug)]
+pub struct ShareLinkView {
+    pub id: String,
+    pub post_id: i64,
+    pub expires_at: i64,
+    pub expires_at_utc: Option<String>,
+    pub revoked_at: Option<i64>,
 }
 
 impl Database {
@@ -465,6 +506,198 @@ impl Database {
         .await
     }
 
+    pub async fn share_link_lifetime_seconds(&self) -> Result<i64, String> {
+        self.run(|connection| {
+            connection.query_row(
+                "SELECT integer_value FROM site_settings WHERE name = 'share_link_lifetime_seconds'",
+                [],
+                |row| row.get(0),
+            )
+        })
+        .await
+    }
+
+    pub async fn set_share_link_lifetime_seconds(&self, seconds: i64) -> Result<(), String> {
+        if seconds <= 0 {
+            return Err("share link lifetime must be a positive integer number of seconds".to_owned());
+        }
+        self.run(move |connection| {
+            connection.execute(
+                "UPDATE site_settings SET integer_value = ?1 WHERE name = 'share_link_lifetime_seconds'",
+                [seconds],
+            )?;
+            Ok(())
+        })
+        .await
+    }
+
+    pub async fn create_share_link(
+        &self,
+        id: String,
+        post_id: i64,
+        token_digest: String,
+        created_at: i64,
+    ) -> Result<Option<ShareLinkCreated>, String> {
+        self.run(move |connection| {
+            let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let published = transaction.query_row(
+                "SELECT EXISTS(SELECT 1 FROM posts WHERE id = ?1 AND published = 1)",
+                [post_id],
+                |row| row.get::<_, bool>(0),
+            )?;
+            if !published {
+                transaction.commit()?;
+                return Ok(None);
+            }
+            let lifetime = transaction.query_row(
+                "SELECT integer_value FROM site_settings WHERE name = 'share_link_lifetime_seconds'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )?;
+            let expires_at = created_at
+                .checked_add(lifetime)
+                .ok_or(rusqlite::Error::IntegralValueOutOfRange(0, lifetime))?;
+            transaction.execute(
+                "INSERT INTO share_links (id, post_id, token_digest, created_at, expires_at) \
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![id, post_id, token_digest, created_at, expires_at],
+            )?;
+            transaction.commit()?;
+            Ok(Some(ShareLinkCreated { id }))
+        })
+        .await
+    }
+
+    pub async fn share_links(&self) -> Result<Vec<ShareLinkView>, String> {
+        self.run(|connection| {
+            let mut statement = connection.prepare(
+                "SELECT id, post_id, expires_at, \
+                 strftime('%Y-%m-%dT%H:%M:%SZ', expires_at, 'unixepoch'), revoked_at \
+                 FROM share_links \
+                 ORDER BY created_at DESC, id",
+            )?;
+            let rows = statement.query_map([], |row| {
+                Ok(ShareLinkView {
+                    id: row.get(0)?,
+                    post_id: row.get(1)?,
+                    expires_at: row.get(2)?,
+                    expires_at_utc: row.get(3)?,
+                    revoked_at: row.get(4)?,
+                })
+            })?;
+            rows.collect()
+        })
+        .await
+    }
+
+    pub async fn revoke_share_link(&self, id: String, revoked_at: i64) -> Result<bool, String> {
+        self.run(move |connection| {
+            let changed = connection.execute(
+                "UPDATE share_links SET revoked_at = COALESCE(revoked_at, ?2) WHERE id = ?1",
+                params![id, revoked_at],
+            )?;
+            Ok(changed != 0)
+        })
+        .await
+    }
+
+    pub async fn issue_share_session(
+        &self,
+        share_link_id: String,
+        link_token_digest: String,
+        session_token_digest: String,
+        created_at: i64,
+    ) -> Result<Option<(i64, i64)>, String> {
+        self.run(move |connection| {
+            let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let link = transaction
+                .query_row(
+                    "SELECT l.post_id, l.expires_at FROM share_links AS l \
+                     JOIN posts AS p ON p.id = l.post_id \
+                     WHERE l.id = ?1 AND l.token_digest = ?2 AND l.expires_at > ?3 \
+                       AND l.revoked_at IS NULL AND p.published = 1",
+                    params![share_link_id, link_token_digest, created_at],
+                    |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
+                )
+                .optional()?;
+            let Some((post_id, expires_at)) = link else {
+                transaction.commit()?;
+                return Ok(None);
+            };
+            transaction.execute(
+                "INSERT INTO share_sessions (token_digest, share_link_id, created_at, expires_at) \
+                 VALUES (?1, ?2, ?3, ?4)",
+                params![session_token_digest, share_link_id, created_at, expires_at],
+            )?;
+            transaction.commit()?;
+            Ok(Some((post_id, expires_at)))
+        })
+        .await
+    }
+
+    pub async fn shared_post(
+        &self,
+        share_link_id: String,
+        session_token_digest: String,
+        post_id: i64,
+        now: i64,
+    ) -> Result<Option<Post>, String> {
+        self.run(move |connection| {
+            let transaction = connection.transaction()?;
+            let authorized = transaction.query_row(
+                "SELECT EXISTS(SELECT 1 FROM share_sessions AS s \
+                 JOIN share_links AS l ON l.id = s.share_link_id \
+                 JOIN posts AS p ON p.id = l.post_id \
+                 WHERE s.token_digest = ?1 AND s.share_link_id = ?2 \
+                   AND s.expires_at > ?4 AND l.expires_at > ?4 \
+                   AND l.revoked_at IS NULL AND p.published = 1 AND p.id = ?3)",
+                params![session_token_digest, share_link_id, post_id, now],
+                |row| row.get::<_, bool>(0),
+            )?;
+            let post = if authorized {
+                load_post(&transaction, post_id, PostAccess::Published)?
+            } else {
+                None
+            };
+            transaction.commit()?;
+            Ok(post)
+        })
+        .await
+    }
+
+    pub async fn shared_media_reference(
+        &self,
+        share_link_id: String,
+        session_token_digest: String,
+        post_id: i64,
+        block_id: i64,
+        now: i64,
+    ) -> Result<Option<MediaReference>, String> {
+        self.run(move |connection| {
+            connection
+                .query_row(
+                    "SELECT b.storage_key, b.content_type FROM share_sessions AS s \
+                     JOIN share_links AS l ON l.id = s.share_link_id \
+                     JOIN posts AS p ON p.id = l.post_id \
+                     JOIN post_blocks AS b ON b.post_id = p.id \
+                     WHERE s.token_digest = ?1 AND s.share_link_id = ?2 \
+                       AND s.expires_at > ?5 AND l.expires_at > ?5 \
+                       AND l.revoked_at IS NULL AND p.published = 1 \
+                       AND p.id = ?3 AND b.id = ?4 AND b.storage_key IS NOT NULL \
+                       AND (b.content_type LIKE 'image/%' OR b.content_type LIKE 'video/%')",
+                    params![session_token_digest, share_link_id, post_id, block_id, now],
+                    |row| {
+                        Ok(MediaReference {
+                            storage_key: row.get(0)?,
+                            content_type: row.get(1)?,
+                        })
+                    },
+                )
+                .optional()
+        })
+        .await
+    }
+
     pub async fn record_login_attempt(
         &self,
         username_digest: String,
@@ -643,64 +876,9 @@ impl Database {
     ) -> Result<Option<Post>, String> {
         self.run(move |connection| {
             let transaction = connection.transaction()?;
-            let post_row = transaction
-                .query_row(
-                    "SELECT id, title, published_at, summary, tags FROM posts WHERE id = ?1 AND (?2 = 1 OR published = 1)",
-                    params![id, access.includes_drafts()],
-                    |row| {
-                        let tags_json: String = row.get(4)?;
-                        let tags = serde_json::from_str(&tags_json).map_err(|error| {
-                            rusqlite::Error::FromSqlConversionFailure(
-                                4,
-                                Type::Text,
-                                Box::new(error),
-                            )
-                        })?;
-                        Ok((post_summary_from_row(row)?, tags))
-                    },
-                )
-                .optional()?;
-            let Some((summary, tags)) = post_row else {
-                transaction.commit()?;
-                return Ok(None);
-            };
-
-            let (mut blocks, mut children) = {
-                let mut statement = transaction.prepare(
-                    "SELECT id, parent_id, position, header, body, content_type, alt_text \
-                     FROM post_blocks WHERE post_id = ?1 \
-                     ORDER BY parent_id IS NOT NULL, parent_id, position",
-                )?;
-                let rows = statement.query_map([id], |row| {
-                    let parent_id: Option<i64> = row.get(1)?;
-                    let block = PostBlock {
-                        id: row.get(0)?,
-                        position: row.get(2)?,
-                        header: row.get(3)?,
-                        body: row.get(4)?,
-                        content_type: row.get(5)?,
-                        alt: row.get(6)?,
-                        children: Vec::new(),
-                    };
-                    Ok((parent_id, block))
-                })?;
-                let mut blocks = Vec::new();
-                let mut children = HashMap::<i64, Vec<PostBlock>>::new();
-                for row in rows {
-                    let (parent_id, block) = row?;
-                    if let Some(parent_id) = parent_id {
-                        children.entry(parent_id).or_default().push(block);
-                    } else {
-                        blocks.push(block);
-                    }
-                }
-                (blocks, children)
-            };
-            for block in &mut blocks {
-                block.children = children.remove(&block.id).unwrap_or_default();
-            }
+            let post = load_post(&transaction, id, access)?;
             transaction.commit()?;
-            Ok(Some(Post { summary, tags, blocks }))
+            Ok(post)
         })
         .await
     }
@@ -781,6 +959,11 @@ impl Database {
             connection
                 .pragma_update(None, "foreign_keys", "ON")
                 .map_err(|error| error.to_string())?;
+            if table_exists(&connection, "share_sessions").map_err(|error| error.to_string())? {
+                connection
+                    .execute("DELETE FROM share_sessions WHERE expires_at <= ?1", [unix_time_seconds()])
+                    .map_err(|error| error.to_string())?;
+            }
             operation(&mut connection).map_err(|error| error.to_string())
         })
         .await
@@ -819,8 +1002,72 @@ fn initialize_schema(connection: &mut Connection) -> rusqlite::Result<()> {
         transaction.execute_batch(POST_BLOCKS_SCHEMA)?;
     }
     transaction.execute_batch(AUTH_SCHEMA)?;
-    transaction.pragma_update(None, "user_version", 3)?;
+    transaction.execute_batch(SHARE_SCHEMA)?;
+    transaction.pragma_update(None, "user_version", 4)?;
     transaction.commit()
+}
+
+fn load_post(
+    connection: &Connection,
+    id: i64,
+    access: PostAccess,
+) -> rusqlite::Result<Option<Post>> {
+    let post_row = connection
+        .query_row(
+            "SELECT id, title, published_at, summary, tags FROM posts WHERE id = ?1 AND (?2 = 1 OR published = 1)",
+            params![id, access.includes_drafts()],
+            |row| {
+                let tags_json: String = row.get(4)?;
+                let tags = serde_json::from_str(&tags_json).map_err(|error| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        4,
+                        Type::Text,
+                        Box::new(error),
+                    )
+                })?;
+                Ok((post_summary_from_row(row)?, tags))
+            },
+        )
+        .optional()?;
+    let Some((summary, tags)) = post_row else {
+        return Ok(None);
+    };
+
+    let (mut blocks, mut children) = {
+        let mut statement = connection.prepare(
+            "SELECT id, parent_id, position, header, body, content_type, alt_text \
+             FROM post_blocks WHERE post_id = ?1 \
+             ORDER BY parent_id IS NOT NULL, parent_id, position",
+        )?;
+        let rows = statement.query_map([id], |row| {
+            let parent_id: Option<i64> = row.get(1)?;
+            let block = PostBlock {
+                id: row.get(0)?,
+                position: row.get(2)?,
+                header: row.get(3)?,
+                body: row.get(4)?,
+                content_type: row.get(5)?,
+                alt: row.get(6)?,
+                children: Vec::new(),
+            };
+            Ok((parent_id, block))
+        })?;
+        let mut blocks = Vec::new();
+        let mut children = HashMap::<i64, Vec<PostBlock>>::new();
+        for row in rows {
+            let (parent_id, block) = row?;
+            if let Some(parent_id) = parent_id {
+                children.entry(parent_id).or_default().push(block);
+            } else {
+                blocks.push(block);
+            }
+        }
+        (blocks, children)
+    };
+    for block in &mut blocks {
+        block.children = children.remove(&block.id).unwrap_or_default();
+    }
+    Ok(Some(Post { summary, tags, blocks }))
 }
 
 fn account_role_from_db(value: &str) -> rusqlite::Result<AccountRole> {
