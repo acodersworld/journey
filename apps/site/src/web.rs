@@ -9,7 +9,7 @@ use axum::{
 use serde::Deserialize;
 
 use crate::{
-    db::{Database, FeedCursor, FeedPage, Post, PostSummary},
+    db::{Database, FeedCursor, Post},
     storage::StorageClient,
 };
 
@@ -31,8 +31,11 @@ struct FeedQuery {
 pub fn router<S: StorageClient>(state: AppState<S>) -> Router {
     Router::new()
         .route("/", get(home::<S>))
+        .route("/site.css", get(site_css))
+        .route("/site.js", get(site_js))
         .route("/api/posts", get(feed::<S>))
         .route("/api/posts/{id}", get(api_full_post::<S>))
+        .route("/posts/{id}/fragment", get(post_fragment::<S>))
         .route("/posts/{id}", get(post_page::<S>))
         .route(
             "/posts/{post_id}/blocks/{block_id}/media",
@@ -66,8 +69,23 @@ async fn feed<S: StorageClient>(
 }
 
 async fn home<S: StorageClient>(State(state): State<AppState<S>>) -> Response {
-    match state.database.feed(DEFAULT_FEED_LIMIT, None).await {
-        Ok(page) => Html(render_home(&page)).into_response(),
+    match state.database.feed(1, None).await {
+        Ok(page) => {
+            let initial_post = match page.posts.first() {
+                Some(summary) => match state.database.post(summary.id).await {
+                    Ok(post) => post,
+                    Err(error) => {
+                        eprintln!("website home post query failed: {error}");
+                        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+                    }
+                },
+                None => None,
+            };
+            let next_cursor = initial_post
+                .as_ref()
+                .and(page.next_cursor.as_deref());
+            Html(render_home(initial_post.as_ref(), next_cursor)).into_response()
+        }
         Err(error) => {
             eprintln!("website home query failed: {error}");
             StatusCode::INTERNAL_SERVER_ERROR.into_response()
@@ -101,6 +119,28 @@ async fn post_page<S: StorageClient>(
             StatusCode::INTERNAL_SERVER_ERROR.into_response()
         }
     }
+}
+
+async fn post_fragment<S: StorageClient>(
+    State(state): State<AppState<S>>,
+    Path(id): Path<i64>,
+) -> Response {
+    match state.database.post(id).await {
+        Ok(Some(post)) => Html(pretty_html(&render_post(&post, false))).into_response(),
+        Ok(None) => StatusCode::NOT_FOUND.into_response(),
+        Err(error) => {
+            eprintln!("website post fragment query failed: {error}");
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        }
+    }
+}
+
+async fn site_css() -> impl IntoResponse {
+    ([(header::CONTENT_TYPE, "text/css; charset=utf-8")], SITE_CSS)
+}
+
+async fn site_js() -> impl IntoResponse {
+    ([(header::CONTENT_TYPE, "text/javascript; charset=utf-8")], SITE_JS)
 }
 
 fn parse_cursor(value: &str) -> Option<FeedCursor> {
@@ -146,92 +186,258 @@ fn valid_publication_date(value: &str) -> bool {
     day > 0 && day <= month_days
 }
 
-fn render_home(page: &FeedPage) -> String {
-    let mut html = format!(
-        "<!doctype html><html lang=\"en\"><head>{}</head><body><main class=\"site\"><header><h1>Journey</h1><p>Stories from the road.</p></header><section id=\"feed\" aria-label=\"Posts\" data-next-cursor=\"{}\">",
-        html_head("Journey"),
-        escape_html(page.next_cursor.as_deref().unwrap_or("")),
+fn render_full_post(post: &Post) -> String {
+    let html = format!(
+        "<!doctype html><html lang=\"en\"><head>{}</head><body><main class=\"site site-post\"><p class=\"back-link\"><a href=\"/\">Journey</a></p>{}</main>{}</body></html>",
+        html_head(&post.summary.title),
+        render_post(post, true),
+        SLIDESHOW_HTML,
     );
-    for post in &page.posts {
-        html.push_str(&render_preview(post));
+    pretty_html(&html)
+}
+
+fn render_home(initial_post: Option<&Post>, next_cursor: Option<&str>) -> String {
+    let mut html = format!(
+        "<!doctype html><html lang=\"en\"><head>{}</head><body><main class=\"site\"><header class=\"site-header\"><a class=\"site-name\" href=\"/\">Journey</a><p>Stories from the road.</p></header><section id=\"feed\" aria-label=\"Posts\" data-next-cursor=\"{}\">",
+        html_head("Journey"),
+        escape_html(next_cursor.unwrap_or("")),
+    );
+    if let Some(post) = initial_post {
+        html.push_str(&render_post(post, true));
+    } else {
+        html.push_str("<p class=\"empty-feed\">No published posts yet.</p>");
     }
     html.push_str("</section><div id=\"feed-sentinel\" aria-hidden=\"true\"></div><p id=\"feed-status\" role=\"status\" aria-live=\"polite\">");
-    if page.next_cursor.is_none() {
+    if next_cursor.is_none() {
         html.push_str("You have reached the end of the feed.");
     }
     html.push_str("</p><button id=\"load-more\" type=\"button\"");
-    if page.next_cursor.is_none() {
+    if next_cursor.is_none() {
         html.push_str(" disabled");
     }
-    html.push_str(">Load more</button></main><script>");
-    html.push_str(FEED_SCRIPT);
-    html.push_str("</script></body></html>");
-    html
+    html.push_str(">Load more</button></main>");
+    html.push_str(SLIDESHOW_HTML);
+    html.push_str("</body></html>");
+    pretty_html(&html)
 }
 
-fn render_preview(post: &PostSummary) -> String {
+fn render_post(post: &Post, prioritize_first_image: bool) -> String {
     format!(
-        "<article class=\"post-preview\" data-post-id=\"{}\"><h2>{}</h2><time datetime=\"{}\">{}</time><p class=\"summary\">{}</p><p class=\"post-actions\"><button class=\"expand-post\" type=\"button\" aria-expanded=\"false\" aria-controls=\"post-content-{}\">Expand post</button> <a href=\"/posts/{}\">Open post</a></p><div class=\"post-content\" id=\"post-content-{}\" hidden></div><p class=\"post-status\" role=\"status\" aria-live=\"polite\"></p></article>",
-        post.id,
-        escape_html(&post.title),
-        escape_html(&post.published_at),
-        escape_html(&post.published_at),
-        escape_html(&post.summary),
-        post.id,
-        post.id,
-        post.id,
-    )
-}
-
-fn render_full_post(post: &Post) -> String {
-    format!(
-        "<!doctype html><html lang=\"en\"><head>{}</head><body><main class=\"site\"><p><a href=\"/\">Journey</a></p><article><h1>{}</h1><time datetime=\"{}\">{}</time><p class=\"summary\">{}</p>{}{}</article></main></body></html>",
-        html_head(&post.summary.title),
+        "<article class=\"post\" data-post-id=\"{}\"><header class=\"post-header\"><h1>{}</h1><time datetime=\"{}\">{}</time><p class=\"summary\">{}</p></header>{}{}</article>",
+        post.summary.id,
         escape_html(&post.summary.title),
         escape_html(&post.summary.published_at),
         escape_html(&post.summary.published_at),
         escape_html(&post.summary.summary),
         render_tags_html(&post.tags),
-        render_post_blocks_html(post),
+        render_post_blocks_html(post, prioritize_first_image),
     )
 }
 
-fn render_post_blocks_html(post: &Post) -> String {
-    render_blocks_html(&post.blocks, post.summary.id)
+fn render_post_blocks_html(post: &Post, prioritize_first_image: bool) -> String {
+    let mut prioritize_first_image = prioritize_first_image;
+    render_blocks_html(&post.blocks, post.summary.id, &mut prioritize_first_image)
 }
 
-fn render_blocks_html(blocks: &[crate::db::PostBlock], post_id: i64) -> String {
+fn render_blocks_html(
+    blocks: &[crate::db::PostBlock],
+    post_id: i64,
+    prioritize_first_image: &mut bool,
+) -> String {
     let mut html = String::new();
     for block in blocks {
-        if let Some(header) = &block.header {
-            html.push_str(&format!("<h2>{}</h2>", escape_html(header)));
+        if block.children.is_empty() {
+            html.push_str(&render_standalone_block(block, post_id, prioritize_first_image));
+        } else {
+            html.push_str(&render_group(block, post_id, prioritize_first_image));
         }
-        match block.content_type.as_deref() {
-            Some(content_type) if content_type.starts_with("image/") => {
-                let media_url = format!("/posts/{post_id}/blocks/{}/media", block.id);
-                html.push_str(&format!(
-                    "<figure><img src=\"{media_url}\" alt=\"{}\" loading=\"lazy\">{}</figure>",
-                    escape_html(block.alt.as_deref().unwrap_or("")),
-                    render_caption(block.body.as_deref()),
-                ));
-            }
-            Some(content_type) if content_type.starts_with("video/") => {
-                let media_url = format!("/posts/{post_id}/blocks/{}/media", block.id);
-                html.push_str(&format!(
-                    "<figure><video controls preload=\"metadata\"><source src=\"{media_url}\" type=\"{}\"></video>{}</figure>",
-                    escape_html(content_type),
-                    render_caption(block.body.as_deref()),
-                ));
-            }
-            _ => {
-                if let Some(body) = &block.body {
-                    html.push_str(&format!("<p>{}</p>", escape_html(body)));
-                }
-            }
-        }
-        html.push_str(&render_blocks_html(&block.children, post_id));
     }
     html
+}
+
+fn render_standalone_block(
+    block: &crate::db::PostBlock,
+    post_id: i64,
+    prioritize_first_image: &mut bool,
+) -> String {
+    let mut html = String::new();
+    match block.content_type.as_deref() {
+        Some(content_type) if content_type.starts_with("image/") => {
+            let media_url = format!("/posts/{post_id}/blocks/{}/media", block.id);
+            let loading = image_loading(prioritize_first_image);
+            let alt = block.alt.as_deref().unwrap_or("");
+            let label = media_accessible_label(block.header.as_deref(), block.body.as_deref(), alt);
+            html.push_str(&format!(
+                "<figure class=\"single-media\"><button class=\"gallery-item solo-media\" type=\"button\" data-gallery=\"solo-{post_id}-{}\" data-media-type=\"{}\" data-media-src=\"{}\" data-alt=\"{}\" data-label=\"{}\" data-caption=\"{}\" aria-label=\"Open image: {}\"><img src=\"{}\" alt=\"{}\" loading=\"{}\"{}></button>{}{}</figure>",
+                block.id,
+                escape_html(content_type),
+                media_url,
+                escape_html(alt),
+                escape_html(block.header.as_deref().unwrap_or("")),
+                escape_html(block.body.as_deref().unwrap_or("")),
+                escape_html(&label),
+                media_url,
+                escape_html(alt),
+                loading,
+                image_fetch_priority(loading),
+                render_media_label(block.header.as_deref()),
+                render_caption(block.body.as_deref()),
+            ));
+        }
+        Some(content_type) if content_type.starts_with("video/") => {
+            let media_url = format!("/posts/{post_id}/blocks/{}/media", block.id);
+            html.push_str(&format!(
+                "<figure class=\"single-media\">{}<video controls preload=\"metadata\" aria-label=\"{}\"><source src=\"{}\" type=\"{}\"></video>{}</figure>",
+                render_media_label(block.header.as_deref()),
+                escape_html(&media_accessible_label(block.header.as_deref(), block.body.as_deref(), "video")),
+                media_url,
+                escape_html(content_type),
+                render_caption(block.body.as_deref()),
+            ));
+        }
+        _ => {
+            if let Some(header) = &block.header {
+                html.push_str(&format!("<h2>{}</h2>", escape_html(header)));
+            }
+            if let Some(body) = &block.body {
+                html.push_str(&format!("<p class=\"block-copy\">{}</p>", escape_html(body)));
+            }
+        }
+    }
+    html
+}
+
+fn render_group(
+    group: &crate::db::PostBlock,
+    post_id: i64,
+    prioritize_first_image: &mut bool,
+) -> String {
+    let mut html = String::from("<section class=\"post-group\">");
+    if let Some(header) = &group.header {
+        html.push_str(&format!("<h2>{}</h2>", escape_html(header)));
+    }
+    if let Some(body) = &group.body {
+        html.push_str(&format!("<p class=\"group-description\">{}</p>", escape_html(body)));
+    }
+
+    let mut index = 0;
+    while index < group.children.len() {
+        let child = &group.children[index];
+        if is_media_block(child) {
+            let start = index;
+            while index < group.children.len() && is_media_block(&group.children[index]) {
+                index += 1;
+            }
+            html.push_str(&render_gallery(
+                &group.children[start..index],
+                post_id,
+                prioritize_first_image,
+            ));
+        } else {
+            if child.header.is_some() || child.body.is_some() {
+                html.push_str("<div class=\"group-note\">");
+                if let Some(header) = &child.header {
+                    html.push_str(&format!("<h3>{}</h3>", escape_html(header)));
+                }
+                if let Some(body) = &child.body {
+                    html.push_str(&format!("<p>{}</p>", escape_html(body)));
+                }
+                html.push_str("</div>");
+            }
+            index += 1;
+        }
+    }
+    html.push_str("</section>");
+    html
+}
+
+fn render_gallery(
+    blocks: &[crate::db::PostBlock],
+    post_id: i64,
+    prioritize_first_image: &mut bool,
+) -> String {
+    let gallery_id = format!("gallery-{post_id}-{}", blocks[0].id);
+    let mut html = format!("<div class=\"gallery\" data-gallery-run=\"{gallery_id}\">");
+    for block in blocks {
+        let content_type = block.content_type.as_deref().unwrap_or("");
+        let media_url = format!("/posts/{post_id}/blocks/{}/media", block.id);
+        let alt = block.alt.as_deref().unwrap_or("");
+        let header = block.header.as_deref().unwrap_or("");
+        let caption = block.body.as_deref().unwrap_or("");
+        let label = media_accessible_label(block.header.as_deref(), block.body.as_deref(), alt);
+        html.push_str(&format!(
+            "<button class=\"gallery-item\" type=\"button\" data-gallery=\"{gallery_id}\" data-media-type=\"{}\" data-media-src=\"{}\" data-alt=\"{}\" data-label=\"{}\" data-caption=\"{}\" aria-label=\"Open media: {}\">",
+            escape_html(content_type),
+            media_url,
+            escape_html(alt),
+            escape_html(header),
+            escape_html(caption),
+            escape_html(&label),
+        ));
+        if content_type.starts_with("image/") {
+            let loading = image_loading(prioritize_first_image);
+            html.push_str(&format!(
+                "<img src=\"{}\" alt=\"{}\" loading=\"{}\"{}>",
+                media_url,
+                escape_html(alt),
+                loading,
+                image_fetch_priority(loading),
+            ));
+        } else {
+            html.push_str("<span class=\"video-placeholder\" aria-hidden=\"true\"><span class=\"play-icon\">▶</span><span>Video</span></span>");
+        }
+        html.push_str(&render_media_label(block.header.as_deref()));
+        html.push_str(&render_caption_span(block.body.as_deref()));
+        html.push_str("</button>");
+    }
+    html.push_str("</div>");
+    html
+}
+
+fn is_media_block(block: &crate::db::PostBlock) -> bool {
+    block
+        .content_type
+        .as_deref()
+        .is_some_and(|content_type| content_type.starts_with("image/") || content_type.starts_with("video/"))
+}
+
+fn image_loading(prioritize_first_image: &mut bool) -> &'static str {
+    if *prioritize_first_image {
+        *prioritize_first_image = false;
+        "eager"
+    } else {
+        "lazy"
+    }
+}
+
+fn image_fetch_priority(loading: &str) -> &'static str {
+    if loading == "eager" {
+        " fetchpriority=\"high\""
+    } else {
+        ""
+    }
+}
+
+fn media_accessible_label(header: Option<&str>, caption: Option<&str>, fallback: &str) -> String {
+    header
+        .filter(|value| !value.is_empty())
+        .or_else(|| caption.filter(|value| !value.is_empty()))
+        .unwrap_or_else(|| if fallback.is_empty() { "media" } else { fallback })
+        .to_owned()
+}
+
+fn render_media_label(label: Option<&str>) -> String {
+    label
+        .filter(|label| !label.is_empty())
+        .map(|label| format!("<span class=\"media-label\">{}</span>", escape_html(label)))
+        .unwrap_or_default()
+}
+
+fn render_caption_span(caption: Option<&str>) -> String {
+    caption
+        .filter(|caption| !caption.is_empty())
+        .map(|caption| format!("<span class=\"gallery-caption\">{}</span>", escape_html(caption)))
+        .unwrap_or_default()
 }
 
 fn render_tags_html(tags: &[String]) -> String {
@@ -239,8 +445,11 @@ fn render_tags_html(tags: &[String]) -> String {
         String::new()
     } else {
         format!(
-            "<p class=\"tags\">Tags: {}</p>",
-            tags.iter().map(|tag| escape_html(tag)).collect::<Vec<_>>().join(", "),
+            "<p class=\"tags\"><span class=\"tag-label\">Tags:</span> {}</p>",
+            tags.iter()
+                .map(|tag| format!("<span class=\"tag\">{}</span>", escape_html(tag)))
+                .collect::<Vec<_>>()
+                .join(" "),
         )
     }
 }
@@ -254,10 +463,91 @@ fn render_caption(caption: Option<&str>) -> String {
 
 fn html_head(title: &str) -> String {
     format!(
-        "<meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width, initial-scale=1\"><title>{}</title><style>body{{margin:0;color:#202421;background:#f5f4ef;font:1rem/1.6 system-ui,sans-serif}}.site{{max-width:48rem;margin:0 auto;padding:2rem 1.25rem}}header{{margin-bottom:2rem}}.post-preview{{padding:1.5rem 0;border-top:1px solid #c9c9c1}}time{{color:#62675f;font-size:.9rem}}.summary{{white-space:pre-wrap}}.post-actions{{display:flex;gap:1rem;align-items:center}}button,a{{font:inherit}}button{{padding:.5rem .8rem}}.post-content{{margin-top:1.5rem}}img,video{{display:block;max-width:100%;height:auto}}figure{{margin:1.5rem 0}}figcaption{{color:#62675f;font-size:.9rem}}#feed-status{{min-height:1.6em}}#feed-sentinel{{height:1px}}</style>",
+        "<meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width, initial-scale=1\"><title>{}</title><link rel=\"stylesheet\" href=\"/site.css\"><script src=\"/site.js\" defer></script>",
         escape_html(title),
     )
 }
+
+// Format adjacent markup tokens while leaving text nodes unchanged.
+fn pretty_html(markup: &str) -> String {
+    let mut formatted = String::with_capacity(markup.len() + markup.len() / 3);
+    let mut depth = 0usize;
+    let mut cursor = 0usize;
+    let mut previous_was_tag = false;
+
+    while cursor < markup.len() {
+        if markup.as_bytes()[cursor] != b'<' {
+            let next_tag = markup[cursor..]
+                .find('<')
+                .map(|offset| cursor + offset)
+                .unwrap_or(markup.len());
+            formatted.push_str(&markup[cursor..next_tag]);
+            cursor = next_tag;
+            previous_was_tag = false;
+            continue;
+        }
+
+        let mut end = cursor + 1;
+        let mut quote = None;
+        while end < markup.len() {
+            let character = markup.as_bytes()[end];
+            match (quote, character) {
+                (Some(active), byte) if active == byte => quote = None,
+                (None, b'\'' | b'"') => quote = Some(character),
+                (None, b'>') => break,
+                _ => {}
+            }
+            end += 1;
+        }
+        if end == markup.len() {
+            formatted.push_str(&markup[cursor..]);
+            break;
+        }
+
+        let tag = &markup[cursor..=end];
+        let closing = tag.starts_with("</");
+        let special = tag.starts_with("<!") || tag.starts_with("<?");
+        let name_start = if closing { 2 } else { 1 };
+        let name_end = tag[name_start..]
+            .find(|character: char| !(character.is_ascii_alphanumeric() || character == '-'))
+            .map(|offset| name_start + offset)
+            .unwrap_or(tag.len() - 1);
+        let name = &tag[name_start..name_end];
+        let self_closing = tag[..tag.len() - 1].trim_end().ends_with('/');
+
+        if closing {
+            depth = depth.saturating_sub(1);
+        }
+        if previous_was_tag {
+            formatted.push('\n');
+            for _ in 0..depth {
+                formatted.push_str("  ");
+            }
+        }
+        formatted.push_str(tag);
+
+        if !closing
+            && !special
+            && !self_closing
+            && !matches!(name, "area" | "base" | "br" | "col" | "embed" | "hr" | "img" | "input" | "link" | "meta" | "param" | "source" | "track" | "wbr")
+        {
+            depth += 1;
+        }
+
+        cursor = end + 1;
+        previous_was_tag = true;
+    }
+
+    if !formatted.ends_with('\n') {
+        formatted.push('\n');
+    }
+    formatted
+}
+
+const SLIDESHOW_HTML: &str = "<dialog id=\"slideshow\" class=\"slideshow\" aria-label=\"Photo slideshow\"><button class=\"slideshow-close\" type=\"button\" aria-label=\"Close slideshow\">×</button><div class=\"slideshow-stage\"><button class=\"slideshow-nav slideshow-previous\" type=\"button\" aria-label=\"Previous item\">‹</button><div class=\"slideshow-media\" id=\"slideshow-media\"></div><button class=\"slideshow-nav slideshow-next\" type=\"button\" aria-label=\"Next item\">›</button></div><p class=\"slideshow-label\" id=\"slideshow-label\"></p><p class=\"slideshow-caption\" id=\"slideshow-caption\"></p></dialog>";
+
+const SITE_CSS: &str = include_str!("../static/site.css");
+const SITE_JS: &str = include_str!("../static/site.js");
 
 fn escape_html(value: &str) -> String {
     let mut escaped = String::with_capacity(value.len());
@@ -273,174 +563,6 @@ fn escape_html(value: &str) -> String {
     }
     escaped
 }
-
-const FEED_SCRIPT: &str = r#"
-const feed = document.querySelector('#feed');
-const status = document.querySelector('#feed-status');
-const loadButton = document.querySelector('#load-more');
-const sentinel = document.querySelector('#feed-sentinel');
-let nextCursor = feed.dataset.nextCursor || null;
-let loadingFeed = false;
-let lastScrollY = window.scrollY;
-let hasScrolledDown = false;
-
-function makeElement(tag, text) {
-  const element = document.createElement(tag);
-  if (text !== undefined && text !== null) element.textContent = text;
-  return element;
-}
-
-function makePreview(post) {
-  const article = document.createElement('article');
-  article.className = 'post-preview';
-  article.dataset.postId = String(post.id);
-  article.append(makeElement('h2', post.title));
-  const time = makeElement('time', post.published_at);
-  time.dateTime = post.published_at;
-  article.append(time, makeElement('p', post.summary));
-  article.lastElementChild.className = 'summary';
-
-  const actions = makeElement('p');
-  actions.className = 'post-actions';
-  const expand = makeElement('button', 'Expand post');
-  expand.type = 'button';
-  expand.className = 'expand-post';
-  expand.setAttribute('aria-expanded', 'false');
-  expand.setAttribute('aria-controls', `post-content-${post.id}`);
-  const link = makeElement('a', 'Open post');
-  link.href = `/posts/${post.id}`;
-  actions.append(expand, link);
-  const content = makeElement('div');
-  content.className = 'post-content';
-  content.id = `post-content-${post.id}`;
-  content.hidden = true;
-  const postStatus = makeElement('p');
-  postStatus.className = 'post-status';
-  postStatus.setAttribute('role', 'status');
-  postStatus.setAttribute('aria-live', 'polite');
-  article.append(actions, content, postStatus);
-  feed.append(article);
-}
-
-function renderBlocks(container, blocks, postId) {
-  for (const block of blocks) {
-    if (block.header) container.append(makeElement('h2', block.header));
-    const contentType = block.content_type || '';
-    if (contentType.startsWith('image/')) {
-      const figure = makeElement('figure');
-      const image = makeElement('img');
-      image.src = `/posts/${postId}/blocks/${block.id}/media`;
-      image.alt = block.alt || '';
-      image.loading = 'lazy';
-      figure.append(image);
-      if (block.body) figure.append(makeElement('figcaption', block.body));
-      container.append(figure);
-    } else if (contentType.startsWith('video/')) {
-      const figure = makeElement('figure');
-      const video = makeElement('video');
-      video.controls = true;
-      video.preload = 'metadata';
-      const source = makeElement('source');
-      source.src = `/posts/${postId}/blocks/${block.id}/media`;
-      source.type = contentType;
-      video.append(source);
-      figure.append(video);
-      if (block.body) figure.append(makeElement('figcaption', block.body));
-      container.append(figure);
-    } else if (block.body) {
-      container.append(makeElement('p', block.body));
-    }
-    if (Array.isArray(block.children)) renderBlocks(container, block.children, postId);
-  }
-}
-
-function renderPostContent(article, post) {
-  const content = article.querySelector('.post-content');
-  if (Array.isArray(post.tags) && post.tags.length > 0) {
-    content.append(makeElement('p', `Tags: ${post.tags.join(', ')}`));
-  }
-  renderBlocks(content, post.blocks, post.id);
-}
-
-async function expandPost(article, button) {
-  const content = article.querySelector('.post-content');
-  const postStatus = article.querySelector('.post-status');
-  const expanded = button.getAttribute('aria-expanded') === 'true';
-  button.setAttribute('aria-expanded', String(!expanded));
-  button.textContent = expanded ? 'Expand post' : 'Collapse post';
-  content.hidden = expanded;
-  if (expanded || article.dataset.contentLoaded === 'true' || article.dataset.contentLoading === 'true') return;
-
-  article.dataset.contentLoading = 'true';
-  button.disabled = true;
-  postStatus.textContent = 'Loading post…';
-  try {
-    const response = await fetch(`/api/posts/${article.dataset.postId}`);
-    if (!response.ok) throw new Error(`HTTP ${response.status}`);
-    const post = await response.json();
-    renderPostContent(article, post);
-    article.dataset.contentLoaded = 'true';
-    postStatus.textContent = '';
-  } catch (_) {
-    postStatus.textContent = 'Could not load this post. Collapse and expand to retry.';
-  } finally {
-    article.dataset.contentLoading = 'false';
-    button.disabled = false;
-  }
-}
-
-feed.addEventListener('click', event => {
-  const button = event.target.closest('.expand-post');
-  if (button) expandPost(button.closest('.post-preview'), button);
-});
-
-async function loadNextPage() {
-  if (loadingFeed || !nextCursor) return;
-  loadingFeed = true;
-  loadButton.disabled = true;
-  status.textContent = 'Loading more posts…';
-  try {
-    const url = `/api/posts?limit=10&after=${encodeURIComponent(nextCursor)}`;
-    const response = await fetch(url);
-    if (!response.ok) throw new Error(`HTTP ${response.status}`);
-    const page = await response.json();
-    if (!Array.isArray(page.posts)) throw new Error('Invalid feed response');
-    for (const post of page.posts) makePreview(post);
-    nextCursor = typeof page.next_cursor === 'string' ? page.next_cursor : null;
-    feed.dataset.nextCursor = nextCursor || '';
-    status.textContent = nextCursor ? '' : 'You have reached the end of the feed.';
-  } catch (_) {
-    status.textContent = 'Could not load more posts. Use Load more to retry.';
-  } finally {
-    loadingFeed = false;
-    loadButton.disabled = !nextCursor;
-  }
-}
-
-loadButton.addEventListener('click', loadNextPage);
-
-function sentinelIsVisible() {
-  const rect = sentinel.getBoundingClientRect();
-  return rect.bottom >= 0 && rect.top <= window.innerHeight;
-}
-
-window.addEventListener('scroll', () => {
-  if (window.scrollY > lastScrollY) {
-    hasScrolledDown = true;
-    if (sentinelIsVisible()) loadNextPage();
-  }
-  lastScrollY = window.scrollY;
-}, {passive: true});
-
-if ('IntersectionObserver' in window) {
-  const observer = new IntersectionObserver(entries => {
-    if (hasScrolledDown && entries.some(entry => entry.isIntersecting)) loadNextPage();
-  });
-  observer.observe(sentinel);
-}
-
-if (!nextCursor) status.textContent = 'You have reached the end of the feed.';
-"#;
 
 async fn media<S: StorageClient>(
     State(state): State<AppState<S>>,
@@ -564,7 +686,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn initial_home_request_renders_ten_previews_and_a_cursor() {
+    async fn initial_home_request_renders_the_newest_full_post_and_cursor() {
         let nonce = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
@@ -589,10 +711,10 @@ mod tests {
         assert_eq!(response.status(), StatusCode::OK);
         let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
         let html = String::from_utf8(body.to_vec()).unwrap();
-        assert_eq!(html.matches("<article class=\"post-preview\"").count(), 10);
-        assert!(html.contains("data-next-cursor=\"2026-01-01:3\""));
-        assert!(html.contains("Post 3"));
-        assert!(!html.contains("Post 2"));
+        assert_eq!(html.matches("<article class=\"post\"").count(), 1);
+        assert!(html.contains("data-next-cursor=\"2026-01-01:12\""));
+        assert!(html.contains("Post 12"));
+        assert!(!html.contains("Post 11"));
         assert!(html.contains("id=\"load-more\""));
 
         std::fs::remove_file(path).unwrap();
@@ -621,10 +743,10 @@ mod tests {
                 PostBlock {
                     id: 18,
                     position: 1,
-                    header: None,
+                    header: Some("Grouped media".to_owned()),
                     body: Some("<caption>".to_owned()),
                     content_type: Some("image/jpeg".to_owned()),
-                    alt: Some("photo\" onerror=\"alert(1)".to_owned()),
+                    alt: None,
                     children: vec![PostBlock {
                         id: 19,
                         position: 0,
@@ -644,18 +766,29 @@ mod tests {
                     alt: None,
                     children: Vec::new(),
                 },
+                PostBlock {
+                    id: 21,
+                    position: 3,
+                    header: None,
+                    body: Some("<caption>".to_owned()),
+                    content_type: Some("image/jpeg".to_owned()),
+                    alt: Some("photo\" onerror=\"alert(1)".to_owned()),
+                    children: Vec::new(),
+                },
             ],
         };
         let html = render_full_post(&post);
-        assert!(html.contains("<p class=\"tags\">Tags: &lt;tag&gt;</p>"));
+        assert!(html.contains("<p class=\"tags\"><span class=\"tag-label\">Tags:</span> <span class=\"tag\">&lt;tag&gt;</span></p>"));
         assert!(html.contains("<h2>A &lt;header&gt;</h2>"));
         assert!(html.contains("&lt;script&gt;body&lt;/script&gt;"));
         assert!(html.contains("&quot;&gt;&lt;script&gt;alert(1)&lt;/script&gt;"));
         assert!(html.contains("alt=\"photo&quot; onerror=&quot;alert(1)\""));
-        assert!(html.contains("<img src=\"/posts/7/blocks/18/media\""));
-        assert!(html.contains("<video controls preload=\"metadata\"><source src=\"/posts/7/blocks/20/media\""));
+        assert!(html.contains("<img src=\"/posts/7/blocks/21/media\""));
+        assert!(html.contains("<video controls preload=\"metadata\" aria-label=\"video\">"));
+        assert!(html.contains("<source src=\"/posts/7/blocks/20/media\""));
         assert!(html.contains("<figcaption>&lt;caption&gt;</figcaption>"));
         assert!(html.contains("<p>Nested body</p>"));
+        assert!(!html.contains("/posts/7/blocks/18/media"));
         assert!(!html.contains("<script>body</script>"));
         assert_eq!(escape_html("'&\"<>"), "&#39;&amp;&quot;&lt;&gt;");
     }

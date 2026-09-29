@@ -1,7 +1,7 @@
 # Website post backend
 
 **Status:** Implemented local backend slice  
-**Updated:** 28 September 2026
+**Updated:** 29 September 2026
 
 ## Runtime data
 
@@ -77,19 +77,32 @@ a publication date. Malformed cursors return `400`. The database fetches one
 extra row to tell whether a following page exists; cursors follow the current
 ordering and do not preserve a snapshot across imports.
 
-`GET /` renders the first ten previews as semantic HTML and embeds the next
-cursor for the browser script. The script loads more previews after downward
-scrolling reaches the sentinel, with a visible **Load more** button as a
-fallback. Expanding a preview fetches only that post from
-`GET /api/posts/{id}` and inserts its blocks inline. The expansion is cached in
-the page after its first successful request. `GET /api/posts/{id}` returns
-tags and nested blocks in JSON, while `GET /posts/{id}` renders a complete
-HTML post for direct links. Both HTML routes escape post text. Image and video
-blocks use public media URLs that identify a post and block ID, never a storage
-key. The backend confirms the block belongs to a published post and is media
-before asking storage for it. It streams response bodies and forwards single
-byte ranges for video. Image ranges are ignored. There are no editing, draft,
-or account routes in this slice.
+`GET /` renders the newest full post and embeds its cursor when older posts
+exist. A small browser script uses `GET /api/posts` to discover one following
+post ID at a time, then fetches its server-rendered HTML from
+`GET /posts/{id}/fragment`. A visible **Load more** button supports manual
+loading and retry. `GET /api/posts/{id}` remains the JSON representation, and
+`GET /posts/{id}` renders a complete HTML page for direct links. All three HTML
+surfaces use the same Rust post renderer. Its external CSS and JavaScript are
+served directly by the site without a frontend build step. Generated HTML is
+indented for readable browser page source while its text nodes remain intact.
+
+Rows with children render as section introductions followed by their children
+in sibling order; a group parent's body is its description, even when it has
+media fields. Adjacent child image and video blocks form a responsive gallery,
+and text children split gallery runs. Gallery items open in a keyboard and
+touch navigable slideshow; standalone images use a one-item slideshow, while
+standalone videos remain inline playable. Initial page images prioritize the
+first image and lazy-load later images. Direct pages and fragments reuse the
+same original-media URLs; image resizing, format conversion, and variants are
+deferred.
+
+HTML text and attributes are escaped. Image and video blocks use public media
+URLs that identify a post and block ID, never a storage key. The backend
+confirms the block belongs to a published post and is media before asking
+storage for it. It streams response bodies and forwards single byte ranges for
+video. Image ranges are ignored. There are no editing, draft, or account
+routes in this slice.
 
 The `journey-site import` and `journey-site db` commands provide explicit
 imports and read-only database inspection. `JOURNEY_SITE_DB` selects the

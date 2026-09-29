@@ -1,7 +1,7 @@
 # Journey: Architecture
 
 **Status:** Exploratory draft  
-**Updated:** 19 September 2026  
+**Updated:** 29 September 2026
 **Purpose:** Record the intended production direction and unresolved questions. This remains an exploratory architecture, not a commitment to implement every component immediately.  
 **First implementation:** [Vertical Slice 01: HTTP/2 over WebSocket Object Download](vertical-slice-01-http2-over-websocket.md)  
 **Later transport work:** [Deferred crate extraction](../deferred/h2-over-websocket-crate-extraction.md)
@@ -83,12 +83,13 @@ The home HTTP/2 server is not a general proxy. It exposes only a strict object A
 
 ### Public website rendering
 
-Rust renders the public feed at `GET /` with its first ten post previews and
-renders complete posts at `GET /posts/{id}`. A small browser script progressively
-enhances the feed: it requests cursor-paginated summaries from
-`GET /api/posts?limit=10&after=<cursor>` after the reader scrolls to the end,
-and fetches a post's blocks from `GET /api/posts/{id}` only when its preview is
-expanded. Direct post links work without the script.
+Rust renders the newest complete post in the public feed at `GET /` and
+complete direct pages at `GET /posts/{id}`. A small browser script progressively
+loads older posts near the feed end: it uses cursor-paginated summaries from
+`GET /api/posts?limit=1&after=<cursor>` to discover the next ID, then requests
+its server-rendered fragment from `GET /posts/{id}/fragment`. The same Rust
+renderer serves both HTML surfaces, and direct post links work without the
+script.
 
 The first public feed does not need a JavaScript framework or a frontend build
 stage. React remains a possible choice for a future authoring interface or
