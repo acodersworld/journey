@@ -9,7 +9,7 @@ use axum::{
 use serde::Deserialize;
 
 use crate::{
-    db::{Database, FeedCursor, Post},
+    db::{Database, FeedCursor, Post, PostSummary, SidebarData},
     storage::StorageClient,
 };
 
@@ -26,11 +26,19 @@ pub struct AppState<S: StorageClient> {
 struct FeedQuery {
     limit: Option<usize>,
     after: Option<String>,
+    tag: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct TagPageQuery {
+    tag: String,
 }
 
 pub fn router<S: StorageClient>(state: AppState<S>) -> Router {
     Router::new()
         .route("/", get(home::<S>))
+        .route("/tags", get(tag_page::<S>))
+        .route("/archive/{month}", get(archive_page::<S>))
         .route("/site.css", get(site_css))
         .route("/site.js", get(site_js))
         .route("/api/posts", get(feed::<S>))
@@ -59,7 +67,7 @@ async fn feed<S: StorageClient>(
         },
         None => None,
     };
-    match state.database.feed(limit, after).await {
+    match state.database.feed_filtered(limit, after, query.tag).await {
         Ok(page) => Json(page).into_response(),
         Err(error) => {
             eprintln!("website feed query failed: {error}");
@@ -84,13 +92,80 @@ async fn home<S: StorageClient>(State(state): State<AppState<S>>) -> Response {
             let next_cursor = initial_post
                 .as_ref()
                 .and(page.next_cursor.as_deref());
-            Html(render_home(initial_post.as_ref(), next_cursor)).into_response()
+            let sidebar = match state.database.sidebar_data().await {
+                Ok(sidebar) => sidebar,
+                Err(error) => {
+                    eprintln!("website sidebar query failed: {error}");
+                    return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+                }
+            };
+            Html(render_home(&sidebar, initial_post.as_ref(), next_cursor)).into_response()
         }
         Err(error) => {
             eprintln!("website home query failed: {error}");
             StatusCode::INTERNAL_SERVER_ERROR.into_response()
         }
     }
+}
+
+async fn tag_page<S: StorageClient>(
+    State(state): State<AppState<S>>,
+    Query(query): Query<TagPageQuery>,
+) -> Response {
+    match state.database.feed_filtered(1, None, Some(query.tag.clone())).await {
+        Ok(page) => {
+            let initial_post = match page.posts.first() {
+                Some(summary) => match state.database.post(summary.id).await {
+                    Ok(post) => post,
+                    Err(error) => {
+                        eprintln!("website tag post query failed: {error}");
+                        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+                    }
+                },
+                None => None,
+            };
+            let next_cursor = initial_post
+                .as_ref()
+                .and(page.next_cursor.as_deref());
+            let sidebar = match state.database.sidebar_data().await {
+                Ok(sidebar) => sidebar,
+                Err(error) => {
+                    eprintln!("website sidebar query failed: {error}");
+                    return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+                }
+            };
+            Html(render_tag_feed(&sidebar, &query.tag, initial_post.as_ref(), next_cursor))
+                .into_response()
+        }
+        Err(error) => {
+            eprintln!("website tag feed query failed: {error}");
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        }
+    }
+}
+
+async fn archive_page<S: StorageClient>(
+    State(state): State<AppState<S>>,
+    Path(month): Path<String>,
+) -> Response {
+    if !valid_archive_month(&month) {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+    let posts = match state.database.posts_for_month(month.clone()).await {
+        Ok(posts) => posts,
+        Err(error) => {
+            eprintln!("website archive query failed: {error}");
+            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        }
+    };
+    let sidebar = match state.database.sidebar_data().await {
+        Ok(sidebar) => sidebar,
+        Err(error) => {
+            eprintln!("website sidebar query failed: {error}");
+            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        }
+    };
+    Html(render_archive(&sidebar, &month, &posts)).into_response()
 }
 
 async fn api_full_post<S: StorageClient>(
@@ -112,7 +187,16 @@ async fn post_page<S: StorageClient>(
     Path(id): Path<i64>,
 ) -> Response {
     match state.database.post(id).await {
-        Ok(Some(post)) => Html(render_full_post(&post)).into_response(),
+        Ok(Some(post)) => {
+            let sidebar = match state.database.sidebar_data().await {
+                Ok(sidebar) => sidebar,
+                Err(error) => {
+                    eprintln!("website sidebar query failed: {error}");
+                    return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+                }
+            };
+            Html(render_full_post(&sidebar, &post)).into_response()
+        }
         Ok(None) => StatusCode::NOT_FOUND.into_response(),
         Err(error) => {
             eprintln!("website post page query failed: {error}");
@@ -186,39 +270,205 @@ fn valid_publication_date(value: &str) -> bool {
     day > 0 && day <= month_days
 }
 
-fn render_full_post(post: &Post) -> String {
-    let html = format!(
-        "<!doctype html><html lang=\"en\"><head>{}</head><body><main class=\"site site-post\"><p class=\"back-link\"><a href=\"/\">Journey</a></p>{}</main>{}</body></html>",
-        html_head(&post.summary.title),
+fn valid_archive_month(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    bytes.len() == 7
+        && bytes[4] == b'-'
+        && bytes
+            .iter()
+            .enumerate()
+            .all(|(index, byte)| index == 4 || byte.is_ascii_digit())
+        && value[5..7].parse::<u32>().is_ok_and(|month| (1..=12).contains(&month))
+}
+
+fn render_full_post(sidebar: &SidebarData, post: &Post) -> String {
+    let content = format!(
+        "<main class=\"site site-post\"><p class=\"back-link\"><a href=\"/\">All posts</a></p>{}</main>",
         render_post(post, true),
-        SLIDESHOW_HTML,
+    );
+    render_site_page(&post.summary.title, sidebar, &content, true)
+}
+
+fn render_home(
+    sidebar: &SidebarData,
+    initial_post: Option<&Post>,
+    next_cursor: Option<&str>,
+) -> String {
+    let mut feed = format!(
+        "<section id=\"feed\" aria-label=\"Posts\" data-next-cursor=\"{}\">",
+        escape_html(next_cursor.unwrap_or("")),
+    );
+    if let Some(post) = initial_post {
+        feed.push_str(&render_post(post, true));
+    } else {
+        feed.push_str("<p class=\"empty-feed\">No published posts yet.</p>");
+    }
+    feed.push_str("</section>");
+    let content = render_feed_controls("<main class=\"site site-feed\">", &feed, next_cursor);
+    render_site_page("Journey", sidebar, &content, true)
+}
+
+fn render_tag_feed(
+    sidebar: &SidebarData,
+    tag: &str,
+    initial_post: Option<&Post>,
+    next_cursor: Option<&str>,
+) -> String {
+    let mut feed = format!(
+        "<section id=\"feed\" aria-label=\"Posts tagged {}\" data-next-cursor=\"{}\" data-tag=\"{}\">",
+        escape_html(tag),
+        escape_html(next_cursor.unwrap_or("")),
+        escape_html(tag),
+    );
+    if let Some(post) = initial_post {
+        feed.push_str(&render_post(post, true));
+    } else {
+        feed.push_str("<p class=\"empty-feed\">No published posts have this tag.</p>");
+    }
+    feed.push_str("</section>");
+    let heading = format!(
+        "<header class=\"feed-page-heading\"><h1>Posts tagged <span>{}</span></h1></header>",
+        escape_html(tag),
+    );
+    let content = render_feed_controls(
+        &format!("<main class=\"site site-feed\">{heading}"),
+        &feed,
+        next_cursor,
+    );
+    render_site_page(&format!("Posts tagged {tag}"), sidebar, &content, true)
+}
+
+fn render_feed_controls(main_open: &str, feed: &str, next_cursor: Option<&str>) -> String {
+    let mut content = format!("{main_open}{feed}<div id=\"feed-sentinel\" aria-hidden=\"true\"></div><p id=\"feed-status\" role=\"status\" aria-live=\"polite\">");
+    if next_cursor.is_none() {
+        content.push_str("You have reached the end of the feed.");
+    }
+    content.push_str("</p><button id=\"load-more\" type=\"button\"");
+    if next_cursor.is_none() {
+        content.push_str(" disabled");
+    }
+    content.push_str(">Load more</button></main>");
+    content
+}
+
+fn render_archive(sidebar: &SidebarData, month: &str, posts: &[PostSummary]) -> String {
+    let mut content = format!(
+        "<main class=\"site site-archive\"><p class=\"back-link\"><a href=\"/\">All posts</a></p><h1>{}</h1><section class=\"archive-posts\" aria-label=\"Posts from {}\">",
+        escape_html(&month_label(month)),
+        escape_html(&month_label(month)),
+    );
+    if posts.is_empty() {
+        content.push_str("<p class=\"empty-feed\">No published posts in this month.</p>");
+    } else {
+        for post in posts {
+            content.push_str(&format!(
+                "<article class=\"archive-post\"><h2><a href=\"/posts/{}\">{}</a></h2><time datetime=\"{}\">{}</time><p class=\"summary\">{}</p></article>",
+                post.id,
+                escape_html(&post.title),
+                escape_html(&post.published_at),
+                escape_html(&post.published_at),
+                escape_html(&post.summary),
+            ));
+        }
+    }
+    content.push_str("</section></main>");
+    render_site_page(&month_label(month), sidebar, &content, false)
+}
+
+fn render_site_page(title: &str, sidebar: &SidebarData, content: &str, include_slideshow: bool) -> String {
+    let slideshow = if include_slideshow { SLIDESHOW_HTML } else { "" };
+    let html = format!(
+        "<!doctype html><html lang=\"en\"><head>{}</head><body><div class=\"site-layout\" id=\"site-layout\"><button class=\"sidebar-toggle\" id=\"sidebar-toggle\" type=\"button\" aria-controls=\"site-sidebar\" aria-expanded=\"false\" aria-label=\"Open sidebar\"><span aria-hidden=\"true\">›</span></button><button class=\"sidebar-backdrop\" id=\"sidebar-backdrop\" type=\"button\" aria-label=\"Close sidebar\" hidden></button>{}{}</div>{}</body></html>",
+        html_head(title),
+        render_sidebar(sidebar),
+        content,
+        slideshow,
     );
     pretty_html(&html)
 }
 
-fn render_home(initial_post: Option<&Post>, next_cursor: Option<&str>) -> String {
-    let mut html = format!(
-        "<!doctype html><html lang=\"en\"><head>{}</head><body><main class=\"site\"><header class=\"site-header\"><a class=\"site-name\" href=\"/\">Journey</a><p>Stories from the road.</p></header><section id=\"feed\" aria-label=\"Posts\" data-next-cursor=\"{}\">",
-        html_head("Journey"),
-        escape_html(next_cursor.unwrap_or("")),
+fn render_sidebar(sidebar: &SidebarData) -> String {
+    let mut html = String::from(
+        "<nav class=\"site-sidebar\" id=\"site-sidebar\" aria-label=\"Site navigation\" hidden><header class=\"sidebar-header\"><a class=\"site-name\" href=\"/\">Journey</a><p>Stories from the road.</p></header><section class=\"sidebar-section\" aria-labelledby=\"sidebar-recent-heading\"><h2 id=\"sidebar-recent-heading\">Recent posts</h2><ul class=\"sidebar-list\">",
     );
-    if let Some(post) = initial_post {
-        html.push_str(&render_post(post, true));
+    if sidebar.recent_posts.is_empty() {
+        html.push_str("<li class=\"sidebar-muted\">No published posts yet.</li>");
     } else {
-        html.push_str("<p class=\"empty-feed\">No published posts yet.</p>");
+        for post in &sidebar.recent_posts {
+            html.push_str(&format!(
+                "<li><a href=\"/posts/{}\">{}</a><time datetime=\"{}\">{}</time></li>",
+                post.id,
+                escape_html(&post.title),
+                escape_html(&post.published_at),
+                escape_html(&post.published_at),
+            ));
+        }
     }
-    html.push_str("</section><div id=\"feed-sentinel\" aria-hidden=\"true\"></div><p id=\"feed-status\" role=\"status\" aria-live=\"polite\">");
-    if next_cursor.is_none() {
-        html.push_str("You have reached the end of the feed.");
+    html.push_str("</ul></section><section class=\"sidebar-section\" aria-labelledby=\"sidebar-archive-heading\"><h2 id=\"sidebar-archive-heading\">Archive</h2><ul class=\"sidebar-list\" id=\"sidebar-months\">");
+    if sidebar.archive_months.is_empty() {
+        html.push_str("<li class=\"sidebar-muted\">No published posts yet.</li>");
+    } else {
+        for (index, month) in sidebar.archive_months.iter().enumerate() {
+            html.push_str(&format!(
+                "<li{}><a href=\"/archive/{}\">{}</a></li>",
+                if index >= 6 { " data-overflow-item=\"true\"" } else { "" },
+                encode_url_component(month),
+                escape_html(&month_label(month)),
+            ));
+        }
     }
-    html.push_str("</p><button id=\"load-more\" type=\"button\"");
-    if next_cursor.is_none() {
-        html.push_str(" disabled");
+    html.push_str("</ul>");
+    if sidebar.archive_months.len() > 6 {
+        html.push_str("<button class=\"sidebar-expand\" type=\"button\" aria-controls=\"sidebar-months\" aria-expanded=\"false\" data-sidebar-expand=\"sidebar-months\" data-expand-label=\"Show all months\" data-collapse-label=\"Show fewer months\" hidden>Show all months</button>");
     }
-    html.push_str(">Load more</button></main>");
-    html.push_str(SLIDESHOW_HTML);
-    html.push_str("</body></html>");
-    pretty_html(&html)
+    html.push_str("</section><section class=\"sidebar-section\" aria-labelledby=\"sidebar-tags-heading\"><h2 id=\"sidebar-tags-heading\">Tags</h2><ul class=\"sidebar-list sidebar-tags\" id=\"sidebar-tags\">");
+    if sidebar.tags.is_empty() {
+        html.push_str("<li class=\"sidebar-muted\">No tags yet.</li>");
+    } else {
+        for (index, tag) in sidebar.tags.iter().enumerate() {
+            html.push_str(&format!(
+                "<li{}><a href=\"/tags?tag={}\">{}</a></li>",
+                if index >= 12 { " data-overflow-item=\"true\"" } else { "" },
+                encode_url_component(tag),
+                escape_html(tag),
+            ));
+        }
+    }
+    html.push_str("</ul>");
+    if sidebar.tags.len() > 12 {
+        html.push_str("<button class=\"sidebar-expand\" type=\"button\" aria-controls=\"sidebar-tags\" aria-expanded=\"false\" data-sidebar-expand=\"sidebar-tags\" data-expand-label=\"Show all tags\" data-collapse-label=\"Show fewer tags\" hidden>Show all tags</button>");
+    }
+    html.push_str("</section></nav>");
+    html
+}
+
+fn month_label(month: &str) -> String {
+    const MONTH_NAMES: [&str; 12] = [
+        "January", "February", "March", "April", "May", "June", "July", "August", "September",
+        "October", "November", "December",
+    ];
+    let Some((year, encoded_month)) = month.split_once('-') else {
+        return month.to_owned();
+    };
+    let Ok(number) = encoded_month.parse::<usize>() else {
+        return month.to_owned();
+    };
+    if !(1..=12).contains(&number) {
+        return month.to_owned();
+    }
+    format!("{} {year}", MONTH_NAMES[number - 1])
+}
+
+fn encode_url_component(value: &str) -> String {
+    let mut encoded = String::with_capacity(value.len());
+    for byte in value.bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~') {
+            encoded.push(byte as char);
+        } else {
+            encoded.push_str(&format!("%{byte:02X}"));
+        }
+    }
+    encoded
 }
 
 fn render_post(post: &Post, prioritize_first_image: bool) -> String {
@@ -445,9 +695,15 @@ fn render_tags_html(tags: &[String]) -> String {
         String::new()
     } else {
         format!(
-            "<p class=\"tags\"><span class=\"tag-label\">Tags:</span> {}</p>",
+                "<p class=\"tags\"><span class=\"tag-label\">Tags:</span> {}</p>",
             tags.iter()
-                .map(|tag| format!("<span class=\"tag\">{}</span>", escape_html(tag)))
+                .map(|tag| {
+                    format!(
+                        "<a class=\"tag\" href=\"/tags?tag={}\">{}</a>",
+                        encode_url_component(tag),
+                        escape_html(tag),
+                    )
+                })
                 .collect::<Vec<_>>()
                 .join(" "),
         )
@@ -642,7 +898,7 @@ mod tests {
         escape_html, feed, home, parse_cursor, render_full_post, state, FeedQuery,
     };
     use crate::{
-        db::{Database, NewPost, Post, PostBlock, PostSummary},
+        db::{Database, NewPost, Post, PostBlock, PostSummary, SidebarData},
         storage::{StorageClient, StorageResponse},
     };
     use axum::{
@@ -676,6 +932,7 @@ mod tests {
             Query(FeedQuery {
                 limit: None,
                 after: Some("2026-02-30:4".to_owned()),
+                tag: None,
             }),
         )
         .await;
@@ -714,7 +971,7 @@ mod tests {
         assert_eq!(html.matches("<article class=\"post\"").count(), 1);
         assert!(html.contains("data-next-cursor=\"2026-01-01:12\""));
         assert!(html.contains("Post 12"));
-        assert!(!html.contains("Post 11"));
+        assert!(!html.contains("data-post-id=\"11\""));
         assert!(html.contains("id=\"load-more\""));
 
         std::fs::remove_file(path).unwrap();
@@ -777,8 +1034,8 @@ mod tests {
                 },
             ],
         };
-        let html = render_full_post(&post);
-        assert!(html.contains("<p class=\"tags\"><span class=\"tag-label\">Tags:</span> <span class=\"tag\">&lt;tag&gt;</span></p>"));
+        let html = render_full_post(&SidebarData::default(), &post);
+        assert!(html.contains("<p class=\"tags\"><span class=\"tag-label\">Tags:</span> <a class=\"tag\" href=\"/tags?tag=%3Ctag%3E\">&lt;tag&gt;</a></p>"));
         assert!(html.contains("<h2>A &lt;header&gt;</h2>"));
         assert!(html.contains("&lt;script&gt;body&lt;/script&gt;"));
         assert!(html.contains("&quot;&gt;&lt;script&gt;alert(1)&lt;/script&gt;"));

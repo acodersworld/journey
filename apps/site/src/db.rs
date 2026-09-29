@@ -83,6 +83,13 @@ pub struct FeedPage {
     pub next_cursor: Option<String>,
 }
 
+#[derive(Clone, Debug, Default)]
+pub struct SidebarData {
+    pub recent_posts: Vec<PostSummary>,
+    pub archive_months: Vec<String>,
+    pub tags: Vec<String>,
+}
+
 #[derive(Clone, Debug)]
 pub struct FeedCursor {
     pub published_at: String,
@@ -182,27 +189,33 @@ impl Database {
         limit: usize,
         after: Option<FeedCursor>,
     ) -> Result<FeedPage, String> {
+        self.feed_filtered(limit, after, None).await
+    }
+
+    pub async fn feed_filtered(
+        &self,
+        limit: usize,
+        after: Option<FeedCursor>,
+        tag: Option<String>,
+    ) -> Result<FeedPage, String> {
         self.run(move |connection| {
-            let mut posts = if let Some(cursor) = after {
-                let mut statement = connection.prepare(
-                    "SELECT id, title, published_at, summary FROM posts \
-                     WHERE published = 1 \
-                       AND (published_at < ?1 OR (published_at = ?1 AND id < ?2)) \
-                     ORDER BY published_at DESC, id DESC LIMIT ?3",
-                )?;
-                let rows = statement.query_map(
-                    params![cursor.published_at, cursor.id, (limit + 1) as i64],
-                    post_summary_from_row,
-                )?;
-                rows.collect::<rusqlite::Result<Vec<_>>>()?
-            } else {
-                let mut statement = connection.prepare(
-                    "SELECT id, title, published_at, summary FROM posts \
-                     WHERE published = 1 ORDER BY published_at DESC, id DESC LIMIT ?1",
-                )?;
-                let rows = statement.query_map([(limit + 1) as i64], post_summary_from_row)?;
-                rows.collect::<rusqlite::Result<Vec<_>>>()?
-            };
+            let after_date = after.as_ref().map(|cursor| cursor.published_at.as_str());
+            let after_id = after.as_ref().map(|cursor| cursor.id);
+            let mut statement = connection.prepare(
+                "SELECT id, title, published_at, summary FROM posts \
+                 WHERE published = 1 \
+                   AND (?1 IS NULL OR EXISTS (\
+                       SELECT 1 FROM json_each(posts.tags) AS post_tag \
+                       WHERE post_tag.type = 'text' AND post_tag.value = ?1 \
+                   )) \
+                   AND (?2 IS NULL OR published_at < ?2 OR (published_at = ?2 AND id < ?3)) \
+                 ORDER BY published_at DESC, id DESC LIMIT ?4",
+            )?;
+            let rows = statement.query_map(
+                params![tag, after_date, after_id, (limit + 1) as i64],
+                post_summary_from_row,
+            )?;
+            let mut posts = rows.collect::<rusqlite::Result<Vec<_>>>()?;
             let has_more = posts.len() > limit;
             posts.truncate(limit);
             let next_cursor = if has_more {
@@ -211,6 +224,53 @@ impl Database {
                 None
             };
             Ok(FeedPage { posts, next_cursor })
+        })
+        .await
+    }
+
+    pub async fn sidebar_data(&self) -> Result<SidebarData, String> {
+        self.run(|connection| {
+            let recent_posts = {
+                let mut statement = connection.prepare(
+                    "SELECT id, title, published_at, summary FROM posts \
+                     WHERE published = 1 ORDER BY published_at DESC, id DESC LIMIT 5",
+                )?;
+                let rows = statement.query_map([], post_summary_from_row)?;
+                rows.collect::<rusqlite::Result<Vec<_>>>()?
+            };
+            let archive_months = {
+                let mut statement = connection.prepare(
+                    "SELECT DISTINCT substr(published_at, 1, 7) FROM posts \
+                     WHERE published = 1 ORDER BY substr(published_at, 1, 7) DESC",
+                )?;
+                let rows = statement.query_map([], |row| row.get(0))?;
+                rows.collect::<rusqlite::Result<Vec<_>>>()?
+            };
+            let tags = {
+                let mut statement = connection.prepare(
+                    "SELECT tag FROM ( \
+                         SELECT DISTINCT post_tag.value AS tag FROM posts \
+                         JOIN json_each(posts.tags) AS post_tag \
+                         WHERE posts.published = 1 AND post_tag.type = 'text' \
+                     ) ORDER BY tag COLLATE NOCASE, tag",
+                )?;
+                let rows = statement.query_map([], |row| row.get(0))?;
+                rows.collect::<rusqlite::Result<Vec<_>>>()?
+            };
+            Ok(SidebarData { recent_posts, archive_months, tags })
+        })
+        .await
+    }
+
+    pub async fn posts_for_month(&self, month: String) -> Result<Vec<PostSummary>, String> {
+        self.run(move |connection| {
+            let mut statement = connection.prepare(
+                "SELECT id, title, published_at, summary FROM posts \
+                 WHERE published = 1 AND substr(published_at, 1, 7) = ?1 \
+                 ORDER BY published_at DESC, id DESC",
+            )?;
+            let rows = statement.query_map([month], post_summary_from_row)?;
+            rows.collect()
         })
         .await
     }

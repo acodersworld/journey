@@ -71,21 +71,36 @@ website.
 `GET /api/posts` returns `{ "posts": [...], "next_cursor": string | null }`
 with published summaries ordered by `published_at DESC, id DESC`. The default
 page size is 10 and the maximum is 100. Its optional `after` parameter contains
-the last post's `YYYY-MM-DD` publication date and ID separated by a colon. The
-query uses that pair as a keyset position, including when adjacent posts share
-a publication date. Malformed cursors return `400`. The database fetches one
-extra row to tell whether a following page exists; cursors follow the current
-ordering and do not preserve a snapshot across imports.
+the last post's `YYYY-MM-DD` publication date and ID separated by a colon. Its
+optional `tag` parameter matches one stored tag exactly, including case. Both
+parameters apply to the same published-post keyset query. Malformed cursors
+return `400`. The database fetches one extra row to tell whether a following
+page exists; cursors follow the current ordering and do not preserve a snapshot
+across imports.
 
 `GET /` renders the newest full post and embeds its cursor when older posts
 exist. A small browser script uses `GET /api/posts` to discover one following
 post ID at a time, then fetches its server-rendered HTML from
 `GET /posts/{id}/fragment`. A visible **Load more** button supports manual
-loading and retry. `GET /api/posts/{id}` remains the JSON representation, and
-`GET /posts/{id}` renders a complete HTML page for direct links. All three HTML
-surfaces use the same Rust post renderer. Its external CSS and JavaScript are
-served directly by the site without a frontend build step. Generated HTML is
-indented for readable browser page source while its text nodes remain intact.
+loading and retry. Tag feeds at `/tags?tag=...` use that same renderer and
+pagination path, passing the selected tag through every API request. Post tags
+link to their exact-case filtered feed. `/archive/{YYYY-MM}` lists published
+post titles, dates, and summaries for the selected month.
+
+Every public HTML page shares a server-rendered navigation sidebar. It lists the
+five newest published posts, distinct published archive months in descending
+order, and distinct published tags in case-insensitive alphabetical order
+while preserving their stored spelling. The archive list starts with six
+months and the tag list with twelve entries; browser controls reveal the rest.
+The sidebar starts closed on each page load. At every screen width it opens as
+a fixed drawer over the page, leaving the reading column and chevron in place.
+A backdrop dims the page; the chevron, backdrop, and Escape close the drawer.
+
+`GET /api/posts/{id}` remains the JSON representation, and `GET /posts/{id}`
+renders a complete HTML page for direct links. All HTML surfaces use the same
+Rust post renderer. Its external CSS and JavaScript are served directly by the
+site without a frontend build step. Generated HTML is indented for readable
+browser page source while its text nodes remain intact.
 
 Rows with children render as section introductions followed by their children
 in sibling order; a group parent's body is its description, even when it has
