@@ -283,9 +283,9 @@ pub struct ShareLinkCreated {
 pub struct ShareLinkView {
     pub id: String,
     pub post_id: i64,
-    pub expires_at: i64,
+    pub expires_at: Duration,
     pub expires_at_utc: Option<String>,
-    pub revoked_at: Option<i64>,
+    pub revoked_at: Option<Duration>,
 }
 
 impl Database {
@@ -310,7 +310,7 @@ impl Database {
         accounts: Vec<ImportedAccount>,
     ) -> Result<usize, String> {
         self.initialize().await?;
-        let created_at = unix_time_seconds();
+        let created_at = unix_time();
         let posts = posts
             .into_iter()
             .map(|post| {
@@ -331,7 +331,7 @@ impl Database {
                         account.username,
                         account.role.as_str(),
                         account.password_hash,
-                        created_at,
+                        unix_seconds(created_at),
                     ])?;
                 }
             }
@@ -362,11 +362,11 @@ impl Database {
         role: AccountRole,
         password_hash: String,
     ) -> Result<(), String> {
-        let created_at = unix_time_seconds();
+        let created_at = unix_time();
         self.run(move |connection| {
             connection.execute(
                 "INSERT INTO users (username, role, password_hash, enabled, created_at) VALUES (?1, ?2, ?3, 1, ?4)",
-                params![username, role.as_str(), password_hash, created_at],
+                params![username, role.as_str(), password_hash, unix_seconds(created_at)],
             )?;
             Ok(())
         })
@@ -459,15 +459,17 @@ impl Database {
         &self,
         user_id: i64,
         token_digest: String,
-        created_at: i64,
-        expires_at: i64,
+        created_at: Duration,
+        expires_at: Duration,
     ) -> Result<(), String> {
         self.run(move |connection| {
             let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-            transaction.execute("DELETE FROM sessions WHERE expires_at <= ?1", [created_at])?;
+            let created_at_seconds = unix_seconds(created_at);
+            let expires_at_seconds = unix_seconds(expires_at);
+            transaction.execute("DELETE FROM sessions WHERE expires_at <= ?1", [created_at_seconds])?;
             transaction.execute(
                 "INSERT INTO sessions (token_digest, user_id, created_at, expires_at) VALUES (?1, ?2, ?3, ?4)",
-                params![token_digest, user_id, created_at, expires_at],
+                params![token_digest, user_id, created_at_seconds, expires_at_seconds],
             )?;
             transaction.commit()
         })
@@ -477,15 +479,16 @@ impl Database {
     pub async fn authenticated_account(
         &self,
         token_digest: String,
-        now: i64,
+        now: Duration,
     ) -> Result<Option<AuthenticatedAccount>, String> {
         self.run(move |connection| {
+            let now_seconds = unix_seconds(now);
             connection
                 .query_row(
                     "SELECT u.username, u.role FROM sessions AS s \
                      JOIN users AS u ON u.id = s.user_id \
                      WHERE s.token_digest = ?1 AND s.expires_at > ?2 AND u.enabled = 1",
-                    params![token_digest, now],
+                    params![token_digest, now_seconds],
                     |row| {
                         Ok(AuthenticatedAccount {
                             username: row.get(0)?,
@@ -506,21 +509,22 @@ impl Database {
         .await
     }
 
-    pub async fn share_link_lifetime_seconds(&self) -> Result<i64, String> {
+    pub async fn share_link_lifetime(&self) -> Result<Duration, String> {
         self.run(|connection| {
             connection.query_row(
                 "SELECT integer_value FROM site_settings WHERE name = 'share_link_lifetime_seconds'",
                 [],
-                |row| row.get(0),
+                |row| row.get::<_, i64>(0).map(duration_from_seconds),
             )
         })
         .await
     }
 
-    pub async fn set_share_link_lifetime_seconds(&self, seconds: i64) -> Result<(), String> {
-        if seconds <= 0 {
+    pub async fn set_share_link_lifetime(&self, lifetime: Duration) -> Result<(), String> {
+        if lifetime.as_secs() == 0 || lifetime.as_secs() > i64::MAX as u64 {
             return Err("share link lifetime must be a positive integer number of seconds".to_owned());
         }
+        let seconds = unix_seconds(lifetime);
         self.run(move |connection| {
             connection.execute(
                 "UPDATE site_settings SET integer_value = ?1 WHERE name = 'share_link_lifetime_seconds'",
@@ -536,10 +540,11 @@ impl Database {
         id: String,
         post_id: i64,
         token_digest: String,
-        created_at: i64,
+        created_at: Duration,
     ) -> Result<Option<ShareLinkCreated>, String> {
         self.run(move |connection| {
             let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let created_at_seconds = unix_seconds(created_at);
             let published = transaction.query_row(
                 "SELECT EXISTS(SELECT 1 FROM posts WHERE id = ?1 AND published = 1)",
                 [post_id],
@@ -549,18 +554,18 @@ impl Database {
                 transaction.commit()?;
                 return Ok(None);
             }
-            let lifetime = transaction.query_row(
+            let lifetime_seconds = transaction.query_row(
                 "SELECT integer_value FROM site_settings WHERE name = 'share_link_lifetime_seconds'",
                 [],
                 |row| row.get::<_, i64>(0),
             )?;
-            let expires_at = created_at
-                .checked_add(lifetime)
-                .ok_or(rusqlite::Error::IntegralValueOutOfRange(0, lifetime))?;
+            let expires_at_seconds = created_at_seconds
+                .checked_add(lifetime_seconds)
+                .ok_or(rusqlite::Error::IntegralValueOutOfRange(0, lifetime_seconds))?;
             transaction.execute(
                 "INSERT INTO share_links (id, post_id, token_digest, created_at, expires_at) \
                  VALUES (?1, ?2, ?3, ?4, ?5)",
-                params![id, post_id, token_digest, created_at, expires_at],
+                params![id, post_id, token_digest, created_at_seconds, expires_at_seconds],
             )?;
             transaction.commit()?;
             Ok(Some(ShareLinkCreated { id }))
@@ -580,9 +585,9 @@ impl Database {
                 Ok(ShareLinkView {
                     id: row.get(0)?,
                     post_id: row.get(1)?,
-                    expires_at: row.get(2)?,
+                    expires_at: duration_from_seconds(row.get(2)?),
                     expires_at_utc: row.get(3)?,
-                    revoked_at: row.get(4)?,
+                    revoked_at: row.get::<_, Option<i64>>(4)?.map(duration_from_seconds),
                 })
             })?;
             rows.collect()
@@ -590,11 +595,11 @@ impl Database {
         .await
     }
 
-    pub async fn revoke_share_link(&self, id: String, revoked_at: i64) -> Result<bool, String> {
+    pub async fn revoke_share_link(&self, id: String, revoked_at: Duration) -> Result<bool, String> {
         self.run(move |connection| {
             let changed = connection.execute(
                 "UPDATE share_links SET revoked_at = COALESCE(revoked_at, ?2) WHERE id = ?1",
-                params![id, revoked_at],
+                params![id, unix_seconds(revoked_at)],
             )?;
             Ok(changed != 0)
         })
@@ -606,31 +611,32 @@ impl Database {
         share_link_id: String,
         link_token_digest: String,
         session_token_digest: String,
-        created_at: i64,
-    ) -> Result<Option<(i64, i64)>, String> {
+        created_at: Duration,
+    ) -> Result<Option<(i64, Duration)>, String> {
         self.run(move |connection| {
             let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let created_at_seconds = unix_seconds(created_at);
             let link = transaction
                 .query_row(
                     "SELECT l.post_id, l.expires_at FROM share_links AS l \
                      JOIN posts AS p ON p.id = l.post_id \
                      WHERE l.id = ?1 AND l.token_digest = ?2 AND l.expires_at > ?3 \
                        AND l.revoked_at IS NULL AND p.published = 1",
-                    params![share_link_id, link_token_digest, created_at],
+                    params![share_link_id, link_token_digest, created_at_seconds],
                     |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
                 )
                 .optional()?;
-            let Some((post_id, expires_at)) = link else {
+            let Some((post_id, expires_at_seconds)) = link else {
                 transaction.commit()?;
                 return Ok(None);
             };
             transaction.execute(
                 "INSERT INTO share_sessions (token_digest, share_link_id, created_at, expires_at) \
                  VALUES (?1, ?2, ?3, ?4)",
-                params![session_token_digest, share_link_id, created_at, expires_at],
+                params![session_token_digest, share_link_id, created_at_seconds, expires_at_seconds],
             )?;
             transaction.commit()?;
-            Ok(Some((post_id, expires_at)))
+            Ok(Some((post_id, duration_from_seconds(expires_at_seconds))))
         })
         .await
     }
@@ -640,10 +646,11 @@ impl Database {
         share_link_id: String,
         session_token_digest: String,
         post_id: i64,
-        now: i64,
+        now: Duration,
     ) -> Result<Option<Post>, String> {
         self.run(move |connection| {
             let transaction = connection.transaction()?;
+            let now_seconds = unix_seconds(now);
             let authorized = transaction.query_row(
                 "SELECT EXISTS(SELECT 1 FROM share_sessions AS s \
                  JOIN share_links AS l ON l.id = s.share_link_id \
@@ -651,7 +658,7 @@ impl Database {
                  WHERE s.token_digest = ?1 AND s.share_link_id = ?2 \
                    AND s.expires_at > ?4 AND l.expires_at > ?4 \
                    AND l.revoked_at IS NULL AND p.published = 1 AND p.id = ?3)",
-                params![session_token_digest, share_link_id, post_id, now],
+                params![session_token_digest, share_link_id, post_id, now_seconds],
                 |row| row.get::<_, bool>(0),
             )?;
             let post = if authorized {
@@ -671,9 +678,10 @@ impl Database {
         session_token_digest: String,
         post_id: i64,
         block_id: i64,
-        now: i64,
+        now: Duration,
     ) -> Result<Option<MediaReference>, String> {
         self.run(move |connection| {
+            let now_seconds = unix_seconds(now);
             connection
                 .query_row(
                     "SELECT b.storage_key, b.content_type FROM share_sessions AS s \
@@ -685,7 +693,7 @@ impl Database {
                        AND l.revoked_at IS NULL AND p.published = 1 \
                        AND p.id = ?3 AND b.id = ?4 AND b.storage_key IS NOT NULL \
                        AND (b.content_type LIKE 'image/%' OR b.content_type LIKE 'video/%')",
-                    params![session_token_digest, share_link_id, post_id, block_id, now],
+                    params![session_token_digest, share_link_id, post_id, block_id, now_seconds],
                     |row| {
                         Ok(MediaReference {
                             storage_key: row.get(0)?,
@@ -701,16 +709,18 @@ impl Database {
     pub async fn record_login_attempt(
         &self,
         username_digest: String,
-        now: i64,
-        window_seconds: i64,
+        now: Duration,
+        window: Duration,
         maximum_attempts: i64,
     ) -> Result<bool, String> {
         self.run(move |connection| {
             let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-            let window_start = now.saturating_sub(window_seconds);
+            let now_seconds = unix_seconds(now);
+            let window_seconds = unix_seconds(window);
+            let window_start_seconds = now_seconds.saturating_sub(window_seconds);
             transaction.execute(
                 "DELETE FROM login_throttles WHERE window_started <= ?1",
-                [window_start],
+                [window_start_seconds],
             )?;
             let existing = transaction
                 .query_row(
@@ -719,8 +729,8 @@ impl Database {
                     |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
                 )
                 .optional()?;
-            if let Some((started, attempts)) = existing {
-                if now.saturating_sub(started) <= window_seconds && attempts >= maximum_attempts {
+            if let Some((started_seconds, attempts)) = existing {
+                if now_seconds.saturating_sub(started_seconds) <= window_seconds && attempts >= maximum_attempts {
                     transaction.commit()?;
                     return Ok(false);
                 }
@@ -732,7 +742,7 @@ impl Database {
                 [],
             )?;
             match existing {
-                Some((started, attempts)) if now.saturating_sub(started) <= window_seconds => {
+                Some((started_seconds, attempts)) if now_seconds.saturating_sub(started_seconds) <= window_seconds => {
                     transaction.execute(
                         "UPDATE login_throttles SET attempts = ?2 WHERE username_digest = ?1",
                         params![username_digest, attempts.saturating_add(1)],
@@ -741,7 +751,7 @@ impl Database {
                 _ => {
                     transaction.execute(
                         "INSERT OR REPLACE INTO login_throttles (username_digest, window_started, attempts) VALUES (?1, ?2, 1)",
-                        params![username_digest, now],
+                        params![username_digest, now_seconds],
                     )?;
                 }
             }
@@ -961,7 +971,7 @@ impl Database {
                 .map_err(|error| error.to_string())?;
             if table_exists(&connection, "share_sessions").map_err(|error| error.to_string())? {
                 connection
-                    .execute("DELETE FROM share_sessions WHERE expires_at <= ?1", [unix_time_seconds()])
+                    .execute("DELETE FROM share_sessions WHERE expires_at <= ?1", [unix_seconds(unix_time())])
                     .map_err(|error| error.to_string())?;
             }
             operation(&mut connection).map_err(|error| error.to_string())
@@ -1082,12 +1092,18 @@ fn account_role_from_db(value: &str) -> rusqlite::Result<AccountRole> {
     }
 }
 
-fn unix_time_seconds() -> i64 {
+fn unix_time() -> Duration {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
-        .as_secs()
-        .min(i64::MAX as u64) as i64
+}
+
+fn unix_seconds(duration: Duration) -> i64 {
+    duration.as_secs().min(i64::MAX as u64) as i64
+}
+
+fn duration_from_seconds(seconds: i64) -> Duration {
+    Duration::from_secs(u64::try_from(seconds).unwrap_or_default())
 }
 
 fn table_exists(connection: &Connection, table: &str) -> rusqlite::Result<bool> {

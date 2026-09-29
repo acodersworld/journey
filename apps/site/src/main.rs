@@ -8,7 +8,7 @@ use std::{
     error::Error,
     net::SocketAddr,
     path::PathBuf,
-    time::{SystemTime, UNIX_EPOCH},
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use db::Database;
@@ -235,17 +235,17 @@ async fn main() -> AppResult<()> {
                             let seconds = value
                                 .into_string()
                                 .map_err(|_| "share link lifetime must be UTF-8")?
-                                .parse::<i64>()?;
+                                .parse::<u64>()?;
                             if args.next().is_some() {
                                 return Err("usage: journey-site share-links lifetime [seconds]".into());
                             }
                             database
-                                .set_share_link_lifetime_seconds(seconds)
+                                .set_share_link_lifetime(Duration::from_secs(seconds))
                                 .await
                                 .map_err(std::io::Error::other)?;
                             println!("share link lifetime set to {seconds} seconds");
                         }
-                        None => println!("{}", database.share_link_lifetime_seconds().await.map_err(std::io::Error::other)?),
+                        None => println!("{}", database.share_link_lifetime().await.map_err(std::io::Error::other)?.as_secs()),
                     }
                     Ok(())
                 }
@@ -265,7 +265,7 @@ async fn main() -> AppResult<()> {
                     let origin = web::share_link_origin(bind_address).map_err(std::io::Error::other)?;
                     let link_id = auth::new_share_link_id();
                     let secret = auth::new_share_link_secret();
-                    let created_at = unix_time_seconds();
+                    let created_at = unix_time();
                     match database
                         .create_share_link(
                             link_id.clone(),
@@ -284,11 +284,11 @@ async fn main() -> AppResult<()> {
                     }
                 }
                 Some("list") if args.next().is_none() => {
-                    let now = unix_time_seconds();
+                    let now = unix_time();
                     println!("Link ID\tPost ID\tExpires (epoch seconds)\tExpires (UTC)\tRevocation status");
                     for link in database.share_links().await.map_err(std::io::Error::other)? {
                         let status = match link.revoked_at {
-                            Some(revoked_at) => format!("revoked at {revoked_at}"),
+                            Some(revoked_at) => format!("revoked at {}", revoked_at.as_secs()),
                             None if link.expires_at <= now => "expired, not revoked".to_owned(),
                             None => "not revoked".to_owned(),
                         };
@@ -296,7 +296,7 @@ async fn main() -> AppResult<()> {
                             "{}\t{}\t{}\t{}\t{}",
                             link.id,
                             link.post_id,
-                            link.expires_at,
+                            link.expires_at.as_secs(),
                             link.expires_at_utc.as_deref().unwrap_or("out of range"),
                             status,
                         );
@@ -313,7 +313,7 @@ async fn main() -> AppResult<()> {
                         return Err("usage: journey-site share-links revoke <link-id>".into());
                     }
                     if !database
-                        .revoke_share_link(link_id.clone(), unix_time_seconds())
+                        .revoke_share_link(link_id.clone(), unix_time())
                         .await
                         .map_err(std::io::Error::other)?
                     {
@@ -375,12 +375,10 @@ fn next_username(args: &mut impl Iterator<Item = std::ffi::OsString>) -> AppResu
         .map_err(|_| std::io::Error::other("username must be UTF-8").into())
 }
 
-fn unix_time_seconds() -> i64 {
+fn unix_time() -> Duration {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
-        .as_secs()
-        .min(i64::MAX as u64) as i64
 }
 
 fn link_url(origin: &str, link_id: &str, secret: &str) -> String {

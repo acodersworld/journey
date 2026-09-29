@@ -8,7 +8,7 @@ use axum::{
     Json, Router,
 };
 use serde::{Deserialize, Serialize};
-use std::{net::{IpAddr, SocketAddr}, time::{SystemTime, UNIX_EPOCH}};
+use std::{net::{IpAddr, SocketAddr}, time::{Duration, SystemTime, UNIX_EPOCH}};
 
 use crate::{
     auth,
@@ -30,7 +30,7 @@ pub struct AppState<S: StorageClient> {
 pub struct SiteSecurity {
     public_origin: Option<ParsedOrigin>,
     secure_cookie: bool,
-    session_lifetime_seconds: i64,
+    session_lifetime: Duration,
 }
 
 #[derive(Clone)]
@@ -110,7 +110,11 @@ impl SiteSecurity {
             return Err("JOURNEY_SITE_SESSION_TTL_SECONDS must be a positive integer".to_owned());
         }
         let secure_cookie = !allow_insecure_cookies;
-        Ok(Self { public_origin, secure_cookie, session_lifetime_seconds })
+        Ok(Self {
+            public_origin,
+            secure_cookie,
+            session_lifetime: Duration::from_secs(session_lifetime_seconds as u64),
+        })
     }
 }
 
@@ -192,7 +196,7 @@ async fn open_share_link<S: StorageClient>(
     State(state): State<AppState<S>>,
     Path((share_link_id, secret)): Path<(String, String)>,
 ) -> Response {
-    let now = unix_time_seconds();
+    let now = unix_time();
     let session_token = auth::new_session_token();
     match state
         .database
@@ -211,7 +215,7 @@ async fn open_share_link<S: StorageClient>(
                 &state.security,
                 &share_link_id,
                 &session_token,
-                expires_at.saturating_sub(unix_time_seconds()),
+                expires_at.saturating_sub(unix_time()),
             );
             no_store(response)
         }
@@ -237,7 +241,7 @@ async fn shared_post_page<S: StorageClient>(
             share_link_id.clone(),
             auth::session_token_digest(&token),
             post_id,
-            unix_time_seconds(),
+            unix_time(),
         )
         .await
     {
@@ -269,7 +273,7 @@ async fn shared_media<S: StorageClient>(
             auth::session_token_digest(&token),
             post_id,
             block_id,
-            unix_time_seconds(),
+            unix_time(),
         )
         .await
     {
@@ -397,14 +401,14 @@ async fn authenticate_and_issue_session<S: StorageClient>(
     }
     let username_throttle_key = auth::username_throttle_key(&username);
     let address_throttle_key = auth::address_throttle_key(&peer_address.ip().to_string());
-    let now = unix_time_seconds();
+    let now = unix_time();
     for (key, maximum_attempts) in [
         (username_throttle_key.clone(), 5),
         (address_throttle_key.clone(), 30),
     ] {
         match state
             .database
-            .record_login_attempt(key, now, 15 * 60, maximum_attempts)
+            .record_login_attempt(key, now, Duration::from_secs(15 * 60), maximum_attempts)
             .await
         {
             Ok(true) => {}
@@ -446,8 +450,8 @@ async fn authenticate_and_issue_session<S: StorageClient>(
     }
 
     let token = auth::new_session_token();
-    let created_at = unix_time_seconds();
-    let expires_at = created_at.saturating_add(state.security.session_lifetime_seconds);
+    let created_at = unix_time();
+    let expires_at = created_at.saturating_add(state.security.session_lifetime);
     if let Err(error) = state
         .database
         .issue_session(
@@ -536,7 +540,7 @@ async fn lookup_session<S: StorageClient>(
 ) -> Result<Option<AuthenticatedAccount>, String> {
     state
         .database
-        .authenticated_account(auth::session_token_digest(token), unix_time_seconds())
+        .authenticated_account(auth::session_token_digest(token), unix_time())
         .await
 }
 
@@ -590,7 +594,7 @@ fn set_session_cookie(response: &mut Response, security: &SiteSecurity, token: &
     let secure = if security.secure_cookie { "; Secure" } else { "" };
     let value = format!(
         "journey_session={token}; Path=/; HttpOnly; SameSite=Strict; Max-Age={}{secure}",
-        security.session_lifetime_seconds,
+        security.session_lifetime.as_secs(),
     );
     if let Ok(value) = HeaderValue::from_str(&value) {
         response.headers_mut().insert(header::SET_COOKIE, value);
@@ -602,11 +606,12 @@ fn set_share_cookie(
     security: &SiteSecurity,
     share_link_id: &str,
     token: &str,
-    max_age: i64,
+    max_age: Duration,
 ) {
     let secure = if security.secure_cookie { "; Secure" } else { "" };
     let value = format!(
-        "journey_share_{share_link_id}={token}; Path=/share/{share_link_id}; HttpOnly; SameSite=Lax; Max-Age={max_age}{secure}"
+        "journey_share_{share_link_id}={token}; Path=/share/{share_link_id}; HttpOnly; SameSite=Lax; Max-Age={}{secure}",
+        max_age.as_secs(),
     );
     if let Ok(value) = HeaderValue::from_str(&value) {
         response.headers_mut().append(header::SET_COOKIE, value);
@@ -782,12 +787,10 @@ fn render_login_page(return_to: &str, username: &str, error: Option<&str>) -> St
     ))
 }
 
-fn unix_time_seconds() -> i64 {
+fn unix_time() -> Duration {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
-        .as_secs()
-        .min(i64::MAX as u64) as i64
 }
 
 async fn feed<S: StorageClient>(
@@ -1725,7 +1728,7 @@ pub fn state<S: StorageClient>(database: Database, storage: S) -> AppState<S> {
         security: SiteSecurity {
             public_origin: None,
             secure_cookie: false,
-            session_lifetime_seconds: 7 * 24 * 60 * 60,
+            session_lifetime: Duration::from_secs(7 * 24 * 60 * 60),
         },
     }
 }
@@ -1743,7 +1746,7 @@ mod tests {
     use std::{
         net::{IpAddr, Ipv4Addr, SocketAddr},
         path::{Path, PathBuf},
-        time::{SystemTime, UNIX_EPOCH},
+        time::{Duration, SystemTime, UNIX_EPOCH},
     };
 
     use rusqlite::Connection;
@@ -2043,8 +2046,8 @@ mod tests {
             .issue_session(
                 reader.id,
                 auth::session_token_digest(&expired_token),
-                1,
-                2,
+                Duration::from_secs(1),
+                Duration::from_secs(2),
             )
             .await
             .unwrap();
