@@ -1,15 +1,18 @@
 use axum::{
     body::Body,
-    extract::{Path, Query, State},
-    http::{header, HeaderMap, Method, StatusCode},
+    extract::{ConnectInfo, Extension, Path, Query, Request, State},
+    http::{header, HeaderMap, HeaderValue, Method, StatusCode, Uri},
+    middleware::{self, Next},
     response::{Html, IntoResponse, Response},
-    routing::get,
+    routing::{get, post},
     Json, Router,
 };
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
+use std::{net::{IpAddr, SocketAddr}, time::{SystemTime, UNIX_EPOCH}};
 
 use crate::{
-    db::{Database, FeedCursor, Post, PostSummary, SidebarData},
+    auth,
+    db::{AccountRole, AuthenticatedAccount, Database, FeedCursor, Post, PostAccess, PostSummary, SidebarData},
     storage::StorageClient,
 };
 
@@ -20,6 +23,38 @@ const MAX_FEED_LIMIT: usize = 100;
 pub struct AppState<S: StorageClient> {
     database: Database,
     storage: S,
+    security: SiteSecurity,
+}
+
+#[derive(Clone)]
+pub struct SiteSecurity {
+    public_origin: Option<ParsedOrigin>,
+    secure_cookie: bool,
+    session_lifetime_seconds: i64,
+}
+
+#[derive(Clone)]
+struct ParsedOrigin {
+    key: String,
+    scheme: String,
+    host: String,
+}
+
+#[derive(Clone)]
+struct AuthPrincipal {
+    role: AccountRole,
+}
+
+#[derive(Deserialize)]
+struct LoginRequest {
+    username: String,
+    password: String,
+}
+
+#[derive(Serialize)]
+struct CurrentAccountResponse {
+    username: String,
+    role: AccountRole,
 }
 
 #[derive(Deserialize)]
@@ -34,8 +69,39 @@ struct TagPageQuery {
     tag: String,
 }
 
+impl SiteSecurity {
+    pub fn from_env(bind_address: SocketAddr) -> Result<Self, String> {
+        let public_origin = match std::env::var("JOURNEY_SITE_PUBLIC_ORIGIN") {
+            Ok(value) => {
+                let origin = parse_origin(&value)
+                    .ok_or_else(|| "JOURNEY_SITE_PUBLIC_ORIGIN must be an origin URL".to_owned())?;
+                if origin.scheme == "http" && !origin.is_loopback() {
+                    return Err("JOURNEY_SITE_PUBLIC_ORIGIN may use HTTP only for loopback hosts".to_owned());
+                }
+                Some(origin)
+            }
+            Err(std::env::VarError::NotPresent) if bind_address.ip().is_loopback() => None,
+            Err(std::env::VarError::NotPresent) => {
+                return Err("JOURNEY_SITE_PUBLIC_ORIGIN is required when binding outside loopback".to_owned());
+            }
+            Err(error) => return Err(format!("could not read JOURNEY_SITE_PUBLIC_ORIGIN: {error}")),
+        };
+        let session_lifetime_seconds = std::env::var("JOURNEY_SITE_SESSION_TTL_SECONDS")
+            .unwrap_or_else(|_| "604800".to_owned())
+            .parse::<i64>()
+            .map_err(|_| "JOURNEY_SITE_SESSION_TTL_SECONDS must be a positive integer".to_owned())?;
+        if session_lifetime_seconds <= 0 {
+            return Err("JOURNEY_SITE_SESSION_TTL_SECONDS must be a positive integer".to_owned());
+        }
+        let secure_cookie = public_origin
+            .as_ref()
+            .is_some_and(|origin| origin.scheme == "https");
+        Ok(Self { public_origin, secure_cookie, session_lifetime_seconds })
+    }
+}
+
 pub fn router<S: StorageClient>(state: AppState<S>) -> Router {
-    Router::new()
+    let content_routes = Router::new()
         .route("/", get(home::<S>))
         .route("/tags", get(tag_page::<S>))
         .route("/archive/{month}", get(archive_page::<S>))
@@ -49,7 +115,314 @@ pub fn router<S: StorageClient>(state: AppState<S>) -> Router {
             "/posts/{post_id}/blocks/{block_id}/media",
             get(media::<S>).head(media::<S>),
         )
+        .route_layer(middleware::from_fn_with_state(state.clone(), authenticate::<S>));
+
+    Router::new()
+        .route("/api/auth/login", post(login::<S>))
+        .route("/api/auth/current", get(current_account::<S>))
+        .route("/api/auth/logout", post(logout::<S>))
+        .merge(content_routes)
         .with_state(state)
+}
+
+async fn authenticate<S: StorageClient>(
+    State(state): State<AppState<S>>,
+    mut request: Request,
+    next: Next,
+) -> Response {
+    let token = cookie_token(request.headers());
+    let Some(token) = token else {
+        return no_store(StatusCode::UNAUTHORIZED.into_response());
+    };
+    let account = match lookup_session(&state, &token).await {
+        Ok(Some(account)) => account,
+        Ok(None) => return no_store(StatusCode::UNAUTHORIZED.into_response()),
+        Err(error) => {
+            eprintln!("website session lookup failed: {error}");
+            return no_store(StatusCode::INTERNAL_SERVER_ERROR.into_response());
+        }
+    };
+    request.extensions_mut().insert(AuthPrincipal::from(account));
+    no_store(next.run(request).await)
+}
+
+async fn login<S: StorageClient>(
+    State(state): State<AppState<S>>,
+    ConnectInfo(peer_address): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    Json(credentials): Json<LoginRequest>,
+) -> Response {
+    if !origin_allowed(&headers, &state.security) {
+        return no_store((StatusCode::FORBIDDEN, "origin not allowed\n").into_response());
+    }
+    if credentials.username.len() > 64 || credentials.password.len() > 1024 {
+        return login_failure();
+    }
+    let username_throttle_key = auth::username_throttle_key(&credentials.username);
+    let address_throttle_key = auth::address_throttle_key(&peer_address.ip().to_string());
+    let now = unix_time_seconds();
+    for (key, maximum_attempts) in [
+        (username_throttle_key.clone(), 5),
+        (address_throttle_key.clone(), 30),
+    ] {
+        match state
+            .database
+            .record_login_attempt(key, now, 15 * 60, maximum_attempts)
+            .await
+        {
+            Ok(true) => {}
+            Ok(false) => return login_failure(),
+            Err(error) => {
+                eprintln!("website login throttle failed: {error}");
+                return no_store(StatusCode::INTERNAL_SERVER_ERROR.into_response());
+            }
+        }
+    }
+
+    let account = match state.database.login_account(credentials.username.clone()).await {
+        Ok(account) => account,
+        Err(error) => {
+            eprintln!("website account lookup failed: {error}");
+            return no_store(StatusCode::INTERNAL_SERVER_ERROR.into_response());
+        }
+    };
+    let valid_username = auth::validate_username(&credentials.username).is_ok();
+    let authenticated = match account.as_ref() {
+        Some(account) => {
+            let password_matches = auth::verify_password(&credentials.password, &account.password_hash);
+            valid_username && account.enabled && password_matches
+        }
+        None => {
+            auth::dummy_verify_password(&credentials.password);
+            false
+        }
+    };
+    if !authenticated {
+        return login_failure();
+    }
+    let account = account.expect("successful authentication has an account");
+    for key in [username_throttle_key, address_throttle_key] {
+        if let Err(error) = state.database.clear_login_attempts(key).await {
+            eprintln!("website login throttle reset failed: {error}");
+            return no_store(StatusCode::INTERNAL_SERVER_ERROR.into_response());
+        }
+    }
+
+    let token = auth::new_session_token();
+    let created_at = unix_time_seconds();
+    let expires_at = created_at.saturating_add(state.security.session_lifetime_seconds);
+    if let Err(error) = state
+        .database
+        .issue_session(
+            account.id,
+            auth::session_token_digest(&token),
+            created_at,
+            expires_at,
+        )
+        .await
+    {
+        eprintln!("website session creation failed: {error}");
+        return no_store(StatusCode::INTERNAL_SERVER_ERROR.into_response());
+    }
+
+    let mut response = Json(CurrentAccountResponse {
+        username: account.username,
+        role: account.role,
+    })
+    .into_response();
+    set_session_cookie(&mut response, &state.security, &token);
+    no_store(response)
+}
+
+async fn current_account<S: StorageClient>(
+    State(state): State<AppState<S>>,
+    headers: HeaderMap,
+) -> Response {
+    let Some(token) = cookie_token(&headers) else {
+        return no_store(StatusCode::UNAUTHORIZED.into_response());
+    };
+    match lookup_session(&state, &token).await {
+        Ok(Some(account)) => no_store(Json(CurrentAccountResponse {
+            username: account.username,
+            role: account.role,
+        }).into_response()),
+        Ok(None) => no_store(StatusCode::UNAUTHORIZED.into_response()),
+        Err(error) => {
+            eprintln!("website current-account lookup failed: {error}");
+            no_store(StatusCode::INTERNAL_SERVER_ERROR.into_response())
+        }
+    }
+}
+
+async fn logout<S: StorageClient>(
+    State(state): State<AppState<S>>,
+    headers: HeaderMap,
+) -> Response {
+    if !origin_allowed(&headers, &state.security) {
+        return no_store((StatusCode::FORBIDDEN, "origin not allowed\n").into_response());
+    }
+    if let Some(token) = cookie_token(&headers) {
+        if let Err(error) = state
+            .database
+            .revoke_session(auth::session_token_digest(&token))
+            .await
+        {
+            eprintln!("website logout failed: {error}");
+            return no_store(StatusCode::INTERNAL_SERVER_ERROR.into_response());
+        }
+    }
+    let mut response = StatusCode::NO_CONTENT.into_response();
+    expire_session_cookie(&mut response, &state.security);
+    no_store(response)
+}
+
+async fn lookup_session<S: StorageClient>(
+    state: &AppState<S>,
+    token: &str,
+) -> Result<Option<AuthenticatedAccount>, String> {
+    state
+        .database
+        .authenticated_account(auth::session_token_digest(token), unix_time_seconds())
+        .await
+}
+
+fn login_failure() -> Response {
+    no_store((StatusCode::UNAUTHORIZED, "invalid username or password\n").into_response())
+}
+
+fn cookie_token(headers: &HeaderMap) -> Option<String> {
+    for cookie_header in headers.get_all(header::COOKIE) {
+        let Ok(cookie_header) = cookie_header.to_str() else {
+            continue;
+        };
+        for cookie in cookie_header.split(';').map(str::trim) {
+            let Some(token) = cookie.strip_prefix("journey_session=") else {
+                continue;
+            };
+            if token.len() == 43
+                && token.bytes().all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
+            {
+                return Some(token.to_owned());
+            }
+        }
+    }
+    None
+}
+
+fn set_session_cookie(response: &mut Response, security: &SiteSecurity, token: &str) {
+    let secure = if security.secure_cookie { "; Secure" } else { "" };
+    let value = format!(
+        "journey_session={token}; Path=/; HttpOnly; SameSite=Strict; Max-Age={}{secure}",
+        security.session_lifetime_seconds,
+    );
+    if let Ok(value) = HeaderValue::from_str(&value) {
+        response.headers_mut().insert(header::SET_COOKIE, value);
+    }
+}
+
+fn expire_session_cookie(response: &mut Response, security: &SiteSecurity) {
+    let secure = if security.secure_cookie { "; Secure" } else { "" };
+    if let Ok(value) = HeaderValue::from_str(&format!(
+        "journey_session=; Path=/; HttpOnly; SameSite=Strict; Max-Age=0{secure}"
+    )) {
+        response.headers_mut().insert(header::SET_COOKIE, value);
+    }
+}
+
+fn origin_allowed(headers: &HeaderMap, security: &SiteSecurity) -> bool {
+    let Some(origin_header) = headers.get(header::ORIGIN) else {
+        return false;
+    };
+    let Ok(origin_value) = origin_header.to_str() else {
+        return false;
+    };
+    let Some(origin) = parse_origin(origin_value) else {
+        return false;
+    };
+    match &security.public_origin {
+        Some(configured) => origin.key == configured.key,
+        None => origin.scheme == "http" && origin.is_loopback(),
+    }
+}
+
+fn parse_origin(value: &str) -> Option<ParsedOrigin> {
+    let uri = value.parse::<Uri>().ok()?;
+    let scheme = uri.scheme_str()?.to_ascii_lowercase();
+    if scheme != "http" && scheme != "https" {
+        return None;
+    }
+    if uri
+        .path_and_query()
+        .is_some_and(|path| path.as_str() != "/")
+    {
+        return None;
+    }
+    let authority = uri.authority()?;
+    if authority.as_str().contains('@') {
+        return None;
+    }
+    let raw_host = authority.host();
+    if raw_host.is_empty() {
+        return None;
+    }
+    let host = raw_host.trim_start_matches('[').trim_end_matches(']').to_ascii_lowercase();
+    let port = authority.port_u16().unwrap_or(if scheme == "https" { 443 } else { 80 });
+    let port_suffix = if (scheme == "https" && port == 443) || (scheme == "http" && port == 80) {
+        String::new()
+    } else {
+        format!(":{port}")
+    };
+    let authority_host = if host.parse::<IpAddr>().is_ok_and(|address| address.is_ipv6()) {
+        format!("[{host}]")
+    } else {
+        host.clone()
+    };
+    Some(ParsedOrigin {
+        key: format!("{scheme}://{authority_host}{port_suffix}"),
+        scheme,
+        host,
+    })
+}
+
+impl ParsedOrigin {
+    fn is_loopback(&self) -> bool {
+        self.host.eq_ignore_ascii_case("localhost")
+            || self
+                .host
+                .parse::<IpAddr>()
+                .is_ok_and(|address| address.is_loopback())
+    }
+}
+
+impl From<AuthenticatedAccount> for AuthPrincipal {
+    fn from(account: AuthenticatedAccount) -> Self {
+        Self { role: account.role }
+    }
+}
+
+impl AuthPrincipal {
+    fn post_access(&self) -> PostAccess {
+        match self.role {
+            AccountRole::Owner => PostAccess::Owner,
+            AccountRole::Reader => PostAccess::Published,
+        }
+    }
+}
+
+fn no_store(mut response: Response) -> Response {
+    response.headers_mut().insert(
+        header::CACHE_CONTROL,
+        HeaderValue::from_static("private, no-store"),
+    );
+    response
+}
+
+fn unix_time_seconds() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+        .min(i64::MAX as u64) as i64
 }
 
 async fn feed<S: StorageClient>(
@@ -171,8 +544,9 @@ async fn archive_page<S: StorageClient>(
 async fn api_full_post<S: StorageClient>(
     State(state): State<AppState<S>>,
     Path(id): Path<i64>,
+    Extension(principal): Extension<AuthPrincipal>,
 ) -> Response {
-    match state.database.post(id).await {
+    match state.database.post_with_access(id, principal.post_access()).await {
         Ok(Some(post)) => Json(post).into_response(),
         Ok(None) => StatusCode::NOT_FOUND.into_response(),
         Err(error) => {
@@ -185,8 +559,9 @@ async fn api_full_post<S: StorageClient>(
 async fn post_page<S: StorageClient>(
     State(state): State<AppState<S>>,
     Path(id): Path<i64>,
+    Extension(principal): Extension<AuthPrincipal>,
 ) -> Response {
-    match state.database.post(id).await {
+    match state.database.post_with_access(id, principal.post_access()).await {
         Ok(Some(post)) => {
             let sidebar = match state.database.sidebar_data().await {
                 Ok(sidebar) => sidebar,
@@ -208,8 +583,9 @@ async fn post_page<S: StorageClient>(
 async fn post_fragment<S: StorageClient>(
     State(state): State<AppState<S>>,
     Path(id): Path<i64>,
+    Extension(principal): Extension<AuthPrincipal>,
 ) -> Response {
-    match state.database.post(id).await {
+    match state.database.post_with_access(id, principal.post_access()).await {
         Ok(Some(post)) => Html(pretty_html(&render_post(&post, false))).into_response(),
         Ok(None) => StatusCode::NOT_FOUND.into_response(),
         Err(error) => {
@@ -823,10 +1199,15 @@ fn escape_html(value: &str) -> String {
 async fn media<S: StorageClient>(
     State(state): State<AppState<S>>,
     Path((post_id, block_id)): Path<(i64, i64)>,
+    Extension(principal): Extension<AuthPrincipal>,
     method: Method,
     headers: HeaderMap,
 ) -> Response {
-    let media = match state.database.media_reference(post_id, block_id).await {
+    let media = match state
+        .database
+        .media_reference_with_access(post_id, block_id, principal.post_access())
+        .await
+    {
         Ok(Some(media)) => media,
         Ok(None) => return StatusCode::NOT_FOUND.into_response(),
         Err(error) => {
@@ -883,8 +1264,25 @@ async fn media<S: StorageClient>(
     })
 }
 
+#[cfg(test)]
 pub fn state<S: StorageClient>(database: Database, storage: S) -> AppState<S> {
-    AppState { database, storage }
+    AppState {
+        database,
+        storage,
+        security: SiteSecurity {
+            public_origin: None,
+            secure_cookie: false,
+            session_lifetime_seconds: 7 * 24 * 60 * 60,
+        },
+    }
+}
+
+pub fn state_with_security<S: StorageClient>(
+    database: Database,
+    storage: S,
+    security: SiteSecurity,
+) -> AppState<S> {
+    AppState { database, storage, security }
 }
 
 #[cfg(test)]

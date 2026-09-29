@@ -1,19 +1,34 @@
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, HashSet},
     error::Error,
     path::{Path, PathBuf},
 };
 
 use serde::Deserialize;
 
-use crate::{db::{Database, NewBlock, NewPost}, storage::StorageClient};
+use crate::{
+    auth,
+    db::{AccountRole, Database, ImportedAccount, NewBlock, NewPost},
+    storage::StorageClient,
+};
 
 type AppResult<T> = Result<T, Box<dyn Error + Send + Sync>>;
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Manifest {
+    #[serde(default)]
+    users: Vec<ManifestUser>,
     posts: Vec<ManifestPost>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ManifestUser {
+    username: String,
+    password: String,
+    #[serde(default)]
+    role: AccountRole,
 }
 
 #[derive(Deserialize)]
@@ -68,6 +83,7 @@ struct PreparedMedia {
 }
 
 pub struct PreparedImport {
+    accounts: Vec<ImportedAccount>,
     posts: Vec<PreparedPost>,
     assets: BTreeMap<PathBuf, MediaAsset>,
 }
@@ -80,6 +96,23 @@ pub async fn prepare_manifest(manifest_path: &Path) -> AppResult<PreparedImport>
         .to_path_buf();
     let manifest_bytes = tokio::fs::read(&manifest_path).await?;
     let manifest: Manifest = serde_json::from_slice(&manifest_bytes)?;
+
+    let mut accounts = Vec::with_capacity(manifest.users.len());
+    let mut usernames = HashSet::new();
+    for user in manifest.users {
+        auth::validate_username(&user.username)?;
+        if user.password.is_empty() {
+            return Err(format!("password for imported user {:?} must not be empty", user.username).into());
+        }
+        if !usernames.insert(user.username.to_ascii_lowercase()) {
+            return Err(format!("duplicate imported username: {:?}", user.username).into());
+        }
+        accounts.push(ImportedAccount {
+            username: user.username,
+            role: user.role,
+            password_hash: auth::hash_password(&user.password).map_err(std::io::Error::other)?,
+        });
+    }
 
     let mut assets = BTreeMap::<PathBuf, MediaAsset>::new();
     let mut posts = Vec::with_capacity(manifest.posts.len());
@@ -108,7 +141,7 @@ pub async fn prepare_manifest(manifest_path: &Path) -> AppResult<PreparedImport>
         });
     }
 
-    Ok(PreparedImport { posts, assets })
+    Ok(PreparedImport { accounts, posts, assets })
 }
 
 pub async fn apply_import<S: StorageClient>(
@@ -117,8 +150,9 @@ pub async fn apply_import<S: StorageClient>(
     storage: &S,
 ) -> AppResult<()> {
     println!(
-        "validated {} posts and {} unique media files",
+        "validated {} posts, {} imported accounts, and {} unique media files",
         prepared.posts.len(),
+        prepared.accounts.len(),
         prepared.assets.len()
     );
     let mut storage_keys = BTreeMap::new();
@@ -128,10 +162,14 @@ pub async fn apply_import<S: StorageClient>(
         storage_keys.insert(path, storage_key);
     }
 
-    database
-        .replace_posts(resolve_posts(prepared.posts, &storage_keys)?)
+    let added_accounts = database
+        .replace_posts_and_add_accounts(
+            resolve_posts(prepared.posts, &storage_keys)?,
+            prepared.accounts,
+        )
         .await
         .map_err(std::io::Error::other)?;
+    println!("added {added_accounts} new account(s); existing accounts and sessions were kept");
     println!("replaced the published post set");
     Ok(())
 }

@@ -1,3 +1,4 @@
+mod auth;
 mod db;
 mod import;
 mod storage;
@@ -21,12 +22,19 @@ Usage:
   journey-site db schema
   journey-site db posts
   journey-site db post <id>
+  journey-site users create <username> <owner|reader>
+  journey-site users list
+  journey-site users password <username>
+  journey-site users disable <username>
+  journey-site users enable <username>
   journey-site --help
 
 Environment:
   JOURNEY_SITE_DB        SQLite file (default: journey-site.sqlite3)
   JOURNEY_SITE_BIND     HTTP listen address (default: 127.0.0.1:8080)
   JOURNEY_STORAGE_H2C   loopback h2c address (default: 127.0.0.1:8081)
+  JOURNEY_SITE_PUBLIC_ORIGIN      site's public origin (required off loopback)
+  JOURNEY_SITE_SESSION_TTL_SECONDS absolute session lifetime (default: 604800)
 ";
 const DB_HELP: &str = "\
 Usage:
@@ -34,6 +42,14 @@ Usage:
   journey-site db schema
   journey-site db posts
   journey-site db post <id>
+";
+const USERS_HELP: &str = "\
+Usage:
+  journey-site users create <username> <owner|reader>
+  journey-site users list
+  journey-site users password <username>
+  journey-site users disable <username>
+  journey-site users enable <username>
 ";
 
 #[tokio::main]
@@ -119,6 +135,73 @@ async fn main() -> AppResult<()> {
                 _ => Err("usage: journey-site db <tables|schema|posts|post <id>>".into()),
             }
         }
+        Some("users") => {
+            let subcommand = args.next().ok_or("users requires a subcommand")?;
+            if subcommand == "--help" || subcommand == "-h" {
+                if args.next().is_some() {
+                    return Err("users help does not take arguments".into());
+                }
+                print!("{USERS_HELP}");
+                return Ok(());
+            }
+            database.initialize().await.map_err(std::io::Error::other)?;
+            match subcommand.to_str() {
+                Some("create") => {
+                    let username = next_username(&mut args)?;
+                    let role = args.next().ok_or("users create requires an account role")?;
+                    let role = db::AccountRole::parse(role.to_str().ok_or("account role must be UTF-8")?)?;
+                    if args.next().is_some() {
+                        return Err("usage: journey-site users create <username> <owner|reader>".into());
+                    }
+                    auth::validate_username(&username)?;
+                    let password = read_new_password()?;
+                    let password_hash = auth::hash_password(&password).map_err(std::io::Error::other)?;
+                    database
+                        .create_account(username.clone(), role, password_hash)
+                        .await
+                        .map_err(std::io::Error::other)?;
+                    println!("created {role} account {username}");
+                    Ok(())
+                }
+                Some("list") if args.next().is_none() => {
+                    let accounts = database.accounts().await.map_err(std::io::Error::other)?;
+                    for account in accounts {
+                        println!("{}\t{}\t{}", account.role, account.username, if account.enabled { "enabled" } else { "disabled" });
+                    }
+                    Ok(())
+                }
+                Some("password") => {
+                    let username = next_username(&mut args)?;
+                    if args.next().is_some() {
+                        return Err("usage: journey-site users password <username>".into());
+                    }
+                    auth::validate_username(&username)?;
+                    let password = read_new_password()?;
+                    let password_hash = auth::hash_password(&password).map_err(std::io::Error::other)?;
+                    database
+                        .change_password(username.clone(), password_hash)
+                        .await
+                        .map_err(std::io::Error::other)?;
+                    println!("changed password for {username}; existing sessions were revoked");
+                    Ok(())
+                }
+                Some("disable") | Some("enable") => {
+                    let enabled = subcommand == "enable";
+                    let username = next_username(&mut args)?;
+                    if args.next().is_some() {
+                        return Err(format!("usage: journey-site users {} <username>", if enabled { "enable" } else { "disable" }).into());
+                    }
+                    auth::validate_username(&username)?;
+                    database
+                        .set_reader_enabled(username.clone(), enabled)
+                        .await
+                        .map_err(std::io::Error::other)?;
+                    println!("{} reader account {username}", if enabled { "enabled" } else { "disabled" });
+                    Ok(())
+                }
+                _ => Err("usage: journey-site users <create|list|password|disable|enable>".into()),
+            }
+        }
         Some("serve") => {
             let next = args.next();
             if next.as_deref() == Some(std::ffi::OsStr::new("--help"))
@@ -137,13 +220,94 @@ async fn main() -> AppResult<()> {
             let storage = connect_storage().await?;
             let bind = std::env::var("JOURNEY_SITE_BIND")
                 .unwrap_or_else(|_| "127.0.0.1:8080".to_owned());
+            let bind_address = bind.parse::<SocketAddr>()?;
+            let security = web::SiteSecurity::from_env(bind_address)
+                .map_err(std::io::Error::other)?;
             let listener = TcpListener::bind(&bind).await?;
             println!("journey-site HTTP listener on {}", listener.local_addr()?);
-            axum::serve(listener, web::router(web::state(database, storage))).await?;
+            axum::serve(
+                listener,
+                web::router(web::state_with_security(database, storage, security))
+                    .into_make_service_with_connect_info::<SocketAddr>(),
+            )
+            .await?;
             Ok(())
         }
         _ => Err("unknown command; use journey-site --help".into()),
     }
+}
+
+fn next_username(args: &mut impl Iterator<Item = std::ffi::OsString>) -> AppResult<String> {
+    args.next()
+        .ok_or_else(|| std::io::Error::other("users command requires a username"))?
+        .into_string()
+        .map_err(|_| std::io::Error::other("username must be UTF-8").into())
+}
+
+fn read_new_password() -> AppResult<String> {
+    let password = read_password("Password: ")?;
+    let confirmation = read_password("Confirm password: ")?;
+    if password != confirmation {
+        return Err("passwords do not match".into());
+    }
+    if password.chars().count() < 12 {
+        return Err("passwords must contain at least 12 characters".into());
+    }
+    if password.len() > 1024 {
+        return Err("passwords must be at most 1024 bytes".into());
+    }
+    Ok(password)
+}
+
+#[cfg(unix)]
+fn read_password(prompt: &str) -> std::io::Result<String> {
+    use std::io::{self, Write};
+
+    print!("{prompt}");
+    io::stdout().flush()?;
+    let descriptor = libc::STDIN_FILENO;
+    let mut original = std::mem::MaybeUninit::<libc::termios>::uninit();
+    if unsafe { libc::tcgetattr(descriptor, original.as_mut_ptr()) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let original = unsafe { original.assume_init() };
+    let mut hidden = original;
+    hidden.c_lflag &= !libc::ECHO;
+    if unsafe { libc::tcsetattr(descriptor, libc::TCSAFLUSH, &hidden) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let _restore = TerminalEchoGuard { descriptor, settings: original };
+    let mut password = String::new();
+    io::stdin().read_line(&mut password)?;
+    drop(_restore);
+    println!();
+    while matches!(password.as_bytes().last(), Some(b'\n' | b'\r')) {
+        password.pop();
+    }
+    Ok(password)
+}
+
+#[cfg(unix)]
+struct TerminalEchoGuard {
+    descriptor: libc::c_int,
+    settings: libc::termios,
+}
+
+#[cfg(unix)]
+impl Drop for TerminalEchoGuard {
+    fn drop(&mut self) {
+        unsafe {
+            libc::tcsetattr(self.descriptor, libc::TCSAFLUSH, &self.settings);
+        }
+    }
+}
+
+#[cfg(not(unix))]
+fn read_password(_prompt: &str) -> std::io::Result<String> {
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "interactive password input without echo is not supported on this platform",
+    ))
 }
 
 fn database_path() -> PathBuf {

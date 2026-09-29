@@ -1,7 +1,7 @@
 use std::{collections::HashMap, path::PathBuf, sync::Arc, time::Duration};
 
 use rusqlite::{params, types::Type, Connection, OptionalExtension, TransactionBehavior};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 const POSTS_SCHEMA: &str = "\
 CREATE TABLE IF NOT EXISTS posts (
@@ -64,9 +64,112 @@ BEGIN
 END;
 ";
 
+const AUTH_SCHEMA: &str = "\
+CREATE TABLE IF NOT EXISTS users (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    username TEXT NOT NULL COLLATE NOCASE UNIQUE
+        CHECK (length(username) BETWEEN 3 AND 32),
+    role TEXT NOT NULL CHECK (role IN ('owner', 'reader')),
+    password_hash TEXT NOT NULL,
+    enabled INTEGER NOT NULL DEFAULT 1 CHECK (enabled IN (0, 1)),
+    created_at INTEGER NOT NULL
+);
+CREATE UNIQUE INDEX IF NOT EXISTS users_single_owner ON users(role) WHERE role = 'owner';
+CREATE TABLE IF NOT EXISTS sessions (
+    token_digest TEXT PRIMARY KEY CHECK (length(token_digest) = 64),
+    user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    created_at INTEGER NOT NULL,
+    expires_at INTEGER NOT NULL CHECK (expires_at > created_at)
+);
+CREATE INDEX IF NOT EXISTS sessions_expiry ON sessions(expires_at);
+CREATE INDEX IF NOT EXISTS sessions_user ON sessions(user_id);
+CREATE TABLE IF NOT EXISTS login_throttles (
+    username_digest TEXT PRIMARY KEY CHECK (length(username_digest) = 64),
+    window_started INTEGER NOT NULL,
+    attempts INTEGER NOT NULL CHECK (attempts > 0)
+);
+";
+
 #[derive(Clone)]
 pub struct Database {
     path: Arc<PathBuf>,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum AccountRole {
+    Owner,
+    Reader,
+}
+
+impl AccountRole {
+    pub fn parse(value: &str) -> Result<Self, String> {
+        match value {
+            "owner" => Ok(Self::Owner),
+            "reader" => Ok(Self::Reader),
+            _ => Err("account role must be owner or reader".to_owned()),
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Owner => "owner",
+            Self::Reader => "reader",
+        }
+    }
+}
+
+impl Default for AccountRole {
+    fn default() -> Self {
+        Self::Reader
+    }
+}
+
+impl std::fmt::Display for AccountRole {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct AccountView {
+    pub username: String,
+    pub role: AccountRole,
+    pub enabled: bool,
+}
+
+#[derive(Clone, Debug)]
+pub struct LoginAccount {
+    pub id: i64,
+    pub username: String,
+    pub role: AccountRole,
+    pub password_hash: String,
+    pub enabled: bool,
+}
+
+#[derive(Clone, Debug)]
+pub struct ImportedAccount {
+    pub username: String,
+    pub role: AccountRole,
+    pub password_hash: String,
+}
+
+#[derive(Clone, Debug)]
+pub struct AuthenticatedAccount {
+    pub username: String,
+    pub role: AccountRole,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PostAccess {
+    Published,
+    Owner,
+}
+
+impl PostAccess {
+    fn includes_drafts(self) -> bool {
+        matches!(self, Self::Owner)
+    }
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -153,8 +256,20 @@ impl Database {
         self.run(initialize_schema).await
     }
 
+    #[cfg(test)]
     pub async fn replace_posts(&self, posts: Vec<NewPost>) -> Result<(), String> {
+        self.replace_posts_and_add_accounts(posts, Vec::new())
+            .await
+            .map(|_| ())
+    }
+
+    pub async fn replace_posts_and_add_accounts(
+        &self,
+        posts: Vec<NewPost>,
+        accounts: Vec<ImportedAccount>,
+    ) -> Result<usize, String> {
         self.initialize().await?;
+        let created_at = unix_time_seconds();
         let posts = posts
             .into_iter()
             .map(|post| {
@@ -164,6 +279,21 @@ impl Database {
             .collect::<Result<Vec<_>, String>>()?;
         self.run(move |connection| {
             let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let mut added_accounts = 0;
+            {
+                let mut insert_account = transaction.prepare(
+                    "INSERT INTO users (username, role, password_hash, enabled, created_at) \
+                     VALUES (?1, ?2, ?3, 1, ?4) ON CONFLICT(username) DO NOTHING",
+                )?;
+                for account in accounts {
+                    added_accounts += insert_account.execute(params![
+                        account.username,
+                        account.role.as_str(),
+                        account.password_hash,
+                        created_at,
+                    ])?;
+                }
+            }
             transaction.execute("DELETE FROM posts", [])?;
             {
                 let mut insert_post = transaction.prepare(
@@ -180,6 +310,221 @@ impl Database {
                 }
             }
             transaction.commit()
+                .map(|_| added_accounts)
+        })
+        .await
+    }
+
+    pub async fn create_account(
+        &self,
+        username: String,
+        role: AccountRole,
+        password_hash: String,
+    ) -> Result<(), String> {
+        let created_at = unix_time_seconds();
+        self.run(move |connection| {
+            connection.execute(
+                "INSERT INTO users (username, role, password_hash, enabled, created_at) VALUES (?1, ?2, ?3, 1, ?4)",
+                params![username, role.as_str(), password_hash, created_at],
+            )?;
+            Ok(())
+        })
+        .await
+    }
+
+    pub async fn accounts(&self) -> Result<Vec<AccountView>, String> {
+        self.run(|connection| {
+            let mut statement = connection.prepare(
+                "SELECT username, role, enabled FROM users ORDER BY role, username COLLATE NOCASE",
+            )?;
+            let rows = statement.query_map([], |row| {
+                Ok(AccountView {
+                    username: row.get(0)?,
+                    role: account_role_from_db(&row.get::<_, String>(1)?)?,
+                    enabled: row.get::<_, i64>(2)? != 0,
+                })
+            })?;
+            rows.collect()
+        })
+        .await
+    }
+
+    pub async fn change_password(
+        &self,
+        username: String,
+        password_hash: String,
+    ) -> Result<(), String> {
+        self.run(move |connection| {
+            let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let changed = transaction.execute(
+                "UPDATE users SET password_hash = ?2 WHERE username = ?1 COLLATE NOCASE",
+                params![username, password_hash],
+            )?;
+            if changed == 0 {
+                return Err(rusqlite::Error::QueryReturnedNoRows);
+            }
+            transaction.execute(
+                "DELETE FROM sessions WHERE user_id = (SELECT id FROM users WHERE username = ?1 COLLATE NOCASE)",
+                [&username],
+            )?;
+            transaction.commit()
+        })
+        .await
+    }
+
+    pub async fn set_reader_enabled(&self, username: String, enabled: bool) -> Result<(), String> {
+        self.run(move |connection| {
+            let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let changed = transaction.execute(
+                "UPDATE users SET enabled = ?2 WHERE username = ?1 COLLATE NOCASE AND role = 'reader'",
+                params![username, enabled],
+            )?;
+            if changed == 0 {
+                return Err(rusqlite::Error::QueryReturnedNoRows);
+            }
+            if !enabled {
+                transaction.execute(
+                    "DELETE FROM sessions WHERE user_id = (SELECT id FROM users WHERE username = ?1 COLLATE NOCASE)",
+                    [&username],
+                )?;
+            }
+            transaction.commit()
+        })
+        .await
+    }
+
+    pub async fn login_account(&self, username: String) -> Result<Option<LoginAccount>, String> {
+        self.run(move |connection| {
+            connection
+                .query_row(
+                    "SELECT id, username, role, password_hash, enabled FROM users WHERE username = ?1 COLLATE NOCASE",
+                    [username],
+                    |row| {
+                        Ok(LoginAccount {
+                            id: row.get(0)?,
+                            username: row.get(1)?,
+                            role: account_role_from_db(&row.get::<_, String>(2)?)?,
+                            password_hash: row.get(3)?,
+                            enabled: row.get::<_, i64>(4)? != 0,
+                        })
+                    },
+                )
+                .optional()
+        })
+        .await
+    }
+
+    pub async fn issue_session(
+        &self,
+        user_id: i64,
+        token_digest: String,
+        created_at: i64,
+        expires_at: i64,
+    ) -> Result<(), String> {
+        self.run(move |connection| {
+            let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            transaction.execute("DELETE FROM sessions WHERE expires_at <= ?1", [created_at])?;
+            transaction.execute(
+                "INSERT INTO sessions (token_digest, user_id, created_at, expires_at) VALUES (?1, ?2, ?3, ?4)",
+                params![token_digest, user_id, created_at, expires_at],
+            )?;
+            transaction.commit()
+        })
+        .await
+    }
+
+    pub async fn authenticated_account(
+        &self,
+        token_digest: String,
+        now: i64,
+    ) -> Result<Option<AuthenticatedAccount>, String> {
+        self.run(move |connection| {
+            connection
+                .query_row(
+                    "SELECT u.username, u.role FROM sessions AS s \
+                     JOIN users AS u ON u.id = s.user_id \
+                     WHERE s.token_digest = ?1 AND s.expires_at > ?2 AND u.enabled = 1",
+                    params![token_digest, now],
+                    |row| {
+                        Ok(AuthenticatedAccount {
+                            username: row.get(0)?,
+                            role: account_role_from_db(&row.get::<_, String>(1)?)?,
+                        })
+                    },
+                )
+                .optional()
+        })
+        .await
+    }
+
+    pub async fn revoke_session(&self, token_digest: String) -> Result<(), String> {
+        self.run(move |connection| {
+            connection.execute("DELETE FROM sessions WHERE token_digest = ?1", [token_digest])?;
+            Ok(())
+        })
+        .await
+    }
+
+    pub async fn record_login_attempt(
+        &self,
+        username_digest: String,
+        now: i64,
+        window_seconds: i64,
+        maximum_attempts: i64,
+    ) -> Result<bool, String> {
+        self.run(move |connection| {
+            let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let window_start = now.saturating_sub(window_seconds);
+            transaction.execute(
+                "DELETE FROM login_throttles WHERE window_started <= ?1",
+                [window_start],
+            )?;
+            let existing = transaction
+                .query_row(
+                    "SELECT window_started, attempts FROM login_throttles WHERE username_digest = ?1",
+                    [&username_digest],
+                    |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
+                )
+                .optional()?;
+            if let Some((started, attempts)) = existing {
+                if now.saturating_sub(started) <= window_seconds && attempts >= maximum_attempts {
+                    transaction.commit()?;
+                    return Ok(false);
+                }
+            }
+            transaction.execute(
+                "DELETE FROM login_throttles WHERE username_digest = (\
+                    SELECT username_digest FROM login_throttles ORDER BY window_started ASC LIMIT 1\
+                 ) AND (SELECT COUNT(*) FROM login_throttles) >= 10000",
+                [],
+            )?;
+            match existing {
+                Some((started, attempts)) if now.saturating_sub(started) <= window_seconds => {
+                    transaction.execute(
+                        "UPDATE login_throttles SET attempts = ?2 WHERE username_digest = ?1",
+                        params![username_digest, attempts.saturating_add(1)],
+                    )?;
+                }
+                _ => {
+                    transaction.execute(
+                        "INSERT OR REPLACE INTO login_throttles (username_digest, window_started, attempts) VALUES (?1, ?2, 1)",
+                        params![username_digest, now],
+                    )?;
+                }
+            }
+            transaction.commit()?;
+            Ok(true)
+        })
+        .await
+    }
+
+    pub async fn clear_login_attempts(&self, username_digest: String) -> Result<(), String> {
+        self.run(move |connection| {
+            connection.execute(
+                "DELETE FROM login_throttles WHERE username_digest = ?1",
+                [username_digest],
+            )?;
+            Ok(())
         })
         .await
     }
@@ -288,12 +633,20 @@ impl Database {
     }
 
     pub async fn post(&self, id: i64) -> Result<Option<Post>, String> {
+        self.post_with_access(id, PostAccess::Published).await
+    }
+
+    pub async fn post_with_access(
+        &self,
+        id: i64,
+        access: PostAccess,
+    ) -> Result<Option<Post>, String> {
         self.run(move |connection| {
             let transaction = connection.transaction()?;
             let post_row = transaction
                 .query_row(
-                    "SELECT id, title, published_at, summary, tags FROM posts WHERE id = ?1 AND published = 1",
-                    [id],
+                    "SELECT id, title, published_at, summary, tags FROM posts WHERE id = ?1 AND (?2 = 1 OR published = 1)",
+                    params![id, access.includes_drafts()],
                     |row| {
                         let tags_json: String = row.get(4)?;
                         let tags = serde_json::from_str(&tags_json).map_err(|error| {
@@ -352,20 +705,30 @@ impl Database {
         .await
     }
 
+    #[cfg(test)]
     pub async fn media_reference(
         &self,
         post_id: i64,
         block_id: i64,
+    ) -> Result<Option<MediaReference>, String> {
+        self.media_reference_with_access(post_id, block_id, PostAccess::Published).await
+    }
+
+    pub async fn media_reference_with_access(
+        &self,
+        post_id: i64,
+        block_id: i64,
+        access: PostAccess,
     ) -> Result<Option<MediaReference>, String> {
         self.run(move |connection| {
             connection
                 .query_row(
                     "SELECT b.storage_key, b.content_type \
                      FROM post_blocks AS b JOIN posts AS p ON p.id = b.post_id \
-                     WHERE p.id = ?1 AND p.published = 1 AND b.id = ?2 \
+                     WHERE p.id = ?1 AND (?3 = 1 OR p.published = 1) AND b.id = ?2 \
                        AND b.storage_key IS NOT NULL \
                        AND (b.content_type LIKE 'image/%' OR b.content_type LIKE 'video/%')",
-                    params![post_id, block_id],
+                    params![post_id, block_id, access.includes_drafts()],
                     |row| {
                         Ok(MediaReference {
                             storage_key: row.get(0)?,
@@ -455,8 +818,29 @@ fn initialize_schema(connection: &mut Connection) -> rusqlite::Result<()> {
     } else {
         transaction.execute_batch(POST_BLOCKS_SCHEMA)?;
     }
-    transaction.pragma_update(None, "user_version", 2)?;
+    transaction.execute_batch(AUTH_SCHEMA)?;
+    transaction.pragma_update(None, "user_version", 3)?;
     transaction.commit()
+}
+
+fn account_role_from_db(value: &str) -> rusqlite::Result<AccountRole> {
+    match value {
+        "owner" => Ok(AccountRole::Owner),
+        "reader" => Ok(AccountRole::Reader),
+        _ => Err(rusqlite::Error::FromSqlConversionFailure(
+            0,
+            Type::Text,
+            Box::new(std::io::Error::other(format!("unknown account role {value:?}"))),
+        )),
+    }
+}
+
+fn unix_time_seconds() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+        .min(i64::MAX as u64) as i64
 }
 
 fn table_exists(connection: &Connection, table: &str) -> rusqlite::Result<bool> {

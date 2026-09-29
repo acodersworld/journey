@@ -33,8 +33,8 @@ routes.
 ## Website post backend
 
 The `journey-site` application imports a JSON manifest into SQLite and serves
-read-only post and media routes. Start the storage example with both listeners
-on loopback and persistent storage:
+post and media routes to authenticated accounts. Start the storage example
+with both listeners on loopback and persistent storage:
 
 ```bash
 JOURNEY_STORAGE_BIND=127.0.0.1:8081 \
@@ -74,20 +74,58 @@ Import and run the website backend in another terminal:
 ```bash
 cargo run -p journey-site -- import ./posts.json
 cargo run -p journey-site -- db posts
+cargo run -p journey-site -- users create owner owner
+cargo run -p journey-site -- users create reader alice
+cargo run -p journey-site -- users list
 cargo run -p journey-site -- serve
 ```
 
+Account creation and password changes prompt for a password twice without
+echoing it. Passwords are not accepted as command-line arguments. The CLI also
+supports `users password <username>`, `users disable <username>`, and
+`users enable <username>`; changing a password or disabling a reader revokes
+that account's active sessions. Only one owner account can exist.
+
+An import manifest may also contain a top-level `users` array with
+`username`, `password`, and optional `role` fields. Imported accounts default
+to the reader role and are added only when the username is new. Re-importing
+does not replace an existing account's password or role, or revoke its
+sessions. The sample `apps/site/example/posts.json` includes `user` / `pass`
+and `user2` / `pass2` reader accounts for local use; those sample passwords are
+stored as plain text in that manifest.
+
 `JOURNEY_SITE_DB` selects the SQLite file, `JOURNEY_SITE_BIND` selects the
 HTTP listener (default `127.0.0.1:8080`), and `JOURNEY_STORAGE_H2C` selects the
-loopback storage address (default `127.0.0.1:8081`). The public feed is
-server-rendered at `GET /`; its browser script loads more previews from
-`GET /api/posts`, which defaults to 10 and accepts a maximum `limit` of 100.
+loopback storage address (default `127.0.0.1:8081`). Set
+`JOURNEY_SITE_PUBLIC_ORIGIN` to the exact public origin when deploying, for
+example `https://journal.example.com`; it is required when binding outside
+loopback. Local loopback HTTP origins are accepted when this variable is unset.
+The `journey_session` cookie is host-only, HttpOnly, and SameSite=Strict. It is
+marked Secure when the configured public origin uses HTTPS. Sessions expire
+after seven days by default; set `JOURNEY_SITE_SESSION_TTL_SECONDS` to change
+the absolute lifetime.
+
+The JSON authentication endpoints are `POST /api/auth/login`,
+`GET /api/auth/current`, and `POST /api/auth/logout`. Login and logout require
+an `Origin` matching the configured public origin (or a loopback HTTP origin
+for local development). Login accepts a JSON object with `username` and
+`password`, returns the current account JSON, and sets the session cookie.
+`GET /api/auth/current` returns that account, and logout returns `204` after
+revoking the cookie's session. All content and media routes require the cookie;
+anonymous requests receive `401`. Readers see published content, while the
+owner can also read drafts by direct post, fragment, API, and media URLs.
+Feeds, tags, archives, and sidebar lists include published posts only.
+
+The authenticated feed is server-rendered at `GET /`; its browser script loads
+more previews from `GET /api/posts`, which defaults to 10 and accepts a maximum
+`limit` of 100.
 Feed responses include `posts` and a `next_cursor`; pass that cursor as `after`
 to request the next page. `GET /api/posts/{id}` returns tags and nested full
 content as JSON, and the normal link `GET /posts/{id}` renders it as HTML.
 Media is served only through `GET` or `HEAD /posts/{id}/blocks/{block_id}/media`.
 Video requests forward one byte range to storage.
-`journey-site --help` and `journey-site db` list the CLI commands.
+`journey-site --help`, `journey-site db`, and `journey-site users --help` list
+the CLI commands.
 
 ## HTTP/2 object storage
 

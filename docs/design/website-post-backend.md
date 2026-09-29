@@ -1,6 +1,6 @@
 # Website post backend
 
-**Status:** Implemented local backend slice  
+**Status:** Implemented local backend and account authentication
 **Updated:** 29 September 2026
 
 ## Runtime data
@@ -114,12 +114,50 @@ deferred.
 
 HTML text and attributes are escaped. Image and video blocks use public media
 URLs that identify a post and block ID, never a storage key. The backend
-confirms the block belongs to a published post and is media before asking
+confirms the block belongs to an accessible post and is media before asking
 storage for it. It streams response bodies and forwards single byte ranges for
-video. Image ranges are ignored. There are no editing, draft, or account
-routes in this slice.
+video. Image ranges are ignored. There are no editing routes in this slice.
 
 The `journey-site import` and `journey-site db` commands provide explicit
 imports and read-only database inspection. `JOURNEY_SITE_DB` selects the
 SQLite path, `JOURNEY_SITE_BIND` selects the website HTTP listener, and
 `JOURNEY_STORAGE_H2C` selects the loopback storage listener.
+
+## Accounts and sessions
+
+The schema adds `users`, `sessions`, and bounded `login_throttles` tables
+without changing post rows. Usernames are case-insensitive, and a partial
+unique index allows at most one owner. Readers can be disabled; owners cannot.
+The CLI creates accounts and changes passwords through terminal input with
+echo disabled. A manifest can add accounts through its optional top-level
+`users` array; an omitted role defaults to reader, and passwords are hashed
+during import. Manifest password inputs remain plain text in the JSON file, so
+this path is intended for local fixtures. Importing is additive: an existing
+username's account and sessions are left untouched when the manifest is
+imported again. There is no self-registration or user-management HTTP API.
+Replacing imported posts only deletes from `posts`, so existing accounts and
+sessions survive imports.
+
+Passwords use Argon2id version 19 with 19 MiB memory, two iterations, and one
+lane. Session cookies contain 256 bits of random token material, while SQLite
+stores only its SHA-256 digest. Sessions have an absolute seven-day lifetime by
+default, configurable with `JOURNEY_SITE_SESSION_TTL_SECONDS`. Password changes
+and reader disabling delete that user's sessions. Login attempts are limited
+to five per username and 30 per client IP in a 15-minute window; old rows are
+pruned and the throttle table is capped at 10,000 entries.
+
+`POST /api/auth/login`, `GET /api/auth/current`, and `POST /api/auth/logout`
+are the JSON session endpoints. State-changing auth requests require an
+`Origin` matching `JOURNEY_SITE_PUBLIC_ORIGIN`. Without that setting, only
+loopback HTTP origins are accepted, and the server itself must bind to a
+loopback address. Deployments set the public origin explicitly; HTTPS origins
+cause the cookie to include `Secure`. Cookies are host-only, HttpOnly, and
+SameSite=Strict. Authenticated content responses use `Cache-Control: private,
+no-store`.
+
+All existing content routes are behind one session middleware, including
+`HEAD` and ranged media requests. The post access value is shared by the post
+and media database lookups: readers receive published-only access and owners
+can include drafts. A future post-scoped link can map to published-only access
+without creating an account session or gaining draft access. Feeds, tags,
+archives, and sidebar data remain published-only for every account.
