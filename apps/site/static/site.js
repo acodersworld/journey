@@ -66,6 +66,248 @@ if (sidebarLayout) {
   });
 }
 
+const createdConfirmation = document.querySelector('[data-created-confirmation]');
+
+if (createdConfirmation) {
+  const currentUrl = new URL(window.location.href);
+  currentUrl.searchParams.delete('created');
+  window.history.replaceState(window.history.state, '', currentUrl);
+  window.setTimeout(() => createdConfirmation.remove(), 5000);
+}
+
+const draftForm = document.querySelector('#draft-form');
+
+if (draftForm) {
+  const rootBlockList = document.querySelector('#draft-root-blocks');
+  const titleInput = document.querySelector('#draft-title');
+  const summaryInput = document.querySelector('#draft-summary');
+  const tagsInput = document.querySelector('#draft-tags');
+  const submitButton = document.querySelector('#draft-submit');
+  const errorMessage = document.querySelector('#draft-form-error');
+  let draftBusy = false;
+
+  function clearDraftError() {
+    errorMessage.hidden = true;
+    errorMessage.textContent = '';
+  }
+
+  function showDraftError(message) {
+    errorMessage.textContent = message;
+    errorMessage.hidden = false;
+  }
+
+  function makeActionButton(label, action, className = '') {
+    const button = document.createElement('button');
+    button.type = 'button';
+    button.className = `draft-small-button ${className}`.trim();
+    button.dataset.blockAction = action;
+    button.textContent = label;
+    return button;
+  }
+
+  function makeBlockField(labelText, fieldName, multiline) {
+    const label = document.createElement('label');
+    label.className = 'draft-block-field';
+    const caption = document.createElement('span');
+    caption.textContent = labelText;
+    const field = document.createElement(multiline ? 'textarea' : 'input');
+    field.dataset.blockField = fieldName;
+    if (multiline) {
+      field.rows = 5;
+    } else {
+      field.type = 'text';
+    }
+    label.append(caption, field);
+    return label;
+  }
+
+  function makeDraftBlock(isChild = false) {
+    const block = document.createElement('fieldset');
+    block.className = isChild ? 'draft-block draft-child-block' : 'draft-block';
+    block.dataset.draftBlock = '';
+
+    const legend = document.createElement('legend');
+    legend.textContent = isChild ? 'Child block' : 'Text block';
+    block.append(legend);
+
+    const actions = document.createElement('div');
+    actions.className = 'draft-block-actions';
+    actions.append(
+      makeActionButton('Move up', 'move-up'),
+      makeActionButton('Move down', 'move-down'),
+      makeActionButton('Remove', 'remove', 'draft-remove-button'),
+    );
+    block.append(actions);
+
+    const fields = document.createElement('div');
+    fields.className = 'draft-block-fields';
+    fields.append(makeBlockField('Header (optional)', 'header', false));
+    fields.append(makeBlockField('Body (optional)', 'body', true));
+    block.append(fields);
+
+    if (!isChild) {
+      const childArea = document.createElement('div');
+      childArea.className = 'draft-child-area';
+      const childHeading = document.createElement('h3');
+      childHeading.textContent = 'Child blocks';
+      const childList = document.createElement('div');
+      childList.className = 'draft-child-list';
+      childList.dataset.blockList = 'child';
+      const addChildButton = makeActionButton('Add child block', 'add-child');
+      childArea.append(childHeading, childList, addChildButton);
+      block.append(childArea);
+    }
+
+    return block;
+  }
+
+  function updateDraftBlockControls() {
+    document.querySelectorAll('[data-block-list]').forEach(list => {
+      const blocks = Array.from(list.children).filter(child => child.matches('[data-draft-block]'));
+      blocks.forEach((block, index) => {
+        const legend = block.querySelector(':scope > legend');
+        const actions = block.querySelector(':scope > .draft-block-actions');
+        const isChild = list.dataset.blockList === 'child';
+        const label = `${isChild ? 'Child block' : 'Text block'} ${index + 1}`;
+        legend.textContent = label;
+        const moveUp = actions.querySelector('[data-block-action="move-up"]');
+        const moveDown = actions.querySelector('[data-block-action="move-down"]');
+        moveUp.disabled = index === 0;
+        moveDown.disabled = index === blocks.length - 1;
+        moveUp.setAttribute('aria-label', `Move ${label.toLowerCase()} up`);
+        moveDown.setAttribute('aria-label', `Move ${label.toLowerCase()} down`);
+        actions.querySelector('[data-block-action="remove"]').setAttribute('aria-label', `Remove ${label.toLowerCase()}`);
+      });
+    });
+  }
+
+  function blockFieldValue(block, name) {
+    const field = block.querySelector(`:scope > .draft-block-fields [data-block-field="${name}"]`);
+    return field.value.trim() ? field.value : null;
+  }
+
+  function serializeBlock(block) {
+    const childList = block.querySelector(':scope > .draft-child-area > [data-block-list="child"]');
+    const children = childList
+      ? Array.from(childList.children).filter(child => child.matches('[data-draft-block]')).map(serializeBlock)
+      : [];
+    return {
+      header: blockFieldValue(block, 'header'),
+      body: blockFieldValue(block, 'body'),
+      blocks: children,
+    };
+  }
+
+  draftForm.addEventListener('click', event => {
+    if (!(event.target instanceof Element)) return;
+    const button = event.target.closest('[data-block-action]');
+    if (!button) return;
+    const action = button.dataset.blockAction;
+
+    if (action === 'add-root') {
+      const block = makeDraftBlock();
+      rootBlockList.append(block);
+      updateDraftBlockControls();
+      block.querySelector('[data-block-field="header"]').focus();
+      return;
+    }
+
+    if (action === 'add-child') {
+      const parent = button.closest('[data-draft-block]');
+      const childList = parent?.querySelector(':scope > .draft-child-area > [data-block-list="child"]');
+      if (!childList) return;
+      const block = makeDraftBlock(true);
+      childList.append(block);
+      updateDraftBlockControls();
+      block.querySelector('[data-block-field="header"]').focus();
+      return;
+    }
+
+    const block = button.closest('[data-draft-block]');
+    const list = block?.parentElement;
+    if (!block || !list) return;
+    const siblings = Array.from(list.children).filter(child => child.matches('[data-draft-block]'));
+    const index = siblings.indexOf(block);
+    if (action === 'remove') {
+      const nextFocus = siblings[index + 1] || siblings[index - 1];
+      const parentAddChild = list.closest('[data-draft-block]')
+        ?.querySelector(':scope > .draft-child-area > [data-block-action="add-child"]');
+      block.remove();
+      updateDraftBlockControls();
+      (nextFocus?.querySelector('[data-block-field="header"]') || parentAddChild || document.querySelector('[data-block-action="add-root"]')).focus();
+    } else if (action === 'move-up' && index > 0) {
+      list.insertBefore(block, siblings[index - 1]);
+      updateDraftBlockControls();
+      button.focus();
+    } else if (action === 'move-down' && index < siblings.length - 1) {
+      list.insertBefore(siblings[index + 1], block);
+      updateDraftBlockControls();
+      button.focus();
+    }
+  });
+
+  titleInput.addEventListener('input', () => {
+    titleInput.removeAttribute('aria-invalid');
+    clearDraftError();
+  });
+
+  draftForm.addEventListener('submit', async event => {
+    event.preventDefault();
+    if (draftBusy) return;
+    clearDraftError();
+    if (!titleInput.value.trim()) {
+      titleInput.setAttribute('aria-invalid', 'true');
+      showDraftError('Enter a title before creating this draft.');
+      titleInput.focus();
+      return;
+    }
+
+    const payload = {
+      title: titleInput.value,
+      summary: summaryInput.value,
+      tags: tagsInput.value.split(',').map(tag => tag.trim()).filter(Boolean),
+      blocks: Array.from(rootBlockList.children)
+        .filter(block => block.matches('[data-draft-block]'))
+        .map(serializeBlock),
+    };
+
+    draftBusy = true;
+    submitButton.disabled = true;
+    submitButton.textContent = 'Creating…';
+    draftForm.setAttribute('aria-busy', 'true');
+
+    let failureMessage = 'Could not create the draft. Your entries are still here; please try again.';
+
+    try {
+      const response = await fetch('/api/posts', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+      });
+      if (!response.ok) {
+        if (response.status === 401) failureMessage = 'Your session is no longer active. Your entries are still here; sign in again before retrying.';
+        if (response.status === 403) failureMessage = 'This account is not allowed to create drafts. Your entries are still here.';
+        showDraftError(failureMessage);
+        return;
+      }
+      const created = await response.json();
+      if (!created || !Number.isInteger(created.id) || created.id < 1) {
+        failureMessage = 'The server could not confirm the new draft. Your entries are still here; please try again.';
+        showDraftError(failureMessage);
+        return;
+      }
+      window.location.assign(`/posts/${encodeURIComponent(created.id)}?created=1`);
+    } catch (_) {
+      showDraftError(failureMessage);
+    } finally {
+      draftBusy = false;
+      submitButton.disabled = false;
+      submitButton.textContent = 'Create draft';
+      draftForm.removeAttribute('aria-busy');
+    }
+  });
+}
+
 const shareDialog = document.querySelector('#share-dialog');
 
 if (shareDialog) {

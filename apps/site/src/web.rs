@@ -64,6 +64,11 @@ struct LoginPageQuery {
     return_to: Option<String>,
 }
 
+#[derive(Deserialize)]
+struct CreatedPostQuery {
+    created: Option<String>,
+}
+
 #[derive(Serialize)]
 struct CurrentAccountResponse {
     username: String,
@@ -178,6 +183,7 @@ pub fn router<S: StorageClient>(state: AppState<S>) -> Router {
         .route("/", get(home::<S>))
         .route("/tags", get(tag_page::<S>))
         .route("/archive/{month}", get(archive_page::<S>))
+        .route("/posts/new", get(new_post_page::<S>))
         .route("/api/posts", get(feed::<S>).post(create_draft::<S>))
         .route("/api/drafts", get(drafts::<S>))
         .route("/api/posts/{id}", get(api_full_post::<S>))
@@ -899,6 +905,7 @@ fn valid_return_target(candidate: &str) -> Option<String> {
 fn is_content_page_path(path: &str) -> bool {
     path == "/"
         || path == "/tags"
+        || path == "/posts/new"
         || path
             .strip_prefix("/archive/")
             .is_some_and(valid_archive_month)
@@ -982,6 +989,36 @@ async fn drafts<S: StorageClient>(
     }
 }
 
+async fn sidebar_data_for_principal(
+    database: &Database,
+    principal: &AuthPrincipal,
+) -> Result<SidebarData, String> {
+    let mut sidebar = database.sidebar_data().await?;
+    sidebar.drafts = match principal.role {
+        AccountRole::Read => None,
+        AccountRole::Write => Some(database.drafts(Some(principal.username.clone())).await?),
+        AccountRole::Admin => Some(database.drafts(None).await?),
+    };
+    Ok(sidebar)
+}
+
+async fn new_post_page<S: StorageClient>(
+    State(state): State<AppState<S>>,
+    Extension(principal): Extension<AuthPrincipal>,
+) -> Response {
+    if !matches!(principal.role, AccountRole::Write | AccountRole::Admin) {
+        return no_store(StatusCode::FORBIDDEN.into_response());
+    }
+    let sidebar = match sidebar_data_for_principal(&state.database, &principal).await {
+        Ok(sidebar) => sidebar,
+        Err(error) => {
+            eprintln!("website sidebar query failed: {error}");
+            return no_store(StatusCode::INTERNAL_SERVER_ERROR.into_response());
+        }
+    };
+    Html(render_new_post_page(&sidebar, &principal.username, principal.role)).into_response()
+}
+
 async fn create_draft<S: StorageClient>(
     State(state): State<AppState<S>>,
     Extension(principal): Extension<AuthPrincipal>,
@@ -1057,7 +1094,7 @@ async fn home<S: StorageClient>(
             let next_cursor = initial_post
                 .as_ref()
                 .and(page.next_cursor.as_deref());
-            let sidebar = match state.database.sidebar_data().await {
+            let sidebar = match sidebar_data_for_principal(&state.database, &principal).await {
                 Ok(sidebar) => sidebar,
                 Err(error) => {
                     eprintln!("website sidebar query failed: {error}");
@@ -1069,6 +1106,7 @@ async fn home<S: StorageClient>(
                 initial_post.as_ref(),
                 next_cursor,
                 &principal.username,
+                principal.role,
                 principal.share_access().as_ref(),
             ))
             .into_response()
@@ -1100,7 +1138,7 @@ async fn tag_page<S: StorageClient>(
             let next_cursor = initial_post
                 .as_ref()
                 .and(page.next_cursor.as_deref());
-            let sidebar = match state.database.sidebar_data().await {
+            let sidebar = match sidebar_data_for_principal(&state.database, &principal).await {
                 Ok(sidebar) => sidebar,
                 Err(error) => {
                     eprintln!("website sidebar query failed: {error}");
@@ -1113,6 +1151,7 @@ async fn tag_page<S: StorageClient>(
                 initial_post.as_ref(),
                 next_cursor,
                 &principal.username,
+                principal.role,
                 principal.share_access().as_ref(),
             ))
                 .into_response()
@@ -1139,14 +1178,21 @@ async fn archive_page<S: StorageClient>(
             return StatusCode::INTERNAL_SERVER_ERROR.into_response();
         }
     };
-    let sidebar = match state.database.sidebar_data().await {
+    let sidebar = match sidebar_data_for_principal(&state.database, &principal).await {
         Ok(sidebar) => sidebar,
         Err(error) => {
             eprintln!("website sidebar query failed: {error}");
             return StatusCode::INTERNAL_SERVER_ERROR.into_response();
         }
     };
-    Html(render_archive(&sidebar, &month, &posts, &principal.username)).into_response()
+    Html(render_archive(
+        &sidebar,
+        &month,
+        &posts,
+        &principal.username,
+        principal.role,
+    ))
+    .into_response()
 }
 
 async fn api_full_post<S: StorageClient>(
@@ -1167,11 +1213,12 @@ async fn api_full_post<S: StorageClient>(
 async fn post_page<S: StorageClient>(
     State(state): State<AppState<S>>,
     Path(id): Path<i64>,
+    query: Result<Query<CreatedPostQuery>, axum::extract::rejection::QueryRejection>,
     Extension(principal): Extension<AuthPrincipal>,
 ) -> Response {
     match state.database.post_with_access(id, principal.post_access()).await {
         Ok(Some(post)) => {
-            let sidebar = match state.database.sidebar_data().await {
+            let sidebar = match sidebar_data_for_principal(&state.database, &principal).await {
                 Ok(sidebar) => sidebar,
                 Err(error) => {
                     eprintln!("website sidebar query failed: {error}");
@@ -1182,6 +1229,9 @@ async fn post_page<S: StorageClient>(
                 &sidebar,
                 &post,
                 &principal.username,
+                principal.role,
+                !post.published
+                    && query.ok().is_some_and(|Query(query)| query.created.as_deref() == Some("1")),
                 principal.share_access().as_ref(),
             ))
             .into_response()
@@ -1280,13 +1330,20 @@ fn render_full_post(
     sidebar: &SidebarData,
     post: &Post,
     username: &str,
+    role: AccountRole,
+    created: bool,
     share_access: Option<&ShareAccess>,
 ) -> String {
+    let confirmation = if created {
+        "<p class=\"creation-confirmation\" data-created-confirmation role=\"status\">Draft created. You can view it here.</p>"
+    } else {
+        ""
+    };
     let content = format!(
-        "<main class=\"site site-post\"><p class=\"back-link\"><a href=\"/\">All posts</a></p>{}</main>",
+        "<main class=\"site site-post\"><p class=\"back-link\"><a href=\"/\">All posts</a></p>{confirmation}{}</main>",
         render_post(post, true, share_access.is_some_and(|access| can_share_post(post, access))),
     );
-    render_site_page(&post.summary.title, sidebar, &content, true, username)
+    render_site_page(&post.summary.title, sidebar, &content, true, username, role, true)
 }
 
 fn render_shared_post(post: &Post, share_prefix: &str) -> String {
@@ -1306,6 +1363,7 @@ fn render_home(
     initial_post: Option<&Post>,
     next_cursor: Option<&str>,
     username: &str,
+    role: AccountRole,
     share_access: Option<&ShareAccess>,
 ) -> String {
     let mut feed = format!(
@@ -1323,7 +1381,7 @@ fn render_home(
     }
     feed.push_str("</section>");
     let content = render_feed_controls("<main class=\"site site-feed\">", &feed, next_cursor);
-    render_site_page("Journey", sidebar, &content, true, username)
+    render_site_page("Journey", sidebar, &content, true, username, role, true)
 }
 
 fn render_tag_feed(
@@ -1332,6 +1390,7 @@ fn render_tag_feed(
     initial_post: Option<&Post>,
     next_cursor: Option<&str>,
     username: &str,
+    role: AccountRole,
     share_access: Option<&ShareAccess>,
 ) -> String {
     let mut feed = format!(
@@ -1359,7 +1418,31 @@ fn render_tag_feed(
         &feed,
         next_cursor,
     );
-    render_site_page(&format!("Posts tagged {tag}"), sidebar, &content, true, username)
+    render_site_page(
+        &format!("Posts tagged {tag}"),
+        sidebar,
+        &content,
+        true,
+        username,
+        role,
+        true,
+    )
+}
+
+fn render_new_post_page(sidebar: &SidebarData, username: &str, role: AccountRole) -> String {
+    let content = concat!(
+        "<main class=\"site site-new-post\">",
+        "<header class=\"new-post-heading\"><p class=\"back-link\"><a href=\"/\">All posts</a></p><h1>Create a draft</h1></header>",
+        "<form class=\"draft-form\" id=\"draft-form\" novalidate>",
+        "<div class=\"draft-field\"><label for=\"draft-title\">Title <span aria-hidden=\"true\">*</span></label><input id=\"draft-title\" name=\"title\" type=\"text\" autocomplete=\"off\" aria-describedby=\"draft-title-help\" required><p class=\"draft-field-help\" id=\"draft-title-help\">A title is required.</p></div>",
+        "<div class=\"draft-field\"><label for=\"draft-summary\">Summary <span class=\"draft-optional\">Optional</span></label><textarea id=\"draft-summary\" name=\"summary\" rows=\"4\"></textarea></div>",
+        "<div class=\"draft-field\"><label for=\"draft-tags\">Tags <span class=\"draft-optional\">Optional</span></label><input id=\"draft-tags\" name=\"tags\" type=\"text\" autocomplete=\"off\" aria-describedby=\"draft-tags-help\"><p class=\"draft-field-help\" id=\"draft-tags-help\">Separate tags with commas.</p></div>",
+        "<section class=\"draft-block-editor\" aria-labelledby=\"draft-blocks-heading\"><div class=\"draft-block-heading\"><div><h2 id=\"draft-blocks-heading\">Text blocks</h2><p>Arrange blocks and one level of child blocks in the order you want them to appear.</p></div><button class=\"draft-secondary-button\" type=\"button\" data-block-action=\"add-root\">Add text block</button></div><div class=\"draft-root-blocks\" id=\"draft-root-blocks\" data-block-list=\"root\"></div></section>",
+        "<p class=\"draft-form-error\" id=\"draft-form-error\" role=\"alert\" hidden></p>",
+        "<div class=\"draft-submit-area\"><p>Saved drafts can currently be viewed, but they cannot yet be edited or published.</p><button class=\"draft-submit-button\" id=\"draft-submit\" type=\"submit\">Create draft</button></div>",
+        "</form></main>",
+    );
+    render_site_page("Create a draft", sidebar, content, false, username, role, false)
 }
 
 fn render_feed_controls(main_open: &str, feed: &str, next_cursor: Option<&str>) -> String {
@@ -1380,6 +1463,7 @@ fn render_archive(
     month: &str,
     posts: &[PostSummary],
     username: &str,
+    role: AccountRole,
 ) -> String {
     let mut content = format!(
         "<main class=\"site site-archive\"><p class=\"back-link\"><a href=\"/\">All posts</a></p><h1>{}</h1><section class=\"archive-posts\" aria-label=\"Posts from {}\">",
@@ -1401,7 +1485,7 @@ fn render_archive(
         }
     }
     content.push_str("</section></main>");
-    render_site_page(&month_label(month), sidebar, &content, false, username)
+    render_site_page(&month_label(month), sidebar, &content, false, username, role, true)
 }
 
 fn render_site_page(
@@ -1410,14 +1494,24 @@ fn render_site_page(
     content: &str,
     include_slideshow: bool,
     username: &str,
+    role: AccountRole,
+    show_new_post: bool,
 ) -> String {
     let slideshow = if include_slideshow { SLIDESHOW_HTML } else { "" };
+    let new_post_button = if show_new_post
+        && matches!(role, AccountRole::Write | AccountRole::Admin)
+    {
+        "<a class=\"new-post-float\" href=\"/posts/new\">+ New post</a>"
+    } else {
+        ""
+    };
     let html = format!(
-        "<!doctype html><html lang=\"en\"><head>{}</head><body><div class=\"site-layout\" id=\"site-layout\"><button class=\"sidebar-toggle\" id=\"sidebar-toggle\" type=\"button\" aria-controls=\"site-sidebar\" aria-expanded=\"false\" aria-label=\"Open sidebar\"><span aria-hidden=\"true\">›</span></button><button class=\"sidebar-backdrop\" id=\"sidebar-backdrop\" type=\"button\" aria-label=\"Close sidebar\" hidden></button>{}{}{}</div>{}{}</body></html>",
+        "<!doctype html><html lang=\"en\"><head>{}</head><body><div class=\"site-layout\" id=\"site-layout\"><button class=\"sidebar-toggle\" id=\"sidebar-toggle\" type=\"button\" aria-controls=\"site-sidebar\" aria-expanded=\"false\" aria-label=\"Open sidebar\"><span aria-hidden=\"true\">›</span></button><button class=\"sidebar-backdrop\" id=\"sidebar-backdrop\" type=\"button\" aria-label=\"Close sidebar\" hidden></button>{}{}{}</div>{}{}{}</body></html>",
         html_head(title),
         render_sidebar(sidebar),
         render_account_controls(username),
         content,
+        new_post_button,
         slideshow,
         SHARE_DIALOG_HTML,
     );
@@ -1433,8 +1527,29 @@ fn render_account_controls(username: &str) -> String {
 
 fn render_sidebar(sidebar: &SidebarData) -> String {
     let mut html = String::from(
-        "<nav class=\"site-sidebar\" id=\"site-sidebar\" aria-label=\"Site navigation\" hidden><header class=\"sidebar-header\"><a class=\"site-name\" href=\"/\">Journey</a><p>Stories from the road.</p></header><section class=\"sidebar-section\" aria-labelledby=\"sidebar-recent-heading\"><h2 id=\"sidebar-recent-heading\">Recent posts</h2><ul class=\"sidebar-list\">",
+        "<nav class=\"site-sidebar\" id=\"site-sidebar\" aria-label=\"Site navigation\" hidden><header class=\"sidebar-header\"><a class=\"site-name\" href=\"/\">Journey</a><p>Stories from the road.</p></header>",
     );
+    if let Some(drafts) = &sidebar.drafts {
+        html.push_str("<section class=\"sidebar-section\" aria-labelledby=\"sidebar-drafts-heading\"><h2 id=\"sidebar-drafts-heading\">Drafts</h2><ul class=\"sidebar-list\" id=\"sidebar-drafts\">");
+        if drafts.is_empty() {
+            html.push_str("<li class=\"sidebar-muted\">No drafts yet.</li>");
+        } else {
+            for (index, post) in drafts.iter().enumerate() {
+                html.push_str(&format!(
+                    "<li{}><a href=\"/posts/{}\">{}</a></li>",
+                    if index >= 5 { " data-overflow-item=\"true\"" } else { "" },
+                    post.id,
+                    escape_html(&post.title),
+                ));
+            }
+        }
+        html.push_str("</ul>");
+        if drafts.len() > 5 {
+            html.push_str("<button class=\"sidebar-expand\" type=\"button\" aria-controls=\"sidebar-drafts\" aria-expanded=\"false\" data-sidebar-expand=\"sidebar-drafts\" data-expand-label=\"Show all drafts\" data-collapse-label=\"Show fewer drafts\" hidden>Show all drafts</button>");
+        }
+        html.push_str("</section>");
+    }
+    html.push_str("<section class=\"sidebar-section\" aria-labelledby=\"sidebar-recent-heading\"><h2 id=\"sidebar-recent-heading\">Recent posts</h2><ul class=\"sidebar-list\">");
     if sidebar.recent_posts.is_empty() {
         html.push_str("<li class=\"sidebar-muted\">No published posts yet.</li>");
     } else {
@@ -2159,12 +2274,24 @@ mod tests {
         let reader_cookie = session_cookie(&database, "reader-one").await;
         let admin_cookie = session_cookie(&database, "admin-one").await;
         let app = router(state(database.clone(), UnusedStorage));
+        let unauthenticated_new_post = get_route(&app, "/posts/new").await;
+        assert_eq!(unauthenticated_new_post.status(), StatusCode::SEE_OTHER);
+        assert_eq!(
+            unauthenticated_new_post.headers().get(header::LOCATION).unwrap(),
+            "/login?return_to=%2Fposts%2Fnew",
+        );
+        assert_eq!(
+            request(&app, "GET", "/posts/new", &reader_cookie, None)
+                .await
+                .status(),
+            StatusCode::FORBIDDEN,
+        );
         let created = request(
             &app,
             "POST",
             "/api/posts",
             &writer_cookie,
-            Some(r#"{"title":"My draft","summary":"","tags":[],"blocks":[{"header":"First","blocks":[{"body":"Child"}]},{"body":"Second"}]}"#),
+            Some(r#"{"title":"My draft","summary":"Short intro","tags":["road","field-notes"],"blocks":[{"header":"First","blocks":[{"body":"Child"}]},{"body":"Second"}]}"#),
         )
         .await;
         assert_eq!(created.status(), StatusCode::CREATED);
@@ -2179,10 +2306,53 @@ mod tests {
             .unwrap();
         assert_eq!(post.author_username, "writer-one");
         assert_eq!(post.summary.published_at, None);
+        assert_eq!(post.summary.summary, "Short intro");
+        assert_eq!(post.tags, vec!["road".to_owned(), "field-notes".to_owned()]);
         assert_eq!(post.blocks.len(), 2);
         assert_eq!(post.blocks[0].children[0].body.as_deref(), Some("Child"));
         assert_eq!(post.blocks[1].body.as_deref(), Some("Second"));
         assert!(!super::render_post(&post, true, false).contains("<time"));
+
+        let writer_creation_page = request(&app, "GET", "/posts/new", &writer_cookie, None).await;
+        assert_eq!(writer_creation_page.status(), StatusCode::OK);
+        let body = to_bytes(writer_creation_page.into_body(), usize::MAX).await.unwrap();
+        let writer_creation_html = String::from_utf8(body.to_vec()).unwrap();
+        assert!(writer_creation_html.contains("id=\"draft-form\""));
+        assert!(writer_creation_html.contains("id=\"draft-title\" name=\"title\" type=\"text\""));
+        assert!(writer_creation_html.contains("data-block-action=\"add-root\""));
+        assert!(writer_creation_html.contains("Create draft"));
+        assert!(writer_creation_html.contains("cannot yet be edited or published"));
+        assert!(!writer_creation_html.contains("class=\"new-post-float\""));
+
+        assert_eq!(
+            request(&app, "GET", "/posts/new", &admin_cookie, None)
+                .await
+                .status(),
+            StatusCode::OK,
+        );
+
+        let writer_home = request(&app, "GET", "/", &writer_cookie, None).await;
+        let body = to_bytes(writer_home.into_body(), usize::MAX).await.unwrap();
+        let writer_home_html = String::from_utf8(body.to_vec()).unwrap();
+        assert!(writer_home_html.contains("class=\"new-post-float\" href=\"/posts/new\""));
+        assert!(writer_home_html.contains("<h2 id=\"sidebar-drafts-heading\">Drafts</h2>"));
+        assert!(writer_home_html.contains("href=\"/posts/2\">My draft</a>"));
+        assert!(!writer_home_html.contains("Another draft"));
+
+        let reader_home = request(&app, "GET", "/", &reader_cookie, None).await;
+        let body = to_bytes(reader_home.into_body(), usize::MAX).await.unwrap();
+        let reader_home_html = String::from_utf8(body.to_vec()).unwrap();
+        assert!(!reader_home_html.contains("class=\"new-post-float\""));
+        assert!(!reader_home_html.contains("sidebar-drafts-heading"));
+
+        let created_post_page = request(&app, "GET", "/posts/2?created=1", &writer_cookie, None).await;
+        let body = to_bytes(created_post_page.into_body(), usize::MAX).await.unwrap();
+        assert!(String::from_utf8(body.to_vec()).unwrap().contains("data-created-confirmation"));
+
+        let published_feed = request(&app, "GET", "/api/posts", &writer_cookie, None).await;
+        let body = to_bytes(published_feed.into_body(), usize::MAX).await.unwrap();
+        let published_feed: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(published_feed["posts"].as_array().unwrap().is_empty());
 
         let empty_draft = request(
             &app,
@@ -2202,6 +2372,14 @@ mod tests {
         assert_eq!(empty_post.summary.summary, "");
         assert!(empty_post.tags.is_empty());
         assert!(empty_post.blocks.is_empty());
+
+        let admin_home = request(&app, "GET", "/", &admin_cookie, None).await;
+        let body = to_bytes(admin_home.into_body(), usize::MAX).await.unwrap();
+        let admin_home_html = String::from_utf8(body.to_vec()).unwrap();
+        assert!(admin_home_html.contains("class=\"new-post-float\" href=\"/posts/new\""));
+        assert!(admin_home_html.contains("href=\"/posts/1\">Another draft</a>"));
+        assert!(admin_home_html.contains("href=\"/posts/2\">My draft</a>"));
+        assert!(admin_home_html.contains("href=\"/posts/3\">Empty draft</a>"));
 
         let writer_drafts = request(&app, "GET", "/api/drafts", &writer_cookie, None).await;
         assert_eq!(writer_drafts.status(), StatusCode::OK);
@@ -2811,6 +2989,8 @@ mod tests {
             &SidebarData::default(),
             &post,
             "owner",
+            AccountRole::Admin,
+            false,
             Some(&ShareAccess::Admin),
         );
         assert!(html.contains("<p class=\"tags\">"));
@@ -2829,6 +3009,7 @@ mod tests {
         assert!(!html.contains("<script>body</script>"));
         assert!(html.contains("Signed in as <strong>owner</strong>"));
         assert!(html.contains("action=\"/logout\" method=\"post\""));
+        assert!(!super::render_shared_post(&post, "/share/example").contains("new-post-float"));
         assert_eq!(escape_html("'&\"<>"), "&#39;&amp;&quot;&lt;&gt;");
     }
 
@@ -2844,10 +3025,33 @@ mod tests {
             Some("/archive/2026-09".to_owned())
         );
         assert_eq!(valid_return_target("/posts/42"), Some("/posts/42".to_owned()));
+        assert_eq!(valid_return_target("/posts/new"), Some("/posts/new".to_owned()));
         assert!(valid_return_target("https://example.com/").is_none());
         assert!(valid_return_target("//example.com/").is_none());
         assert!(valid_return_target("/api/posts").is_none());
         assert!(valid_return_target("/posts/42/fragment").is_none());
         assert!(valid_return_target("/archive/2026-13").is_none());
+    }
+
+    #[test]
+    fn sidebar_shows_five_newest_drafts_before_the_expand_control() {
+        let sidebar = SidebarData {
+            drafts: Some((1..=7).rev().map(|id| PostSummary {
+                id,
+                title: format!("Draft {id}"),
+                published_at: None,
+                summary: String::new(),
+            }).collect()),
+            ..SidebarData::default()
+        };
+        let html = super::render_sidebar(&sidebar);
+        assert_eq!(html.matches("data-overflow-item=\"true\"").count(), 2);
+        assert!(html.contains("data-sidebar-expand=\"sidebar-drafts\""));
+        let newest = html.find("Draft 7").unwrap();
+        let fifth = html.find("Draft 3").unwrap();
+        let sixth = html.find("Draft 2").unwrap();
+        assert!(newest < fifth);
+        assert!(fifth < sixth);
+        assert!(html.find("sidebar-drafts-heading").unwrap() < html.find("sidebar-recent-heading").unwrap());
     }
 }

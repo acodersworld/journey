@@ -233,6 +233,7 @@ pub struct FeedPage {
 
 #[derive(Clone, Debug, Default)]
 pub struct SidebarData {
+    pub drafts: Option<Vec<PostSummary>>,
     pub recent_posts: Vec<PostSummary>,
     pub archive_months: Vec<String>,
     pub tags: Vec<String>,
@@ -968,7 +969,7 @@ impl Database {
                 let rows = statement.query_map([], |row| row.get(0))?;
                 rows.collect::<rusqlite::Result<Vec<_>>>()?
             };
-            Ok(SidebarData { recent_posts, archive_months, tags })
+            Ok(SidebarData { drafts: None, recent_posts, archive_months, tags })
         })
         .await
     }

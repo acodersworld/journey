@@ -95,6 +95,16 @@ writers see only their own, while admins see all. A read account receives
 `403`. Draft summaries serialize `published_at` as `null`, and draft HTML omits
 the date element.
 
+`GET /posts/new` serves the draft form to authenticated `write` and `admin`
+accounts. It accepts a title, optional summary and comma-separated tags, and
+ordered text blocks with optional headers and bodies. Root blocks and one
+level of child blocks can be added, removed, and reordered in the browser; the
+submitted JSON preserves the visible sibling order and has no media fields.
+The form posts to `POST /api/posts`, prevents repeat submissions while the
+request is active, and keeps its contents visible on failure. On success it
+opens the new read-only draft page with a short creation confirmation. Drafts
+remain unavailable to readers and cannot yet be edited or published.
+
 `GET /` renders the newest full post and embeds its cursor when older posts
 exist. A small browser script uses `GET /api/posts` to discover one following
 post ID at a time, then fetches its server-rendered HTML from
@@ -105,11 +115,16 @@ link to their exact-case filtered feed. `/archive/{YYYY-MM}` lists published
 post titles, dates, and summaries for the selected month.
 
 Every signed-in HTML page shares a server-rendered navigation sidebar. It
-lists the five newest published posts, distinct published archive months in
-descending order, and distinct published tags in case-insensitive alphabetical
-order while preserving their stored spelling. The archive list starts with
-six months and the tag list with twelve entries; browser controls reveal the
-rest.
+lists drafts near the top for writers and admins: writers see their own, while
+admins see all, ordered newest first with five initially visible. Readers do
+not see a Drafts section. Each draft links to its read-only page. The sidebar
+also lists the five newest published posts, distinct published archive months
+in descending order, and distinct published tags in case-insensitive
+alphabetical order while preserving their stored spelling. The archive list
+starts with six months and the tag list with twelve entries; browser controls
+reveal the rest. A fixed **+ New post** link appears on signed-in pages for
+writers and admins except on the creation page itself; its stacking order
+places it beneath the sidebar backdrop.
 The sidebar starts closed on each page load. At every screen width it opens as
 a fixed drawer over the page, leaving the reading column and chevron in place.
 A backdrop dims the page; the chevron, backdrop, and Escape close the drawer.
