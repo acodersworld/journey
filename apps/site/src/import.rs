@@ -34,6 +34,7 @@ struct ManifestUser {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ManifestPost {
+    author: String,
     title: String,
     published_at: String,
     summary: String,
@@ -62,6 +63,7 @@ struct MediaAsset {
 }
 
 struct PreparedPost {
+    author_username: String,
     title: String,
     published_at: String,
     summary: String,
@@ -133,6 +135,7 @@ pub async fn prepare_manifest(manifest_path: &Path) -> AppResult<PreparedImport>
             });
         }
         posts.push(PreparedPost {
+            author_username: post.author,
             title: post.title,
             published_at: post.published_at,
             summary: post.summary,
@@ -149,6 +152,7 @@ pub async fn apply_import<S: StorageClient>(
     database: &Database,
     storage: &S,
 ) -> AppResult<()> {
+    database.initialize().await.map_err(std::io::Error::other)?;
     println!(
         "validated {} posts, {} imported accounts, and {} unique media files",
         prepared.posts.len(),
@@ -175,6 +179,7 @@ pub async fn apply_import<S: StorageClient>(
 }
 
 fn validate_post(post: &ManifestPost) -> AppResult<()> {
+    auth::validate_username(&post.author)?;
     if post.title.trim().is_empty() {
         return Err("post title must not be empty".into());
     }
@@ -315,8 +320,9 @@ fn resolve_posts(
         .map(|post| {
             let blocks = resolve_blocks(post.blocks, storage_keys)?;
             Ok(NewPost {
+                author_username: post.author_username,
                 title: post.title,
-                published_at: post.published_at,
+                published_at: Some(post.published_at),
                 summary: post.summary,
                 tags: post.tags,
                 blocks,
@@ -447,7 +453,9 @@ mod tests {
             })
             .collect::<Vec<_>>();
         let manifest = serde_json::json!({
+            "users": [{"username": "user", "password": "password", "role": "read"}],
             "posts": [{
+                "author": "user",
                 "title": "Imported post",
                 "published_at": "2026-01-02",
                 "summary": "Imported summary",
@@ -464,8 +472,9 @@ mod tests {
         let database = Database::new(directory.path().join("posts.sqlite3"));
         database
             .replace_posts(vec![NewPost {
+                author_username: "test-author".to_owned(),
                 title: "Previous post".to_owned(),
-                published_at: "2025-12-31".to_owned(),
+                published_at: Some("2025-12-31".to_owned()),
                 summary: "Still available after a failed import".to_owned(),
                 tags: Vec::new(),
                 blocks: Vec::new(),
@@ -480,6 +489,8 @@ mod tests {
         let manifest = Path::new(env!("CARGO_MANIFEST_DIR")).join("example/posts.json");
         let prepared = prepare_manifest(&manifest).await.unwrap();
         let post = &prepared.posts[0];
+        assert_eq!(post.author_username, "user");
+        assert_eq!(prepared.posts[1].author_username, "user2");
         assert_eq!(post.tags, vec!["alpine", "lake", "morning"]);
         assert_eq!(post.blocks.len(), 1);
         assert!(post.blocks[0].media.is_some());
@@ -493,6 +504,7 @@ mod tests {
         let directory = TestDirectory::new();
         let manifest = serde_json::json!({
             "posts": [{
+                "author": "user",
                 "title": "Nested post",
                 "published_at": "2026-01-02",
                 "summary": "Nested summary",
@@ -516,6 +528,20 @@ mod tests {
     async fn repeated_media_path_uploads_once_and_resolves_all_blocks() {
         let directory = TestDirectory::new();
         let database = database_with_old_post(&directory).await;
+        database
+            .create_account("user".to_owned(), AccountRole::Read, "existing-hash".to_owned())
+            .await
+            .unwrap();
+        database
+            .create_draft(
+                "test-author".to_owned(),
+                "HTTP-created draft".to_owned(),
+                String::new(),
+                Vec::new(),
+                Vec::new(),
+            )
+            .await
+            .unwrap();
         let manifest = make_manifest(&directory, &["photo.png", "photo.png"]);
         let prepared = prepare_manifest(&manifest).await.unwrap();
         let key = format!("media/{}", "a".repeat(64));
@@ -526,6 +552,8 @@ mod tests {
         assert_eq!(storage.uploads.lock().unwrap().len(), 1);
         let summary = database.all_summaries().await.unwrap().remove(0);
         let post = database.post(summary.id).await.unwrap().unwrap();
+        assert_eq!(post.author_username, "user");
+        assert!(database.drafts(None).await.unwrap().is_empty());
         assert_eq!(post.tags, vec!["Import test", "CASE-sensitive"]);
         for block in &post.blocks {
             let media = database.media_reference(summary.id, block.id).await.unwrap().unwrap();

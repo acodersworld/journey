@@ -46,8 +46,12 @@ Create a manifest next to its local media files, for example:
 
 ```json
 {
+  "users": [
+    { "username": "alice", "password": "local-example-password", "role": "write" }
+  ],
   "posts": [
     {
+      "author": "alice",
       "title": "A first journey",
       "published_at": "2026-09-27",
       "summary": "Notes from the road.",
@@ -74,30 +78,32 @@ Import and run the website backend in another terminal:
 ```bash
 cargo run -p journey-site -- import ./posts.json
 cargo run -p journey-site -- db posts
-cargo run -p journey-site -- users create owner owner
-cargo run -p journey-site -- users create alice reader
 cargo run -p journey-site -- users list
 cargo run -p journey-site -- serve
 ```
 
-Open `http://127.0.0.1:8080/` and sign in with the owner or reader account.
+Open `http://127.0.0.1:8080/` and sign in with the imported `alice` account.
 The server-rendered sign-in form works without JavaScript. After sign-in, the
 browser returns to the requested post or feed page. Signed-in pages show the
 username and a Sign out button at the top right.
 
 Account creation and password changes prompt for a password twice without
-echoing it. Passwords are not accepted as command-line arguments. The CLI also
+echoing it. Passwords are not accepted as command-line arguments. Create
+accounts with `users create <username> <read|write|admin>`. The CLI also
 supports `users password <username>`, `users disable <username>`, and
-`users enable <username>`; changing a password or disabling a reader revokes
-that account's active sessions. Only one owner account can exist.
+`users enable <username>`; changing a password or disabling an account revokes
+that account's active sessions. Any number of admin accounts can exist.
 
 An import manifest may also contain a top-level `users` array with
-`username`, `password`, and optional `role` fields. Imported accounts default
-to the reader role and are added only when the username is new. Re-importing
-does not replace an existing account's password or role, or revoke its
-sessions. The sample `apps/site/example/posts.json` includes `user` / `pass`
-and `user2` / `pass2` reader accounts for local use; those sample passwords are
-stored as plain text in that manifest.
+`username`, `password`, and optional `role` fields. Roles are `read`, `write`,
+and `admin`; imported accounts default to `read` and are added only when the
+username is new. Every manifest post requires an `author` username that names
+an existing or newly imported account. Re-importing does not replace an
+existing account's password or role, or revoke its sessions. The sample
+`apps/site/example/posts.json` includes `user` / `pass` (`write`), `user2` /
+`pass2` (`read`), and an `admin` account; sample passwords are stored as plain
+text in that manifest. Each import replaces the entire post set, including
+HTTP-created drafts, while existing accounts and sessions remain.
 
 `JOURNEY_SITE_DB` selects the SQLite file, `JOURNEY_SITE_BIND` selects the
 HTTP listener (default `127.0.0.1:8080`), and `JOURNEY_STORAGE_H2C` selects the
@@ -120,11 +126,11 @@ revoking the cookie's session. The browser also has `GET` and `POST /login` and
 `POST /logout` form routes. All content and media require the session cookie.
 Unauthenticated HTML page requests redirect to `/login` with a validated local
 return path. Protected APIs, post fragments, and media requests return `401`.
-The login page, CSS, and JavaScript load without a session. Readers see
-published content, while the owner can also read drafts by direct post,
-fragment, API, and media URLs. Feeds, tags, archives, and sidebar lists include
-published posts only. There is no anonymous access to posts or
-their media.
+The login page, CSS, and JavaScript load without a session. `read` accounts see
+published content. `write` accounts also see drafts they authored by direct
+post, fragment, API, and media URLs; `admin` accounts can see every draft.
+Feeds, tags, archives, and sidebar lists include published posts only. There
+is no anonymous access to posts or their media.
 
 The authenticated feed is server-rendered at `GET /`; its browser script loads
 additional full posts near the end of the page. It uses `GET /api/posts` to find
@@ -136,6 +142,20 @@ and the normal link `GET /posts/{id}` renders it as HTML. The collapsible
 sidebar links to recent posts, monthly archives, and tag-filtered feeds.
 Media is served only through `GET` or `HEAD /posts/{id}/blocks/{block_id}/media`.
 Video requests forward one byte range to storage.
+
+`POST /api/posts` creates a text-only draft for a signed-in `write` or `admin`
+account. Its title must be nonblank; summary, tags, and the ordered block list
+may be empty. Blocks support one child level, and media fields are rejected.
+The draft author is always the signed-in account. The response is `201 Created`
+with its ID and a `Location: /posts/{id}` header. `GET /api/drafts` lists a
+write account's drafts by newest ID first; admins receive all drafts. The
+response's `published_at` is `null` until a future publish operation sets it,
+and draft pages omit the publication date.
+
+This development site has no schema migration process. After an incompatible
+site database change, recreate the SQLite database and run the destructive
+importer again. An outdated database is rejected with that rebuild instruction.
+
 `journey-site --help`, `journey-site db`, and `journey-site users --help` list
 the CLI commands.
 

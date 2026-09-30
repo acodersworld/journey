@@ -1,14 +1,16 @@
 # Journey: Architecture
 
 **Status:** Exploratory draft  
-**Updated:** 29 September 2026
+**Updated:** 30 September 2026
 **Purpose:** Record the intended production direction and unresolved questions. This remains an exploratory architecture, not a commitment to implement every component immediately.  
 **First implementation:** [Vertical Slice 01: HTTP/2 over WebSocket Object Download](vertical-slice-01-http2-over-websocket.md)  
 **Later transport work:** [Deferred crate extraction](../deferred/h2-over-websocket-crate-extraction.md)
 
 The current local website differs from parts of this exploratory draft: every
 post and media request requires an account session, published posts are visible
-to signed-in readers, and drafts are owner-only. Its server-rendered sign-in
+to signed-in `read`, `write`, and `admin` accounts, `write` accounts can read
+their own drafts, and admins can read every draft. It supports text-only draft
+creation but has no editing or publishing routes. Its server-rendered sign-in
 page, feed, and sidebar are described in the
 [implemented website design](website-post-backend.md). References below to a
 public post feed or public-media cache describe earlier or possible future

@@ -6,11 +6,13 @@ use serde::{Deserialize, Serialize};
 const POSTS_SCHEMA: &str = "\
 CREATE TABLE IF NOT EXISTS posts (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
+    author_id INTEGER NOT NULL REFERENCES users(id),
     title TEXT NOT NULL CHECK (length(trim(title)) > 0),
-    published_at TEXT NOT NULL,
+    published_at TEXT,
     summary TEXT NOT NULL,
     published INTEGER NOT NULL DEFAULT 1 CHECK (published IN (0, 1)),
-    tags TEXT NOT NULL DEFAULT '[]' CHECK (json_valid(tags) AND json_type(tags) = 'array')
+    tags TEXT NOT NULL DEFAULT '[]' CHECK (json_valid(tags) AND json_type(tags) = 'array'),
+    CHECK (published = 0 OR published_at IS NOT NULL)
 );
 CREATE INDEX IF NOT EXISTS posts_published_order ON posts(published, published_at DESC, id DESC);
 CREATE TRIGGER IF NOT EXISTS posts_tags_are_strings_insert
@@ -69,12 +71,11 @@ CREATE TABLE IF NOT EXISTS users (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     username TEXT NOT NULL COLLATE NOCASE UNIQUE
         CHECK (length(username) BETWEEN 3 AND 32),
-    role TEXT NOT NULL CHECK (role IN ('owner', 'reader')),
+    role TEXT NOT NULL CHECK (role IN ('read', 'write', 'admin')),
     password_hash TEXT NOT NULL,
     enabled INTEGER NOT NULL DEFAULT 1 CHECK (enabled IN (0, 1)),
     created_at INTEGER NOT NULL
 );
-CREATE UNIQUE INDEX IF NOT EXISTS users_single_owner ON users(role) WHERE role = 'owner';
 CREATE TABLE IF NOT EXISTS sessions (
     token_digest TEXT PRIMARY KEY CHECK (length(token_digest) = 64),
     user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
@@ -89,6 +90,9 @@ CREATE TABLE IF NOT EXISTS login_throttles (
     attempts INTEGER NOT NULL CHECK (attempts > 0)
 );
 ";
+
+const CURRENT_SCHEMA_VERSION: i64 = 5;
+const REBUILD_DATABASE_MESSAGE: &str = "site database schema is outdated; recreate the SQLite database and run the destructive importer again";
 
 const SHARE_SCHEMA: &str = "\
 CREATE TABLE IF NOT EXISTS site_settings (
@@ -125,30 +129,33 @@ pub struct Database {
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum AccountRole {
-    Owner,
-    Reader,
+    Read,
+    Write,
+    Admin,
 }
 
 impl AccountRole {
     pub fn parse(value: &str) -> Result<Self, String> {
         match value {
-            "owner" => Ok(Self::Owner),
-            "reader" => Ok(Self::Reader),
-            _ => Err("account role must be owner or reader".to_owned()),
+            "read" => Ok(Self::Read),
+            "write" => Ok(Self::Write),
+            "admin" => Ok(Self::Admin),
+            _ => Err("account role must be read, write, or admin".to_owned()),
         }
     }
 
     fn as_str(self) -> &'static str {
         match self {
-            Self::Owner => "owner",
-            Self::Reader => "reader",
+            Self::Read => "read",
+            Self::Write => "write",
+            Self::Admin => "admin",
         }
     }
 }
 
 impl Default for AccountRole {
     fn default() -> Self {
-        Self::Reader
+        Self::Read
     }
 }
 
@@ -187,23 +194,34 @@ pub struct AuthenticatedAccount {
     pub role: AccountRole,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum PostAccess {
     Published,
-    Owner,
+    Author(String),
+    Admin,
 }
 
 impl PostAccess {
-    fn includes_drafts(self) -> bool {
-        matches!(self, Self::Owner)
+    fn query_args(&self) -> (bool, Option<&str>) {
+        match self {
+            Self::Published => (false, None),
+            Self::Author(username) => (false, Some(username)),
+            Self::Admin => (true, None),
+        }
     }
+}
+
+#[derive(Clone, Debug)]
+pub enum ShareAccess {
+    Author(String),
+    Admin,
 }
 
 #[derive(Clone, Debug, Serialize)]
 pub struct PostSummary {
     pub id: i64,
     pub title: String,
-    pub published_at: String,
+    pub published_at: Option<String>,
     pub summary: String,
 }
 
@@ -247,14 +265,17 @@ pub struct Post {
     pub summary: PostSummary,
     #[serde(skip)]
     pub published: bool,
+    #[serde(skip)]
+    pub author_username: String,
     pub tags: Vec<String>,
     pub blocks: Vec<PostBlock>,
 }
 
 #[derive(Clone, Debug)]
 pub struct NewPost {
+    pub author_username: String,
     pub title: String,
-    pub published_at: String,
+    pub published_at: Option<String>,
     pub summary: String,
     pub tags: Vec<String>,
     pub blocks: Vec<NewBlock>,
@@ -297,12 +318,36 @@ impl Database {
     }
 
     pub async fn initialize(&self) -> Result<(), String> {
+        let (user_version, has_site_tables) = self.run(|connection| {
+            let version = connection.pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))?;
+            let has_site_tables = table_exists(connection, "posts")?
+                || table_exists(connection, "post_blocks")?
+                || table_exists(connection, "users")?
+                || table_exists(connection, "sessions")?
+                || table_exists(connection, "login_throttles")?
+                || table_exists(connection, "share_links")?
+                || table_exists(connection, "share_sessions")?
+                || table_exists(connection, "site_settings")?;
+            Ok((version, has_site_tables))
+        }).await?;
+        if (user_version != 0 && user_version != CURRENT_SCHEMA_VERSION)
+            || (user_version == 0 && has_site_tables)
+        {
+            return Err(REBUILD_DATABASE_MESSAGE.to_owned());
+        }
         self.run(initialize_schema).await
     }
 
     #[cfg(test)]
     pub async fn replace_posts(&self, posts: Vec<NewPost>) -> Result<(), String> {
-        self.replace_posts_and_add_accounts(posts, Vec::new())
+        self.replace_posts_and_add_accounts(
+            posts,
+            vec![ImportedAccount {
+                username: "test-author".to_owned(),
+                role: AccountRole::Read,
+                password_hash: "unused-test-hash".to_owned(),
+            }],
+        )
             .await
             .map(|_| ())
     }
@@ -338,23 +383,78 @@ impl Database {
                     ])?;
                 }
             }
+            let posts = posts
+                .into_iter()
+                .map(|(post, tags)| {
+                    let author_id = transaction
+                        .query_row(
+                            "SELECT id FROM users WHERE username = ?1 COLLATE NOCASE",
+                            [&post.author_username],
+                            |row| row.get::<_, i64>(0),
+                        )
+                        .optional()?
+                        .ok_or_else(|| {
+                            rusqlite::Error::InvalidParameterName(format!(
+                                "post author {:?} does not exist",
+                                post.author_username
+                            ))
+                        })?;
+                    Ok((post, tags, author_id))
+                })
+                .collect::<rusqlite::Result<Vec<_>>>()?;
             transaction.execute("DELETE FROM posts", [])?;
             {
                 let mut insert_post = transaction.prepare(
-                    "INSERT INTO posts (title, published_at, summary, published, tags) VALUES (?1, ?2, ?3, 1, ?4)",
+                    "INSERT INTO posts (author_id, title, published_at, summary, published, tags) VALUES (?1, ?2, ?3, ?4, 1, ?5)",
                 )?;
                 let mut insert_block = transaction.prepare(
                     "INSERT INTO post_blocks (post_id, parent_id, position, header, body, storage_key, content_type, alt_text) \
                      VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
                 )?;
-                for (post, tags) in posts {
-                    insert_post.execute(params![post.title, post.published_at, post.summary, tags])?;
+                for (post, tags, author_id) in posts {
+                    insert_post.execute(params![author_id, post.title, post.published_at, post.summary, tags])?;
                     let post_id = transaction.last_insert_rowid();
                     insert_blocks(&transaction, &mut insert_block, post_id, None, post.blocks)?;
                 }
             }
             transaction.commit()
                 .map(|_| added_accounts)
+        })
+        .await
+    }
+
+    pub async fn create_draft(
+        &self,
+        author_username: String,
+        title: String,
+        summary: String,
+        tags: Vec<String>,
+        blocks: Vec<NewBlock>,
+    ) -> Result<i64, String> {
+        self.initialize().await?;
+        let tags = serde_json::to_string(&tags).map_err(|error| error.to_string())?;
+        self.run(move |connection| {
+            let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let author_id = transaction.query_row(
+                "SELECT id FROM users WHERE username = ?1 COLLATE NOCASE",
+                [&author_username],
+                |row| row.get::<_, i64>(0),
+            )?;
+            transaction.execute(
+                "INSERT INTO posts (author_id, title, published_at, summary, published, tags) \
+                 VALUES (?1, ?2, NULL, ?3, 0, ?4)",
+                params![author_id, title, summary, tags],
+            )?;
+            let post_id = transaction.last_insert_rowid();
+            {
+                let mut insert_block = transaction.prepare(
+                    "INSERT INTO post_blocks (post_id, parent_id, position, header, body, storage_key, content_type, alt_text) \
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                )?;
+                insert_blocks(&transaction, &mut insert_block, post_id, None, blocks)?;
+            }
+            transaction.commit()?;
+            Ok(post_id)
         })
         .await
     }
@@ -416,11 +516,11 @@ impl Database {
         .await
     }
 
-    pub async fn set_reader_enabled(&self, username: String, enabled: bool) -> Result<(), String> {
+    pub async fn set_account_enabled(&self, username: String, enabled: bool) -> Result<(), String> {
         self.run(move |connection| {
             let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
             let changed = transaction.execute(
-                "UPDATE users SET enabled = ?2 WHERE username = ?1 COLLATE NOCASE AND role = 'reader'",
+                "UPDATE users SET enabled = ?2 WHERE username = ?1 COLLATE NOCASE",
                 params![username, enabled],
             )?;
             if changed == 0 {
@@ -544,13 +644,16 @@ impl Database {
         post_id: i64,
         token_digest: String,
         created_at: Duration,
+        access: ShareAccess,
     ) -> Result<Option<ShareLinkCreated>, String> {
         self.run(move |connection| {
             let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
             let created_at_seconds = unix_seconds(created_at);
+            let (is_admin, author_username) = share_access_args(&access);
             let published = transaction.query_row(
-                "SELECT EXISTS(SELECT 1 FROM posts WHERE id = ?1 AND published = 1)",
-                [post_id],
+                "SELECT EXISTS(SELECT 1 FROM posts WHERE id = ?1 AND published = 1 \
+                 AND (?2 = 1 OR author_id = (SELECT id FROM users WHERE username = ?3 COLLATE NOCASE)))",
+                params![post_id, is_admin, author_username],
                 |row| row.get::<_, bool>(0),
             )?;
             if !published {
@@ -601,11 +704,21 @@ impl Database {
         .await
     }
 
-    pub async fn revoke_share_link(&self, id: String, revoked_at: Duration) -> Result<bool, String> {
+    pub async fn revoke_share_link(
+        &self,
+        id: String,
+        revoked_at: Duration,
+        access: ShareAccess,
+    ) -> Result<bool, String> {
         self.run(move |connection| {
+            let (is_admin, author_username) = share_access_args(&access);
             let changed = connection.execute(
-                "UPDATE share_links SET revoked_at = COALESCE(revoked_at, ?2) WHERE id = ?1",
-                params![id, unix_seconds(revoked_at)],
+                "UPDATE share_links SET revoked_at = COALESCE(revoked_at, ?2) \
+                 WHERE id = ?1 AND EXISTS (\
+                     SELECT 1 FROM posts AS p WHERE p.id = share_links.post_id AND p.published = 1 \
+                       AND (?3 = 1 OR p.author_id = (SELECT id FROM users WHERE username = ?4 COLLATE NOCASE))\
+                 )",
+                params![id, unix_seconds(revoked_at), is_admin, author_username],
             )?;
             Ok(changed != 0)
         })
@@ -813,7 +926,11 @@ impl Database {
             let has_more = posts.len() > limit;
             posts.truncate(limit);
             let next_cursor = if has_more {
-                posts.last().map(|post| format!("{}:{}", post.published_at, post.id))
+                posts.last().and_then(|post| {
+                    post.published_at
+                        .as_ref()
+                        .map(|published_at| format!("{published_at}:{}", post.id))
+                })
             } else {
                 None
             };
@@ -881,6 +998,20 @@ impl Database {
         .await
     }
 
+    pub async fn drafts(&self, author_username: Option<String>) -> Result<Vec<PostSummary>, String> {
+        self.run(move |connection| {
+            let mut statement = connection.prepare(
+                "SELECT id, title, published_at, summary FROM posts \
+                 WHERE published = 0 AND (?1 IS NULL OR author_id = (\
+                     SELECT id FROM users WHERE username = ?1 COLLATE NOCASE\
+                 )) ORDER BY id DESC",
+            )?;
+            let rows = statement.query_map([author_username], post_summary_from_row)?;
+            rows.collect()
+        })
+        .await
+    }
+
     pub async fn post(&self, id: i64) -> Result<Option<Post>, String> {
         self.post_with_access(id, PostAccess::Published).await
     }
@@ -893,6 +1024,27 @@ impl Database {
         self.run(move |connection| {
             let transaction = connection.transaction()?;
             let post = load_post(&transaction, id, access)?;
+            transaction.commit()?;
+            Ok(post)
+        })
+        .await
+    }
+
+    pub async fn post_for_share_preview(
+        &self,
+        id: i64,
+        access: ShareAccess,
+    ) -> Result<Option<Post>, String> {
+        self.run(move |connection| {
+            let transaction = connection.transaction()?;
+            let (is_admin, author_username) = share_access_args(&access);
+            let post = load_post_with_query(
+                &transaction,
+                id,
+                "p.published = 1 AND (?2 = 1 OR p.author_id = (SELECT id FROM users WHERE username = ?3 COLLATE NOCASE))",
+                is_admin,
+                author_username,
+            )?;
             transaction.commit()?;
             Ok(post)
         })
@@ -915,14 +1067,17 @@ impl Database {
         access: PostAccess,
     ) -> Result<Option<MediaReference>, String> {
         self.run(move |connection| {
+            let (is_admin, author_username) = access.query_args();
             connection
                 .query_row(
                     "SELECT b.storage_key, b.content_type \
                      FROM post_blocks AS b JOIN posts AS p ON p.id = b.post_id \
-                     WHERE p.id = ?1 AND (?3 = 1 OR p.published = 1) AND b.id = ?2 \
+                     WHERE p.id = ?1 AND (p.published = 1 OR ?3 = 1 OR (\
+                         ?4 IS NOT NULL AND p.author_id = (SELECT id FROM users WHERE username = ?4 COLLATE NOCASE)\
+                     )) AND b.id = ?2 \
                        AND b.storage_key IS NOT NULL \
                        AND (b.content_type LIKE 'image/%' OR b.content_type LIKE 'video/%')",
-                    params![post_id, block_id, access.includes_drafts()],
+                    params![post_id, block_id, is_admin, author_username],
                     |row| {
                         Ok(MediaReference {
                             storage_key: row.get(0)?,
@@ -990,36 +1145,10 @@ impl Database {
 fn initialize_schema(connection: &mut Connection) -> rusqlite::Result<()> {
     let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
     transaction.execute_batch(POSTS_SCHEMA)?;
-    if !table_has_column(&transaction, "posts", "tags")? {
-        transaction.execute(
-            "ALTER TABLE posts ADD COLUMN tags TEXT NOT NULL DEFAULT '[]' \
-             CHECK (json_valid(tags) AND json_type(tags) = 'array')",
-            [],
-        )?;
-    }
-
-    if table_exists(&transaction, "post_blocks")? {
-        if table_has_column(&transaction, "post_blocks", "kind")? {
-            transaction.execute("ALTER TABLE post_blocks RENAME TO post_blocks_legacy", [])?;
-            transaction.execute_batch(POST_BLOCKS_SCHEMA)?;
-            transaction.execute_batch(
-                "INSERT INTO post_blocks (post_id, parent_id, position, header, body, storage_key, content_type, alt_text) \
-                 SELECT post_id, NULL, position, \
-                     CASE WHEN kind = 'heading' THEN text END, \
-                     CASE WHEN kind = 'paragraph' THEN text WHEN kind IN ('image', 'video') THEN caption END, \
-                     storage_key, content_type, alt_text \
-                 FROM post_blocks_legacy ORDER BY post_id, position; \
-                 DROP TABLE post_blocks_legacy;",
-            )?;
-        } else {
-            transaction.execute_batch(POST_BLOCKS_SCHEMA)?;
-        }
-    } else {
-        transaction.execute_batch(POST_BLOCKS_SCHEMA)?;
-    }
+    transaction.execute_batch(POST_BLOCKS_SCHEMA)?;
     transaction.execute_batch(AUTH_SCHEMA)?;
     transaction.execute_batch(SHARE_SCHEMA)?;
-    transaction.pragma_update(None, "user_version", 4)?;
+    transaction.pragma_update(None, "user_version", CURRENT_SCHEMA_VERSION)?;
     transaction.commit()
 }
 
@@ -1028,10 +1157,32 @@ fn load_post(
     id: i64,
     access: PostAccess,
 ) -> rusqlite::Result<Option<Post>> {
+    let (is_admin, author_username) = access.query_args();
+    load_post_with_query(
+        connection,
+        id,
+        "p.published = 1 OR ?2 = 1 OR (?3 IS NOT NULL AND p.author_id = (SELECT id FROM users WHERE username = ?3 COLLATE NOCASE))",
+        is_admin,
+        author_username,
+    )
+}
+
+fn load_post_with_query(
+    connection: &Connection,
+    id: i64,
+    access_predicate: &str,
+    is_admin: bool,
+    author_username: Option<&str>,
+) -> rusqlite::Result<Option<Post>> {
+    let query = format!(
+        "SELECT p.id, p.title, p.published_at, p.summary, p.tags, p.published, u.username \
+         FROM posts AS p JOIN users AS u ON u.id = p.author_id \
+         WHERE p.id = ?1 AND ({access_predicate})"
+    );
     let post_row = connection
         .query_row(
-            "SELECT id, title, published_at, summary, tags, published FROM posts WHERE id = ?1 AND (?2 = 1 OR published = 1)",
-            params![id, access.includes_drafts()],
+            &query,
+            params![id, is_admin, author_username],
             |row| {
                 let tags_json: String = row.get(4)?;
                 let tags = serde_json::from_str(&tags_json).map_err(|error| {
@@ -1041,11 +1192,11 @@ fn load_post(
                         Box::new(error),
                     )
                 })?;
-                Ok((post_summary_from_row(row)?, tags, row.get::<_, bool>(5)?))
+                Ok((post_summary_from_row(row)?, tags, row.get::<_, bool>(5)?, row.get::<_, String>(6)?))
             },
         )
         .optional()?;
-    let Some((summary, tags, published)) = post_row else {
+    let Some((summary, tags, published, author_username)) = post_row else {
         return Ok(None);
     };
 
@@ -1086,6 +1237,7 @@ fn load_post(
     Ok(Some(Post {
         summary,
         published,
+        author_username,
         tags,
         blocks,
     }))
@@ -1093,8 +1245,9 @@ fn load_post(
 
 fn account_role_from_db(value: &str) -> rusqlite::Result<AccountRole> {
     match value {
-        "owner" => Ok(AccountRole::Owner),
-        "reader" => Ok(AccountRole::Reader),
+        "read" => Ok(AccountRole::Read),
+        "write" => Ok(AccountRole::Write),
+        "admin" => Ok(AccountRole::Admin),
         _ => Err(rusqlite::Error::FromSqlConversionFailure(
             0,
             Type::Text,
@@ -1125,19 +1278,11 @@ fn table_exists(connection: &Connection, table: &str) -> rusqlite::Result<bool> 
     )
 }
 
-fn table_has_column(
-    connection: &Connection,
-    table: &str,
-    column: &str,
-) -> rusqlite::Result<bool> {
-    let mut statement = connection.prepare(&format!("PRAGMA table_info({table})"))?;
-    let columns = statement.query_map([], |row| row.get::<_, String>(1))?;
-    for existing in columns {
-        if existing? == column {
-            return Ok(true);
-        }
+fn share_access_args(access: &ShareAccess) -> (bool, Option<&str>) {
+    match access {
+        ShareAccess::Author(username) => (false, Some(username)),
+        ShareAccess::Admin => (true, None),
     }
-    Ok(false)
 }
 
 fn insert_blocks(
@@ -1178,12 +1323,12 @@ fn post_summary_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<PostSummar
 mod tests {
     use std::{
         path::PathBuf,
-        time::{SystemTime, UNIX_EPOCH},
+        time::{Duration, SystemTime, UNIX_EPOCH},
     };
 
     use rusqlite::Connection;
 
-    use super::{Database, NewBlock, NewPost};
+    use super::{Database, NewBlock, NewPost, PostAccess, ShareAccess};
 
     fn test_database_path() -> PathBuf {
         let nonce = SystemTime::now()
@@ -1195,8 +1340,9 @@ mod tests {
 
     fn post(published_at: &str, title: &str) -> NewPost {
         NewPost {
+            author_username: "test-author".to_owned(),
             title: title.to_owned(),
-            published_at: published_at.to_owned(),
+            published_at: Some(published_at.to_owned()),
             summary: format!("Summary for {title}"),
             tags: Vec::new(),
             blocks: Vec::new(),
@@ -1238,7 +1384,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn migration_maps_flat_blocks_and_adds_empty_tags() {
+    async fn outdated_database_requests_rebuild() {
         let path = test_database_path();
         let connection = Connection::open(&path).unwrap();
         connection.execute_batch(
@@ -1271,16 +1417,9 @@ mod tests {
         drop(connection);
 
         let database = Database::new(path.clone());
-        database.initialize().await.unwrap();
-        let migrated = database.post(7).await.unwrap().unwrap();
-        assert!(migrated.tags.is_empty());
-        assert_eq!(migrated.blocks.len(), 4);
-        assert_eq!(migrated.blocks[0].header.as_deref(), Some("A heading"));
-        assert_eq!(migrated.blocks[1].body.as_deref(), Some("A paragraph"));
-        assert_eq!(migrated.blocks[2].body.as_deref(), Some("Image caption"));
-        assert_eq!(migrated.blocks[2].content_type.as_deref(), Some("image/jpeg"));
-        assert_eq!(migrated.blocks[3].body.as_deref(), Some("Video caption"));
-        assert!(migrated.blocks.iter().all(|block| block.children.is_empty()));
+        let error = database.initialize().await.unwrap_err();
+        assert!(error.contains("recreate the SQLite database"));
+        assert!(error.contains("destructive importer"));
 
         std::fs::remove_file(path).unwrap();
     }
@@ -1385,10 +1524,14 @@ mod tests {
         let path = test_database_path();
         let database = Database::new(path.clone());
         database.initialize().await.unwrap();
+        database
+            .create_account("test-author".to_owned(), super::AccountRole::Read, "hash".to_owned())
+            .await
+            .unwrap();
         let connection = Connection::open(&path).unwrap();
         connection.execute_batch("PRAGMA foreign_keys = ON;").unwrap();
         connection.execute(
-            "INSERT INTO posts (title, published_at, summary) VALUES ('Post', '2026-01-01', 'Summary')",
+            "INSERT INTO posts (author_id, title, published_at, summary) VALUES (1, 'Post', '2026-01-01', 'Summary')",
             [],
         ).unwrap();
         connection.execute(
@@ -1434,6 +1577,217 @@ mod tests {
         connection.execute("UPDATE posts SET published = 0 WHERE id = 1", []).unwrap();
         drop(connection);
         assert!(database.media_reference(1, block_id).await.unwrap().is_none());
+
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn drafts_are_scoped_to_the_author_and_admin() {
+        let path = test_database_path();
+        let database = Database::new(path.clone());
+        database.initialize().await.unwrap();
+        for (username, role) in [
+            ("writer-one", super::AccountRole::Write),
+            ("writer-two", super::AccountRole::Write),
+            ("site-admin", super::AccountRole::Admin),
+            ("read-only", super::AccountRole::Read),
+        ] {
+            database
+                .create_account(username.to_owned(), role, "test-hash".to_owned())
+                .await
+                .unwrap();
+        }
+
+        let first_id = database
+            .create_draft(
+                "writer-one".to_owned(),
+                "First draft".to_owned(),
+                String::new(),
+                Vec::new(),
+                vec![
+                    NewBlock {
+                        header: Some("First block".to_owned()),
+                        body: None,
+                        storage_key: Some("media/draft-image".to_owned()),
+                        content_type: Some("image/jpeg".to_owned()),
+                        alt: None,
+                        children: vec![NewBlock {
+                            header: None,
+                            body: Some("Nested text".to_owned()),
+                            storage_key: None,
+                            content_type: None,
+                            alt: None,
+                            children: Vec::new(),
+                        }],
+                    },
+                    NewBlock {
+                        header: None,
+                        body: Some("Second block".to_owned()),
+                        storage_key: None,
+                        content_type: None,
+                        alt: None,
+                        children: Vec::new(),
+                    },
+                ],
+            )
+            .await
+            .unwrap();
+        let second_id = database
+            .create_draft(
+                "writer-two".to_owned(),
+                "Other draft".to_owned(),
+                String::new(),
+                Vec::new(),
+                Vec::new(),
+            )
+            .await
+            .unwrap();
+
+        let first = database
+            .post_with_access(first_id, PostAccess::Author("writer-one".to_owned()))
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(!first.published);
+        assert_eq!(first.summary.published_at, None);
+        assert_eq!(first.author_username, "writer-one");
+        assert_eq!(first.summary.summary, "");
+        assert_eq!(first.blocks.len(), 2);
+        assert_eq!(first.blocks[0].position, 0);
+        assert_eq!(first.blocks[0].children[0].body.as_deref(), Some("Nested text"));
+        assert_eq!(first.blocks[1].position, 1);
+        let media_block_id = first.blocks[0].id;
+
+        assert!(database
+            .post_with_access(first_id, PostAccess::Author("writer-two".to_owned()))
+            .await
+            .unwrap()
+            .is_none());
+        assert!(database
+            .post_with_access(first_id, PostAccess::Published)
+            .await
+            .unwrap()
+            .is_none());
+        assert!(database
+            .post_with_access(first_id, PostAccess::Admin)
+            .await
+            .unwrap()
+            .is_some());
+        assert!(database
+            .media_reference_with_access(
+                first_id,
+                media_block_id,
+                PostAccess::Author("writer-one".to_owned()),
+            )
+            .await
+            .unwrap()
+            .is_some());
+        assert!(database
+            .media_reference_with_access(
+                first_id,
+                media_block_id,
+                PostAccess::Author("writer-two".to_owned()),
+            )
+            .await
+            .unwrap()
+            .is_none());
+        assert!(database
+            .media_reference_with_access(first_id, media_block_id, PostAccess::Admin)
+            .await
+            .unwrap()
+            .is_some());
+        assert_eq!(
+            database.drafts(Some("writer-one".to_owned())).await.unwrap()[0].id,
+            first_id
+        );
+        assert_eq!(
+            database.drafts(None).await.unwrap().iter().map(|post| post.id).collect::<Vec<_>>(),
+            vec![second_id, first_id]
+        );
+
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn share_link_management_is_author_scoped_or_admin_wide() {
+        let path = test_database_path();
+        let database = Database::new(path.clone());
+        database.initialize().await.unwrap();
+        for (username, role) in [
+            ("writer-one", super::AccountRole::Write),
+            ("writer-two", super::AccountRole::Write),
+            ("site-admin", super::AccountRole::Admin),
+        ] {
+            database
+                .create_account(username.to_owned(), role, "test-hash".to_owned())
+                .await
+                .unwrap();
+        }
+        let connection = Connection::open(&path).unwrap();
+        connection
+            .execute(
+                "INSERT INTO posts (author_id, title, published_at, summary, published, tags) \
+                 VALUES ((SELECT id FROM users WHERE username = 'writer-one'), 'Published', '2026-01-01', 'Summary', 1, '[]')",
+                [],
+            )
+            .unwrap();
+        drop(connection);
+        let now = Duration::from_secs(1_800_000_000);
+
+        let writer_link = database
+            .create_share_link(
+                "writer-link".to_owned(),
+                1,
+                "a".repeat(64),
+                now,
+                ShareAccess::Author("writer-one".to_owned()),
+            )
+            .await
+            .unwrap();
+        assert!(writer_link.is_some());
+        assert!(database
+            .create_share_link(
+                "other-writer-link".to_owned(),
+                1,
+                "b".repeat(64),
+                now,
+                ShareAccess::Author("writer-two".to_owned()),
+            )
+            .await
+            .unwrap()
+            .is_none());
+        assert!(!database
+            .revoke_share_link(
+                "writer-link".to_owned(),
+                now,
+                ShareAccess::Author("writer-two".to_owned()),
+            )
+            .await
+            .unwrap());
+        assert!(database
+            .revoke_share_link(
+                "writer-link".to_owned(),
+                now,
+                ShareAccess::Author("writer-one".to_owned()),
+            )
+            .await
+            .unwrap());
+
+        assert!(database
+            .create_share_link(
+                "admin-link".to_owned(),
+                1,
+                "c".repeat(64),
+                now,
+                ShareAccess::Admin,
+            )
+            .await
+            .unwrap()
+            .is_some());
+        assert!(database
+            .revoke_share_link("admin-link".to_owned(), now, ShareAccess::Admin)
+            .await
+            .unwrap());
 
         std::fs::remove_file(path).unwrap();
     }

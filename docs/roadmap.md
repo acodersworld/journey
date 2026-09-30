@@ -302,16 +302,16 @@ operations to public browsers.
 ## 5. Next website work
 
 The local site now has a SQLite-backed post backend, a server-rendered scrolling
-feed, a sidebar, and owner/reader sessions with a browser sign-in form. Every
-post and media request requires a session. Readers see published posts; the
-owner can also open drafts directly. The next work is ordered as follows:
+feed, a sidebar, and `read`, `write`, and `admin` sessions with a browser
+sign-in form. Every post and media request requires a session. Writers can
+create drafts and read their own drafts; admins can read every draft. The next
+work is ordered as follows:
 
-1. **Post creation and editing backend — next.** Define draft creation and
-   updates, media uploads and references, and publish/unpublish operations
-   under the existing owner authorization. Plan how this coexists with the
-   current manifest importer before implementing it.
-2. **Authoring UI.** Add the browser workflow for drafting, uploading, editing,
-   and publishing on top of the authoring backend.
+1. **Text drafting UI.** Add the browser workflow for text-only draft creation
+   and draft listing on top of the current backend endpoints.
+2. **Post editing and publishing backend.** Add author-scoped edits and deletes,
+   media uploads and references, and publish/unpublish operations. A post's
+   author needs `write` permission; admins can manage every post.
 3. **Video thumbnail previews.** Generate or store preview images and show
    them on gallery tiles; videos remain playable without previews meanwhile.
 4. **Automatic gallery slideshow.** Add optional timed advance to the existing
@@ -342,7 +342,8 @@ they must not grant draft access.
 - The filesystem-backed object store and its write semantics are documented in
   the current object-storage design.
 - The website uses server-rendered HTML and small browser scripts.
-- Every post and media request requires a session. Readers see published posts;
-  only the owner can access drafts by direct URL. There is no post editor yet.
+- Every post and media request requires a session. `read` accounts see
+  published posts; `write` accounts can access drafts they authored and admins
+  can access every draft. There is no post editor yet.
 - The local website streams original media from the storage service and has no
   AWS media cache.

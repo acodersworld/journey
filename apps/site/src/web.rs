@@ -12,7 +12,7 @@ use std::{net::{IpAddr, SocketAddr}, time::{Duration, SystemTime, UNIX_EPOCH}};
 
 use crate::{
     auth,
-    db::{AccountRole, AuthenticatedAccount, Database, FeedCursor, MediaReference, Post, PostAccess, PostSummary, SidebarData},
+    db::{AccountRole, AuthenticatedAccount, Database, FeedCursor, MediaReference, NewBlock, Post, PostAccess, PostSummary, ShareAccess, SidebarData},
     storage::StorageClient,
 };
 
@@ -89,6 +89,34 @@ struct TagPageQuery {
     tag: String,
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CreateDraftRequest {
+    title: String,
+    #[serde(default)]
+    summary: Option<String>,
+    #[serde(default)]
+    tags: Option<Vec<String>>,
+    #[serde(default)]
+    blocks: Vec<CreateDraftBlock>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CreateDraftBlock {
+    #[serde(default)]
+    header: Option<String>,
+    #[serde(default)]
+    body: Option<String>,
+    #[serde(default)]
+    blocks: Vec<CreateDraftBlock>,
+}
+
+#[derive(Serialize)]
+struct CreatedPostResponse {
+    id: i64,
+}
+
 impl SiteSecurity {
     pub fn from_env(bind_address: SocketAddr, allow_insecure_cookies: bool) -> Result<Self, String> {
         if allow_insecure_cookies && !bind_address.ip().is_loopback() {
@@ -150,7 +178,8 @@ pub fn router<S: StorageClient>(state: AppState<S>) -> Router {
         .route("/", get(home::<S>))
         .route("/tags", get(tag_page::<S>))
         .route("/archive/{month}", get(archive_page::<S>))
-        .route("/api/posts", get(feed::<S>))
+        .route("/api/posts", get(feed::<S>).post(create_draft::<S>))
+        .route("/api/drafts", get(drafts::<S>))
         .route("/api/posts/{id}", get(api_full_post::<S>))
         .route("/api/posts/{id}/share-links", post(create_share_link::<S>))
         .route("/api/share-links/{id}", delete(revoke_share_link::<S>))
@@ -302,10 +331,10 @@ async fn share_preview<S: StorageClient>(
     Path(id): Path<i64>,
     Extension(principal): Extension<AuthPrincipal>,
 ) -> Response {
-    if principal.role != AccountRole::Owner {
+    let Some(access) = principal.share_access() else {
         return no_store(StatusCode::FORBIDDEN.into_response());
-    }
-    match state.database.post_with_access(id, PostAccess::Owner).await {
+    };
+    match state.database.post_for_share_preview(id, access).await {
         Ok(Some(post)) if post.published => {
             no_store(Html(render_shared_post(&post, "")).into_response())
         }
@@ -326,9 +355,9 @@ async fn create_share_link<S: StorageClient>(
     let Some(origin) = validated_request_origin(&headers, &state.security) else {
         return no_store((StatusCode::FORBIDDEN, "origin not allowed\n").into_response());
     };
-    if principal.role != AccountRole::Owner {
+    let Some(access) = principal.share_access() else {
         return no_store(StatusCode::FORBIDDEN.into_response());
-    }
+    };
 
     let link_id = auth::new_share_link_id();
     let secret = auth::new_share_link_secret();
@@ -339,6 +368,7 @@ async fn create_share_link<S: StorageClient>(
             post_id,
             auth::session_token_digest(&secret),
             unix_time(),
+            access,
         )
         .await
     {
@@ -367,13 +397,13 @@ async fn revoke_share_link<S: StorageClient>(
     if !origin_allowed(&headers, &state.security) {
         return no_store((StatusCode::FORBIDDEN, "origin not allowed\n").into_response());
     }
-    if principal.role != AccountRole::Owner {
+    let Some(access) = principal.share_access() else {
         return no_store(StatusCode::FORBIDDEN.into_response());
-    }
+    };
     if !valid_share_link_id(&id) {
         return no_store(StatusCode::NOT_FOUND.into_response());
     }
-    match state.database.revoke_share_link(id, unix_time()).await {
+    match state.database.revoke_share_link(id, unix_time(), access).await {
         Ok(true) => no_store(StatusCode::NO_CONTENT.into_response()),
         Ok(false) => no_store(StatusCode::NOT_FOUND.into_response()),
         Err(error) => {
@@ -812,8 +842,17 @@ impl From<AuthenticatedAccount> for AuthPrincipal {
 impl AuthPrincipal {
     fn post_access(&self) -> PostAccess {
         match self.role {
-            AccountRole::Owner => PostAccess::Owner,
-            AccountRole::Reader => PostAccess::Published,
+            AccountRole::Read => PostAccess::Published,
+            AccountRole::Write => PostAccess::Author(self.username.clone()),
+            AccountRole::Admin => PostAccess::Admin,
+        }
+    }
+
+    fn share_access(&self) -> Option<ShareAccess> {
+        match self.role {
+            AccountRole::Read => None,
+            AccountRole::Write => Some(ShareAccess::Author(self.username.clone())),
+            AccountRole::Admin => Some(ShareAccess::Admin),
         }
     }
 }
@@ -925,6 +964,80 @@ async fn feed<S: StorageClient>(
     }
 }
 
+async fn drafts<S: StorageClient>(
+    State(state): State<AppState<S>>,
+    Extension(principal): Extension<AuthPrincipal>,
+) -> Response {
+    let author_username = match principal.role {
+        AccountRole::Read => return no_store(StatusCode::FORBIDDEN.into_response()),
+        AccountRole::Write => Some(principal.username),
+        AccountRole::Admin => None,
+    };
+    match state.database.drafts(author_username).await {
+        Ok(posts) => no_store(Json(posts).into_response()),
+        Err(error) => {
+            eprintln!("website draft list query failed: {error}");
+            no_store(StatusCode::INTERNAL_SERVER_ERROR.into_response())
+        }
+    }
+}
+
+async fn create_draft<S: StorageClient>(
+    State(state): State<AppState<S>>,
+    Extension(principal): Extension<AuthPrincipal>,
+    headers: HeaderMap,
+    Json(request): Json<CreateDraftRequest>,
+) -> Response {
+    if !matches!(principal.role, AccountRole::Write | AccountRole::Admin) {
+        return no_store(StatusCode::FORBIDDEN.into_response());
+    }
+    if !origin_allowed(&headers, &state.security) {
+        return no_store((StatusCode::FORBIDDEN, "origin not allowed\n").into_response());
+    }
+    if request.title.trim().is_empty() {
+        return no_store((StatusCode::BAD_REQUEST, "title must not be blank\n").into_response());
+    }
+    if request.blocks.iter().any(|block| block.blocks.iter().any(|child| !child.blocks.is_empty())) {
+        return no_store((StatusCode::BAD_REQUEST, "post blocks may only be nested one level deep\n").into_response());
+    }
+    let blocks = request.blocks.into_iter().map(create_draft_block).collect();
+    match state
+        .database
+        .create_draft(
+            principal.username,
+            request.title,
+            request.summary.unwrap_or_default(),
+            request.tags.unwrap_or_default(),
+            blocks,
+        )
+        .await
+    {
+        Ok(id) => {
+            let mut response = Json(CreatedPostResponse { id }).into_response();
+            *response.status_mut() = StatusCode::CREATED;
+            if let Ok(location) = HeaderValue::from_str(&format!("/posts/{id}")) {
+                response.headers_mut().insert(header::LOCATION, location);
+            }
+            no_store(response)
+        }
+        Err(error) => {
+            eprintln!("website draft creation failed: {error}");
+            no_store(StatusCode::INTERNAL_SERVER_ERROR.into_response())
+        }
+    }
+}
+
+fn create_draft_block(block: CreateDraftBlock) -> NewBlock {
+    NewBlock {
+        header: block.header,
+        body: block.body,
+        storage_key: None,
+        content_type: None,
+        alt: None,
+        children: block.blocks.into_iter().map(create_draft_block).collect(),
+    }
+}
+
 async fn home<S: StorageClient>(
     State(state): State<AppState<S>>,
     Extension(principal): Extension<AuthPrincipal>,
@@ -956,7 +1069,7 @@ async fn home<S: StorageClient>(
                 initial_post.as_ref(),
                 next_cursor,
                 &principal.username,
-                principal.role == AccountRole::Owner,
+                principal.share_access().as_ref(),
             ))
             .into_response()
         }
@@ -1000,7 +1113,7 @@ async fn tag_page<S: StorageClient>(
                 initial_post.as_ref(),
                 next_cursor,
                 &principal.username,
-                principal.role == AccountRole::Owner,
+                principal.share_access().as_ref(),
             ))
                 .into_response()
         }
@@ -1069,7 +1182,7 @@ async fn post_page<S: StorageClient>(
                 &sidebar,
                 &post,
                 &principal.username,
-                principal.role == AccountRole::Owner,
+                principal.share_access().as_ref(),
             ))
             .into_response()
         }
@@ -1090,7 +1203,7 @@ async fn post_fragment<S: StorageClient>(
         Ok(Some(post)) => Html(pretty_html(&render_post(
             &post,
             false,
-            principal.role == AccountRole::Owner,
+            principal.share_access().as_ref().is_some_and(|access| can_share_post(&post, access)),
         )))
         .into_response(),
         Ok(None) => StatusCode::NOT_FOUND.into_response(),
@@ -1163,10 +1276,15 @@ fn valid_archive_month(value: &str) -> bool {
         && value[5..7].parse::<u32>().is_ok_and(|month| (1..=12).contains(&month))
 }
 
-fn render_full_post(sidebar: &SidebarData, post: &Post, username: &str, is_owner: bool) -> String {
+fn render_full_post(
+    sidebar: &SidebarData,
+    post: &Post,
+    username: &str,
+    share_access: Option<&ShareAccess>,
+) -> String {
     let content = format!(
         "<main class=\"site site-post\"><p class=\"back-link\"><a href=\"/\">All posts</a></p>{}</main>",
-        render_post(post, true, is_owner),
+        render_post(post, true, share_access.is_some_and(|access| can_share_post(post, access))),
     );
     render_site_page(&post.summary.title, sidebar, &content, true, username)
 }
@@ -1188,14 +1306,18 @@ fn render_home(
     initial_post: Option<&Post>,
     next_cursor: Option<&str>,
     username: &str,
-    is_owner: bool,
+    share_access: Option<&ShareAccess>,
 ) -> String {
     let mut feed = format!(
         "<section id=\"feed\" aria-label=\"Posts\" data-next-cursor=\"{}\">",
         escape_html(next_cursor.unwrap_or("")),
     );
     if let Some(post) = initial_post {
-        feed.push_str(&render_post(post, true, is_owner));
+        feed.push_str(&render_post(
+            post,
+            true,
+            share_access.is_some_and(|access| can_share_post(post, access)),
+        ));
     } else {
         feed.push_str("<p class=\"empty-feed\">No published posts yet.</p>");
     }
@@ -1210,7 +1332,7 @@ fn render_tag_feed(
     initial_post: Option<&Post>,
     next_cursor: Option<&str>,
     username: &str,
-    is_owner: bool,
+    share_access: Option<&ShareAccess>,
 ) -> String {
     let mut feed = format!(
         "<section id=\"feed\" aria-label=\"Posts tagged {}\" data-next-cursor=\"{}\" data-tag=\"{}\">",
@@ -1219,7 +1341,11 @@ fn render_tag_feed(
         escape_html(tag),
     );
     if let Some(post) = initial_post {
-        feed.push_str(&render_post(post, true, is_owner));
+        feed.push_str(&render_post(
+            post,
+            true,
+            share_access.is_some_and(|access| can_share_post(post, access)),
+        ));
     } else {
         feed.push_str("<p class=\"empty-feed\">No published posts have this tag.</p>");
     }
@@ -1264,12 +1390,12 @@ fn render_archive(
         content.push_str("<p class=\"empty-feed\">No published posts in this month.</p>");
     } else {
         for post in posts {
+            let published_at = render_time_element(post.published_at.as_deref());
             content.push_str(&format!(
-                "<article class=\"archive-post\"><h2><a href=\"/posts/{}\">{}</a></h2><time datetime=\"{}\">{}</time><p class=\"summary\">{}</p></article>",
+                "<article class=\"archive-post\"><h2><a href=\"/posts/{}\">{}</a></h2>{}<p class=\"summary\">{}</p></article>",
                 post.id,
                 escape_html(&post.title),
-                escape_html(&post.published_at),
-                escape_html(&post.published_at),
+                published_at,
                 escape_html(&post.summary),
             ));
         }
@@ -1313,12 +1439,12 @@ fn render_sidebar(sidebar: &SidebarData) -> String {
         html.push_str("<li class=\"sidebar-muted\">No published posts yet.</li>");
     } else {
         for post in &sidebar.recent_posts {
+            let published_at = render_time_element(post.published_at.as_deref());
             html.push_str(&format!(
-                "<li><a href=\"/posts/{}\">{}</a><time datetime=\"{}\">{}</time></li>",
+                "<li><a href=\"/posts/{}\">{}</a>{}</li>",
                 post.id,
                 escape_html(&post.title),
-                escape_html(&post.published_at),
-                escape_html(&post.published_at),
+                published_at,
             ));
         }
     }
@@ -1389,17 +1515,17 @@ fn encode_url_component(value: &str) -> String {
     encoded
 }
 
-fn render_post(post: &Post, prioritize_first_image: bool, is_owner: bool) -> String {
-    render_post_with_media_prefix(post, prioritize_first_image, None, is_owner)
+fn render_post(post: &Post, prioritize_first_image: bool, can_manage_shares: bool) -> String {
+    render_post_with_media_prefix(post, prioritize_first_image, None, can_manage_shares)
 }
 
 fn render_post_with_media_prefix(
     post: &Post,
     prioritize_first_image: bool,
     media_prefix: Option<&str>,
-    is_owner: bool,
+    can_manage_shares: bool,
 ) -> String {
-    let share_control = if is_owner && post.published {
+    let share_control = if can_manage_shares && post.published {
         format!(
             "<button class=\"post-share-button\" type=\"button\" data-share-post=\"{}\" aria-haspopup=\"dialog\" aria-controls=\"share-dialog\">Share</button>",
             post.summary.id,
@@ -1407,17 +1533,36 @@ fn render_post_with_media_prefix(
     } else {
         String::new()
     };
+    let published_at = render_time_element(post.summary.published_at.as_deref());
     format!(
-        "<article class=\"post\" data-post-id=\"{}\"><header class=\"post-header\"><h1>{}</h1><div class=\"post-date-row\"><time datetime=\"{}\">{}</time>{}</div><p class=\"summary\">{}</p></header>{}{}</article>",
+        "<article class=\"post\" data-post-id=\"{}\"><header class=\"post-header\"><h1>{}</h1><div class=\"post-date-row\">{}{}</div><p class=\"summary\">{}</p></header>{}{}</article>",
         post.summary.id,
         escape_html(&post.summary.title),
-        escape_html(&post.summary.published_at),
-        escape_html(&post.summary.published_at),
+        published_at,
         share_control,
         escape_html(&post.summary.summary),
         render_tags_html(&post.tags, media_prefix.is_some()),
         render_post_blocks_html(post, prioritize_first_image, media_prefix),
     )
+}
+
+fn render_time_element(published_at: Option<&str>) -> String {
+    published_at
+        .map(|published_at| {
+            format!(
+                "<time datetime=\"{}\">{}</time>",
+                escape_html(published_at),
+                escape_html(published_at),
+            )
+        })
+        .unwrap_or_default()
+}
+
+fn can_share_post(post: &Post, access: &ShareAccess) -> bool {
+    match access {
+        ShareAccess::Author(username) => post.author_username.eq_ignore_ascii_case(username),
+        ShareAccess::Admin => true,
+    }
 }
 
 fn render_post_blocks_html(
@@ -1893,7 +2038,7 @@ mod tests {
     };
     use crate::{
         auth,
-        db::{AccountRole, Database, NewPost, Post, PostBlock, PostSummary, SidebarData},
+        db::{AccountRole, Database, NewPost, Post, PostAccess, PostBlock, PostSummary, ShareAccess, SidebarData},
         storage::{StorageClient, StorageResponse},
     };
     use axum::{
@@ -1932,6 +2077,351 @@ mod tests {
             )
             .await
             .unwrap()
+    }
+
+    #[tokio::test]
+    async fn draft_http_api_creates_and_lists_author_owned_drafts() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "journey-site-drafts-{}-{nonce}.sqlite3",
+            std::process::id()
+        ));
+        let database = Database::new(path.clone());
+        database.initialize().await.unwrap();
+        for (username, role) in [
+            ("writer-one", AccountRole::Write),
+            ("writer-two", AccountRole::Write),
+            ("reader-one", AccountRole::Read),
+            ("admin-one", AccountRole::Admin),
+        ] {
+            database
+                .create_account(username.to_owned(), role, "test-hash".to_owned())
+                .await
+                .unwrap();
+        }
+        database
+            .create_draft(
+                "writer-two".to_owned(),
+                "Another draft".to_owned(),
+                String::new(),
+                Vec::new(),
+                Vec::new(),
+            )
+            .await
+            .unwrap();
+
+        async fn session_cookie(database: &Database, username: &str) -> String {
+            let account = database
+                .login_account(username.to_owned())
+                .await
+                .unwrap()
+                .unwrap();
+            let token = auth::new_session_token();
+            let created_at = super::unix_time();
+            database
+                .issue_session(
+                    account.id,
+                    auth::session_token_digest(&token),
+                    created_at,
+                    created_at + Duration::from_secs(3600),
+                )
+                .await
+                .unwrap();
+            format!("journey_session={token}")
+        }
+
+        async fn request(
+            app: &axum::Router,
+            method: &str,
+            target: &str,
+            cookie: &str,
+            body: Option<&str>,
+        ) -> Response {
+            let mut builder = Request::builder()
+                .method(method)
+                .uri(target)
+                .header(header::COOKIE, cookie);
+            if method != "GET" {
+                builder = builder
+                    .header(header::ORIGIN, "http://127.0.0.1")
+                    .header(header::CONTENT_TYPE, "application/json");
+            }
+            app.clone()
+                .oneshot(builder.body(Body::from(body.unwrap_or_default().to_owned())).unwrap())
+                .await
+                .unwrap()
+        }
+
+        let writer_cookie = session_cookie(&database, "writer-one").await;
+        let reader_cookie = session_cookie(&database, "reader-one").await;
+        let admin_cookie = session_cookie(&database, "admin-one").await;
+        let app = router(state(database.clone(), UnusedStorage));
+        let created = request(
+            &app,
+            "POST",
+            "/api/posts",
+            &writer_cookie,
+            Some(r#"{"title":"My draft","summary":"","tags":[],"blocks":[{"header":"First","blocks":[{"body":"Child"}]},{"body":"Second"}]}"#),
+        )
+        .await;
+        assert_eq!(created.status(), StatusCode::CREATED);
+        assert_eq!(created.headers().get(header::LOCATION).unwrap(), "/posts/2");
+        let body = to_bytes(created.into_body(), usize::MAX).await.unwrap();
+        let response: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(response["id"], 2);
+        let post = database
+            .post_with_access(2, PostAccess::Author("writer-one".to_owned()))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(post.author_username, "writer-one");
+        assert_eq!(post.summary.published_at, None);
+        assert_eq!(post.blocks.len(), 2);
+        assert_eq!(post.blocks[0].children[0].body.as_deref(), Some("Child"));
+        assert_eq!(post.blocks[1].body.as_deref(), Some("Second"));
+        assert!(!super::render_post(&post, true, false).contains("<time"));
+
+        let empty_draft = request(
+            &app,
+            "POST",
+            "/api/posts",
+            &admin_cookie,
+            Some(r#"{"title":"Empty draft"}"#),
+        )
+        .await;
+        assert_eq!(empty_draft.status(), StatusCode::CREATED);
+        let empty_post = database
+            .post_with_access(3, PostAccess::Admin)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(empty_post.author_username, "admin-one");
+        assert_eq!(empty_post.summary.summary, "");
+        assert!(empty_post.tags.is_empty());
+        assert!(empty_post.blocks.is_empty());
+
+        let writer_drafts = request(&app, "GET", "/api/drafts", &writer_cookie, None).await;
+        assert_eq!(writer_drafts.status(), StatusCode::OK);
+        let body = to_bytes(writer_drafts.into_body(), usize::MAX).await.unwrap();
+        let drafts: Vec<serde_json::Value> = serde_json::from_slice(&body).unwrap();
+        assert_eq!(drafts.len(), 1);
+        assert_eq!(drafts[0]["id"], 2);
+        assert!(drafts[0]["published_at"].is_null());
+
+        let admin_drafts = request(&app, "GET", "/api/drafts", &admin_cookie, None).await;
+        assert_eq!(admin_drafts.status(), StatusCode::OK);
+        let body = to_bytes(admin_drafts.into_body(), usize::MAX).await.unwrap();
+        let drafts: Vec<serde_json::Value> = serde_json::from_slice(&body).unwrap();
+        assert_eq!(drafts.iter().map(|draft| draft["id"].as_i64().unwrap()).collect::<Vec<_>>(), vec![3, 2, 1]);
+
+        assert_eq!(
+            request(&app, "GET", "/api/drafts", &reader_cookie, None)
+                .await
+                .status(),
+            StatusCode::FORBIDDEN,
+        );
+        assert_eq!(
+            request(
+                &app,
+                "POST",
+                "/api/posts",
+                &reader_cookie,
+                Some(r#"{"title":"No draft"}"#),
+            )
+            .await
+            .status(),
+            StatusCode::FORBIDDEN,
+        );
+        assert_eq!(
+            request(
+                &app,
+                "POST",
+                "/api/posts",
+                &writer_cookie,
+                Some(r#"{"title":"Media","blocks":[{"path":"photo.jpg"}]}"#),
+            )
+            .await
+            .status(),
+            StatusCode::UNPROCESSABLE_ENTITY,
+        );
+        assert_eq!(
+            request(
+                &app,
+                "POST",
+                "/api/posts",
+                &writer_cookie,
+                Some(r#"{"title":"Forged author","author":"writer-two"}"#),
+            )
+            .await
+            .status(),
+            StatusCode::UNPROCESSABLE_ENTITY,
+        );
+        assert_eq!(
+            request(
+                &app,
+                "POST",
+                "/api/posts",
+                &writer_cookie,
+                Some(r#"{"title":"  "}"#),
+            )
+            .await
+            .status(),
+            StatusCode::BAD_REQUEST,
+        );
+        assert_eq!(
+            request(
+                &app,
+                "POST",
+                "/api/posts",
+                &writer_cookie,
+                Some(r#"{"title":"Too deep","blocks":[{"blocks":[{"blocks":[{"body":"No"}]}]}]}"#),
+            )
+            .await
+            .status(),
+            StatusCode::BAD_REQUEST,
+        );
+
+        let connection = Connection::open(&path).unwrap();
+        connection
+            .execute_batch(
+                "INSERT INTO posts (author_id, title, published_at, summary, published, tags) \
+                 VALUES ((SELECT id FROM users WHERE username = 'writer-one'), 'Writer published', '2026-01-01', '', 1, '[]'); \
+                 INSERT INTO posts (author_id, title, published_at, summary, published, tags) \
+                 VALUES ((SELECT id FROM users WHERE username = 'writer-two'), 'Other published', '2026-01-02', '', 1, '[]');",
+            )
+            .unwrap();
+        drop(connection);
+        let writer_link = request(
+            &app,
+            "POST",
+            "/api/posts/4/share-links",
+            &writer_cookie,
+            None,
+        )
+        .await;
+        assert_eq!(writer_link.status(), StatusCode::OK);
+        let body = to_bytes(writer_link.into_body(), usize::MAX).await.unwrap();
+        let writer_link: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let writer_link_id = writer_link["id"].as_str().unwrap();
+        assert_eq!(
+            request(
+                &app,
+                "POST",
+                "/api/posts/5/share-links",
+                &writer_cookie,
+                None,
+            )
+            .await
+            .status(),
+            StatusCode::NOT_FOUND,
+        );
+        assert_eq!(
+            request(
+                &app,
+                "POST",
+                "/api/posts/4/share-links",
+                &reader_cookie,
+                None,
+            )
+            .await
+            .status(),
+            StatusCode::FORBIDDEN,
+        );
+        assert_eq!(
+            request(
+                &app,
+                "POST",
+                "/api/posts/2/share-links",
+                &writer_cookie,
+                None,
+            )
+            .await
+            .status(),
+            StatusCode::NOT_FOUND,
+        );
+        let admin_link = request(
+            &app,
+            "POST",
+            "/api/posts/5/share-links",
+            &admin_cookie,
+            None,
+        )
+        .await;
+        assert_eq!(admin_link.status(), StatusCode::OK);
+        let body = to_bytes(admin_link.into_body(), usize::MAX).await.unwrap();
+        let admin_link: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let admin_link_id = admin_link["id"].as_str().unwrap();
+        assert_eq!(
+            request(
+                &app,
+                "DELETE",
+                &format!("/api/share-links/{admin_link_id}"),
+                &writer_cookie,
+                None,
+            )
+            .await
+            .status(),
+            StatusCode::NOT_FOUND,
+        );
+        assert_eq!(
+            request(
+                &app,
+                "DELETE",
+                &format!("/api/share-links/{writer_link_id}"),
+                &reader_cookie,
+                None,
+            )
+            .await
+            .status(),
+            StatusCode::FORBIDDEN,
+        );
+        assert_eq!(
+            request(
+                &app,
+                "DELETE",
+                &format!("/api/share-links/{writer_link_id}"),
+                &writer_cookie,
+                None,
+            )
+            .await
+            .status(),
+            StatusCode::NO_CONTENT,
+        );
+        assert_eq!(
+            request(
+                &app,
+                "DELETE",
+                &format!("/api/share-links/{admin_link_id}"),
+                &admin_cookie,
+                None,
+            )
+            .await
+            .status(),
+            StatusCode::NO_CONTENT,
+        );
+        assert_eq!(
+            request(&app, "GET", "/posts/4/share-preview", &writer_cookie, None)
+                .await
+                .status(),
+            StatusCode::OK,
+        );
+        assert_eq!(
+            request(&app, "GET", "/posts/4/share-preview", &reader_cookie, None)
+                .await
+                .status(),
+            StatusCode::FORBIDDEN,
+        );
+        assert_eq!(
+            request(&app, "GET", "/posts/4/share-preview", &admin_cookie, None)
+                .await
+                .status(),
+            StatusCode::OK,
+        );
+
+        std::fs::remove_file(path).unwrap();
     }
 
     #[tokio::test]
@@ -2010,7 +2500,7 @@ mod tests {
         database
             .create_account(
                 "reader".to_owned(),
-                AccountRole::Reader,
+                AccountRole::Read,
                 auth::hash_password("reader-secret").unwrap(),
             )
             .await
@@ -2018,7 +2508,7 @@ mod tests {
         database
             .create_account(
                 "owner".to_owned(),
-                AccountRole::Owner,
+                AccountRole::Write,
                 auth::hash_password("owner-secret").unwrap(),
             )
             .await
@@ -2026,7 +2516,8 @@ mod tests {
         let connection = Connection::open(&path).unwrap();
         connection
             .execute(
-                "INSERT INTO posts (title, published_at, summary, published, tags) VALUES ('Draft', '2026-09-01', 'A draft', 0, '[]')",
+                "INSERT INTO posts (author_id, title, published_at, summary, published, tags) \
+                 VALUES ((SELECT id FROM users WHERE username = 'owner'), 'Draft', NULL, 'A draft', 0, '[]')",
                 [],
             )
             .unwrap();
@@ -2227,8 +2718,9 @@ mod tests {
         let database = Database::new(path.clone());
         let posts = (1..=12)
             .map(|id| NewPost {
+                author_username: "test-author".to_owned(),
                 title: format!("Post {id}"),
-                published_at: "2026-01-01".to_owned(),
+                published_at: Some("2026-01-01".to_owned()),
                 summary: format!("Summary {id}"),
                 tags: Vec::new(),
                 blocks: Vec::new(),
@@ -2240,7 +2732,7 @@ mod tests {
             State(state(database, UnusedStorage)),
             Extension(AuthPrincipal {
                 username: "reader".to_owned(),
-                role: AccountRole::Reader,
+                role: AccountRole::Read,
             }),
         )
         .await;
@@ -2262,10 +2754,11 @@ mod tests {
             summary: PostSummary {
                 id: 7,
                 title: "\"><script>alert(1)</script>".to_owned(),
-                published_at: "2026-01-01".to_owned(),
+                published_at: Some("2026-01-01".to_owned()),
                 summary: "A <summary>".to_owned(),
             },
             published: true,
+            author_username: "owner".to_owned(),
             tags: vec!["<tag>".to_owned()],
             blocks: vec![
                 PostBlock {
@@ -2314,7 +2807,12 @@ mod tests {
                 },
             ],
         };
-        let html = render_full_post(&SidebarData::default(), &post, "owner", true);
+        let html = render_full_post(
+            &SidebarData::default(),
+            &post,
+            "owner",
+            Some(&ShareAccess::Admin),
+        );
         assert!(html.contains("<p class=\"tags\">"));
         assert!(html.contains("class=\"tag-label\">Tags:</span>"));
         assert!(html.contains("href=\"/tags?tag=%3Ctag%3E\">&lt;tag&gt;</a>"));

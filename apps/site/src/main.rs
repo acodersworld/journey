@@ -18,7 +18,7 @@ use tokio::net::TcpListener;
 type AppResult<T> = Result<T, Box<dyn Error + Send + Sync>>;
 
 const HELP: &str = "\
-journey-site — read-only post backend and manifest importer
+journey-site — post backend and manifest importer
 
 Usage:
   journey-site serve [--allow-insecure-cookies]
@@ -27,7 +27,7 @@ Usage:
   journey-site db schema
   journey-site db posts
   journey-site db post <id>
-  journey-site users create <username> <owner|reader>
+  journey-site users create <username> <read|write|admin>
   journey-site users list
   journey-site users password <username>
   journey-site users disable <username>
@@ -54,7 +54,7 @@ Usage:
 ";
 const USERS_HELP: &str = "\
 Usage:
-  journey-site users create <username> <owner|reader>
+  journey-site users create <username> <read|write|admin>
   journey-site users list
   journey-site users password <username>
   journey-site users disable <username>
@@ -167,7 +167,7 @@ async fn main() -> AppResult<()> {
                     let role = args.next().ok_or("users create requires an account role")?;
                     let role = db::AccountRole::parse(role.to_str().ok_or("account role must be UTF-8")?)?;
                     if args.next().is_some() {
-                        return Err("usage: journey-site users create <username> <owner|reader>".into());
+                        return Err("usage: journey-site users create <username> <read|write|admin>".into());
                     }
                     auth::validate_username(&username)?;
                     let password = read_new_password()?;
@@ -209,10 +209,10 @@ async fn main() -> AppResult<()> {
                     }
                     auth::validate_username(&username)?;
                     database
-                        .set_reader_enabled(username.clone(), enabled)
+                        .set_account_enabled(username.clone(), enabled)
                         .await
                         .map_err(std::io::Error::other)?;
-                    println!("{} reader account {username}", if enabled { "enabled" } else { "disabled" });
+                    println!("{} account {username}", if enabled { "enabled" } else { "disabled" });
                     Ok(())
                 }
                 _ => Err("usage: journey-site users <create|list|password|disable|enable>".into()),
@@ -272,6 +272,7 @@ async fn main() -> AppResult<()> {
                             post_id,
                             auth::session_token_digest(&secret),
                             created_at,
+                            db::ShareAccess::Admin,
                         )
                         .await
                         .map_err(std::io::Error::other)?
@@ -313,7 +314,7 @@ async fn main() -> AppResult<()> {
                         return Err("usage: journey-site share-links revoke <link-id>".into());
                     }
                     if !database
-                        .revoke_share_link(link_id.clone(), unix_time())
+                        .revoke_share_link(link_id.clone(), unix_time(), db::ShareAccess::Admin)
                         .await
                         .map_err(std::io::Error::other)?
                     {

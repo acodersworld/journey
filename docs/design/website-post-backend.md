@@ -1,22 +1,24 @@
 # Website post backend
 
 **Status:** Implemented local backend and authenticated website UI
-**Updated:** 29 September 2026
+**Updated:** 30 September 2026
 
 ## Runtime data
 
 `journey-site` stores posts in SQLite. `posts` contains an auto-generated ID,
-title, ISO publication date, summary, a published flag, and a JSON array of
-case-preserving string tags. `post_blocks` stores blocks with an auto-generated
-ID, parent ID, sibling position, optional header and body, and optional media
-fields. A row with children is a group; groups can contain only one level of
+required author reference, title, nullable ISO publication date, summary, a
+published flag, and a JSON array of case-preserving string tags. The author is
+the account that created a draft or is credited by the manifest.
+`post_blocks` stores blocks with an auto-generated ID, parent ID, sibling
+position, optional header and body, and optional media fields. A row with
+children is a group; groups can contain only one level of
 children and can also have their own text and media. The content type identifies
-image and video media. A migration maps legacy headings to headers, paragraphs
-to bodies, and media captions to bodies; migrated posts receive empty tag
-arrays. Imported posts are always published. All post and media lookups require
-a session: readers can access published posts, while the owner can also access
-drafts through direct post and media URLs. Feeds and navigation lists contain
-published posts only.
+image and video media. Imported posts are always published; HTTP-created posts
+are drafts until a future publish operation sets their publication date. All
+post and media lookups require a session: `read` accounts can access published
+posts, `write` accounts can also access their own drafts, and `admin` accounts
+can access every draft. Feeds and navigation lists contain published posts
+only.
 
 Post and block IDs are regenerated on each full import. They remain stable for
 in-place edits. Feed ordering is publication date descending, then ID
@@ -25,9 +27,11 @@ descending. Blocks are ordered by zero-based position among siblings.
 ## Manifest import
 
 The JSON manifest is the editable source for this local workflow. Its top
-level contains `posts`; each post has `title`, `published_at` (`YYYY-MM-DD`),
-`summary`, optional `tags`, and ordered `blocks`. Each block can have a plain
-text `header`, plain text `body`, a media `path` with optional `alt`, and nested
+level contains `posts`; each post requires an `author` username, `title`,
+`published_at` (`YYYY-MM-DD`), `summary`, optional `tags`, and ordered `blocks`.
+Each author must already exist or be added through the manifest's `users` array.
+Each block can have a plain text `header`, plain text `body`, a media `path`
+with optional `alt`, and nested
 `blocks`. Nested blocks are allowed only on top-level blocks. Media type is
 inferred from the path extension and stored as its content type. Image and
 video paths are relative to the manifest directory. The importer canonicalizes
@@ -45,11 +49,12 @@ form the full storage key. Uploads are unconditional, so repeated imports
 receive the same key for the same contents. Different paths with identical
 contents are uploaded separately and resolve to the same key.
 
-After every upload and key check succeeds, the importer resolves media blocks
-to their returned keys and replaces the post set in one immediate SQLite
-transaction. If validation, upload, key checking, or the database transaction
-fails, the previous post set remains available. Successfully uploaded but
-unreferenced objects can remain in storage.
+After every upload and key check succeeds, the importer adds new users, resolves
+all post authors to user IDs, and replaces the entire post set in one immediate
+SQLite transaction. This deletes HTTP-created drafts as well as prior imported
+posts. If author resolution or the database transaction fails, the previous
+post set remains available. Successfully uploaded but unreferenced objects can
+remain in storage.
 
 ## Storage and HTTP boundary
 
@@ -78,6 +83,17 @@ parameters apply to the same published-post keyset query. Malformed cursors
 return `400`. The database fetches one extra row to tell whether a following
 page exists; cursors follow the current ordering and do not preserve a snapshot
 across imports.
+
+`POST /api/posts` creates a text-only draft for a `write` or `admin` account.
+The signed-in account is always the author. The request accepts a nonblank
+title, optional summary and tags, and ordered blocks nested at most one level;
+summary, tags, and the block list may be empty. Unknown fields reject media
+references. The draft and all blocks are inserted in one transaction. The
+response is `201 Created`, contains the new ID, and sets `Location` to
+`/posts/{id}`. `GET /api/drafts` lists draft summaries by descending post ID;
+writers see only their own, while admins see all. A read account receives
+`403`. Draft summaries serialize `published_at` as `null`, and draft HTML omits
+the date element.
 
 `GET /` renders the newest full post and embeds its cursor when older posts
 exist. A small browser script uses `GET /api/posts` to discover one following
@@ -127,24 +143,24 @@ SQLite path, `JOURNEY_SITE_BIND` selects the website HTTP listener, and
 
 ## Accounts and sessions
 
-The schema adds `users`, `sessions`, and bounded `login_throttles` tables
-without changing post rows. Usernames are case-insensitive, and a partial
-unique index allows at most one owner. Readers can be disabled; owners cannot.
+The schema adds `users`, `sessions`, and bounded `login_throttles` tables.
+Usernames are case-insensitive. Account roles are `read`, `write`, and `admin`;
+any number of admins can exist and any account can be disabled.
 The CLI creates accounts and changes passwords through terminal input with
 echo disabled. A manifest can add accounts through its optional top-level
-`users` array; an omitted role defaults to reader, and passwords are hashed
+`users` array; an omitted role defaults to `read`, and passwords are hashed
 during import. Manifest password inputs remain plain text in the JSON file, so
 this path is intended for local fixtures. Importing is additive: an existing
 username's account and sessions are left untouched when the manifest is
 imported again. There is no self-registration or user-management HTTP API.
-Replacing imported posts only deletes from `posts`, so existing accounts and
-sessions survive imports.
+Import replaces every post, including HTTP-created drafts, while existing
+accounts and sessions survive imports.
 
 Passwords use Argon2id version 19 with 19 MiB memory, two iterations, and one
 lane. Session cookies contain 256 bits of random token material, while SQLite
 stores only its SHA-256 digest. Sessions have an absolute seven-day lifetime by
 default, configurable with `JOURNEY_SITE_SESSION_TTL_SECONDS`. Password changes
-and reader disabling delete that user's sessions. Login attempts are limited
+and account disabling delete that user's sessions. Login attempts are limited
 to five per username and 30 per client IP in a 15-minute window; old rows are
 pruned and the throttle table is capped at 10,000 entries.
 
@@ -158,11 +174,20 @@ SameSite=Strict. Authenticated content responses use `Cache-Control: private,
 no-store`.
 
 All existing content routes are behind one session middleware, including
-`HEAD` and ranged media requests. The post access value is shared by the post
-and media database lookups: readers receive published-only access and owners
-can include drafts. A future post-scoped link can map to published-only access
-without creating an account session or gaining draft access. Feeds, tags,
-archives, and sidebar data remain published-only for every account.
+`HEAD` and ranged media requests. Post and media lookups apply the same policy:
+read accounts receive published-only access, write accounts can also read
+their own drafts, and admins can read every draft. Writers can create or revoke
+share links for their own published posts; admins can manage links for any
+published post. Guest share links remain limited to published posts. Feeds,
+tags, archives, and sidebar data remain published-only for every account.
+Future edit and delete operations require the author to have `write`
+permission or the account to have `admin`; author credit alone gives a `read`
+account no write permission.
+
+The development site has no schema migration process. Incompatible database
+changes require recreating the SQLite database and running the destructive
+importer again. Startup rejects an outdated database with this rebuild
+instruction; legacy-row migrations are not part of the development workflow.
 
 The browser uses a server-rendered `GET`/`POST /login` form and `POST /logout`;
 the form works without JavaScript and reuses the JSON endpoints' credential,

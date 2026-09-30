@@ -1,8 +1,9 @@
 # Ephemeral post share links
 
-Share links provide guest access to one published post and its media. Owners
-can create and revoke a current link from a published post's share panel; the
-CLI also creates, lists, and revokes links.
+Share links provide guest access to one published post and its media. A `write`
+account can create and revoke links for its own published posts; an `admin` can
+manage links for any published post. The CLI also creates, lists, and revokes
+links.
 
 ## Stored credentials
 
@@ -38,17 +39,19 @@ The `journey-site share-links` commands manage the SQLite lifetime and links.
 Link listing contains public IDs, post IDs, expiry as epoch seconds and an ISO
 8601 UTC date-time, and revocation status; it never returns link secrets.
 
-## Owner sharing controls
+## Account sharing controls
 
-The share panel appears only for owners and only on published posts in feeds
-and full post pages. Opening the panel loads an owner-authenticated preview
-that uses the guest post renderer and the regular authenticated media routes;
-it does not create a share link or a guest session.
+The share panel appears only for write accounts viewing their own published
+posts and for admins viewing any published post. Opening the panel loads an
+authenticated preview that checks the same author or admin permission and
+uses the guest post renderer with regular authenticated media routes; it does
+not create a share link or a guest session.
 
 The panel creates a link only after an explicit copy action. Its URL and ID
 remain in client memory while the panel is open, and the URL is never shown as
 page text. Repeated copies reuse that link. Closing the panel or reloading the
 page discards it, so the next panel session creates a new link. Revocation
 applies to the current panel link; older links remain available through the
-CLI. Create and revoke endpoints require an owner session and a validated
-same-site request origin, and return private no-store responses.
+CLI. Create and revoke endpoints require the post's author with `write`
+permission or an `admin` session, plus a validated same-site request origin.
+They return private no-store responses.
