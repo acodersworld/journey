@@ -656,6 +656,7 @@ body.sidebar-modal-open {
 }
 
 .post-share-button,
+.post-publish-button,
 .share-copy-button,
 .share-revoke-button {
   padding: 0.38rem 0.75rem;
@@ -669,13 +670,31 @@ body.sidebar-modal-open {
 }
 
 .post-share-button:hover,
+.post-publish-button:hover,
 .share-copy-button:hover,
 .share-revoke-button:hover {
   border-color: #d2b17b;
   background: #2a2c26;
 }
 
-.share-dialog {
+.post-publish-area {
+  margin-top: 1rem;
+}
+
+.post-publish-button {
+  border-color: #d2b17b;
+  background: #d9bb8a;
+  color: #191a16;
+  font-weight: 650;
+}
+
+.post-publish-button:hover {
+  border-color: #f0d8b3;
+  background: #f0d8b3;
+}
+
+.share-dialog,
+.publish-dialog {
   position: fixed;
   width: min(94vw, 54rem);
   max-width: none;
@@ -689,17 +708,20 @@ body.sidebar-modal-open {
   box-shadow: 0 1.5rem 4rem rgb(0 0 0 / 45%);
 }
 
-.share-dialog::backdrop {
+.share-dialog::backdrop,
+.publish-dialog::backdrop {
   background: rgb(0 0 0 / 78%);
 }
 
-.share-dialog h2 {
+.share-dialog h2,
+.publish-dialog h2 {
   margin: 0 0 0.8rem;
   font-size: 1.35rem;
   font-weight: 580;
 }
 
-.share-dialog-close {
+.share-dialog-close,
+.publish-dialog-close {
   position: absolute;
   top: 0.45rem;
   right: 0.5rem;
@@ -714,9 +736,94 @@ body.sidebar-modal-open {
   cursor: pointer;
 }
 
-.share-dialog-close:hover {
+.share-dialog-close:hover,
+.publish-dialog-close:hover {
   border-color: #d2b17b;
   background: #2a2c26;
+}
+
+.publish-dialog {
+  width: min(92vw, 34rem);
+  padding: 2.6rem 1.5rem 1.5rem;
+}
+
+.publish-dialog form {
+  margin: 0;
+}
+
+.publish-override-toggle {
+  display: flex;
+  align-items: center;
+  gap: 0.6rem;
+  color: #d4d5cf;
+}
+
+.publish-override-toggle input {
+  accent-color: #d9bb8a;
+}
+
+.publish-time-override {
+  display: grid;
+  gap: 0.4rem;
+  margin-top: 1rem;
+}
+
+.publish-time-override[hidden] {
+  display: none;
+}
+
+.publish-time-override input {
+  width: 100%;
+  min-height: 2.8rem;
+  padding: 0.55rem 0.7rem;
+  border: 1px solid #65695f;
+  border-radius: 0.2rem;
+  background: #111311;
+  color: #f0efe9;
+  font: inherit;
+}
+
+.publish-confirmation {
+  min-height: 2.7rem;
+  margin: 1rem 0;
+  color: #c7c9c2;
+}
+
+.publish-error {
+  margin: 1rem 0;
+  padding: 0.7rem 0.8rem;
+  border-left: 3px solid #ce8f80;
+  background: #2b211f;
+  color: #f0c2b7;
+}
+
+.publish-dialog-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 0.7rem;
+}
+
+.publish-dialog-actions button {
+  min-height: 2.7rem;
+  padding: 0.45rem 0.8rem;
+  border: 1px solid #65695f;
+  border-radius: 0.2rem;
+  background: #20231f;
+  color: #f0efe9;
+  font: inherit;
+  cursor: pointer;
+}
+
+.publish-dialog-actions #publish-submit {
+  border-color: #d2b17b;
+  background: #d9bb8a;
+  color: #191a16;
+  font-weight: 650;
+}
+
+.publish-dialog-actions button:disabled {
+  cursor: wait;
+  opacity: 0.65;
 }
 
 .share-preview-actions {

@@ -1,3 +1,39 @@
+function syncBrowserTimezone() {
+  const timezone = Intl.DateTimeFormat().resolvedOptions().timeZone;
+  if (!timezone) return;
+  const readTimezone = () => {
+    const cookie = document.cookie.split(';').map(value => value.trim())
+      .find(value => value.startsWith('journey_timezone='));
+    if (!cookie) return null;
+    try {
+      return decodeURIComponent(cookie.slice('journey_timezone='.length));
+    } catch (_) {
+      return null;
+    }
+  };
+
+  if (readTimezone() !== timezone) {
+    document.cookie = `journey_timezone=${timezone}; Path=/; SameSite=Lax`;
+    if (readTimezone() === timezone) window.location.reload();
+  }
+
+  formatLocalTimes(document);
+}
+
+function formatLocalTimes(root) {
+  root.querySelectorAll('time[data-local-time][datetime]').forEach(element => {
+    const instant = new Date(element.dateTime);
+    if (!Number.isNaN(instant.getTime())) {
+      element.textContent = new Intl.DateTimeFormat(undefined, {
+        dateStyle: 'medium',
+        timeStyle: 'short',
+      }).format(instant);
+    }
+  });
+}
+
+syncBrowserTimezone();
+
 const sidebarLayout = document.querySelector('#site-layout');
 
 function redirectToLogin() {
@@ -73,6 +109,158 @@ if (createdConfirmation) {
   currentUrl.searchParams.delete('created');
   window.history.replaceState(window.history.state, '', currentUrl);
   window.setTimeout(() => createdConfirmation.remove(), 5000);
+}
+
+const publishDialog = document.querySelector('#publish-dialog');
+
+if (publishDialog) {
+  const closeButton = publishDialog.querySelector('.publish-dialog-close');
+  const cancelButton = document.querySelector('#publish-cancel');
+  const publishForm = document.querySelector('#publish-form');
+  const useTimeCheckbox = document.querySelector('#publish-use-time');
+  const overrideArea = document.querySelector('#publish-time-override');
+  const timeInput = document.querySelector('#publish-time');
+  const confirmation = document.querySelector('#publish-confirmation');
+  const errorMessage = document.querySelector('#publish-error');
+  const submitButton = document.querySelector('#publish-submit');
+  let activePublishButton = null;
+  let currentPostId = null;
+  let publishBusy = false;
+
+  function currentLocalMinute() {
+    const now = new Date();
+    return new Date(now.getTime() - now.getTimezoneOffset() * 60000)
+      .toISOString().slice(0, 16);
+  }
+
+  function clearPublishError() {
+    errorMessage.hidden = true;
+    errorMessage.textContent = '';
+  }
+
+  function updatePublishConfirmation() {
+    overrideArea.hidden = !useTimeCheckbox.checked;
+    timeInput.required = useTimeCheckbox.checked;
+    timeInput.removeAttribute('aria-invalid');
+    clearPublishError();
+
+    if (!useTimeCheckbox.checked) {
+      confirmation.textContent = 'The post will be published now using the server time.';
+      submitButton.textContent = 'Publish now';
+      return true;
+    }
+
+    const instant = new Date(timeInput.value);
+    if (!timeInput.value || Number.isNaN(instant.getTime())) {
+      confirmation.textContent = 'Choose a valid local date and time to continue.';
+      submitButton.textContent = 'Publish at this time';
+      return false;
+    }
+    confirmation.textContent = `The post will be published at ${new Intl.DateTimeFormat(undefined, {
+      dateStyle: 'full',
+      timeStyle: 'short',
+    }).format(instant)}.`;
+    submitButton.textContent = 'Publish at this time';
+    return true;
+  }
+
+  function setPublishBusy(busy) {
+    publishBusy = busy;
+    publishForm.querySelectorAll('input, button').forEach(control => {
+      control.disabled = busy;
+    });
+    closeButton.disabled = busy;
+    publishForm.setAttribute('aria-busy', String(busy));
+  }
+
+  document.addEventListener('click', event => {
+    if (!(event.target instanceof Element)) return;
+    const button = event.target.closest('[data-publish-post]');
+    if (!button) return;
+    activePublishButton = button;
+    currentPostId = button.dataset.publishPost;
+    publishForm.reset();
+    timeInput.value = currentLocalMinute();
+    clearPublishError();
+    updatePublishConfirmation();
+    publishDialog.showModal();
+    closeButton.focus({ preventScroll: true });
+  });
+
+  useTimeCheckbox.addEventListener('change', updatePublishConfirmation);
+  timeInput.addEventListener('input', updatePublishConfirmation);
+  cancelButton.addEventListener('click', () => publishDialog.close());
+  closeButton.addEventListener('click', () => publishDialog.close());
+  publishDialog.addEventListener('click', event => {
+    if (event.target === publishDialog && !publishBusy) publishDialog.close();
+  });
+
+  publishForm.addEventListener('submit', async event => {
+    event.preventDefault();
+    if (publishBusy || !currentPostId) return;
+    clearPublishError();
+    if (!updatePublishConfirmation()) {
+      timeInput.setAttribute('aria-invalid', 'true');
+      timeInput.focus();
+      return;
+    }
+
+    let payload = {};
+    if (useTimeCheckbox.checked) {
+      const instant = new Date(timeInput.value);
+      const publishedAt = Math.floor(instant.getTime() / 1000);
+      if (!Number.isSafeInteger(publishedAt)) {
+        timeInput.setAttribute('aria-invalid', 'true');
+        errorMessage.textContent = 'Choose a valid date and time.';
+        errorMessage.hidden = false;
+        timeInput.focus();
+        return;
+      }
+      payload = { published_at: publishedAt };
+    }
+
+    const postId = currentPostId;
+    setPublishBusy(true);
+    try {
+      const response = await fetch(`/api/posts/${encodeURIComponent(postId)}/publish`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+      });
+      if (response.status === 401) {
+        redirectToLogin();
+        return;
+      }
+      if (response.status === 204) {
+        window.location.assign(`/posts/${encodeURIComponent(postId)}`);
+        return;
+      }
+      if (response.status === 403) {
+        errorMessage.textContent = 'This account is not allowed to publish this post.';
+      } else if (response.status === 404) {
+        errorMessage.textContent = 'This draft is no longer available to publish.';
+      } else if (response.status === 409) {
+        errorMessage.textContent = 'This post has already been published.';
+      } else {
+        const returnedError = (await response.text()).trim();
+        errorMessage.textContent = returnedError || 'Could not publish this post. Try again.';
+      }
+      errorMessage.hidden = false;
+    } catch (_) {
+      errorMessage.textContent = 'Could not publish this post. Check your connection and try again.';
+      errorMessage.hidden = false;
+    } finally {
+      setPublishBusy(false);
+      if (publishDialog.open) submitButton.focus({ preventScroll: true });
+    }
+  });
+
+  publishDialog.addEventListener('close', () => {
+    currentPostId = null;
+    clearPublishError();
+    if (activePublishButton?.isConnected) activePublishButton.focus({ preventScroll: true });
+    activePublishButton = null;
+  });
 }
 
 const draftForm = document.querySelector('#draft-form');
@@ -532,6 +720,7 @@ if (feed) {
         const article = template.content.firstElementChild;
         if (!article || !article.matches('article.post')) throw new Error('Invalid post fragment');
         feed.append(article);
+        formatLocalTimes(article);
         nextCursor = typeof page.next_cursor === 'string' ? page.next_cursor : null;
       }
 

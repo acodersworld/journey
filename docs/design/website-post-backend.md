@@ -6,7 +6,7 @@
 ## Runtime data
 
 `journey-site` stores posts in SQLite. `posts` contains an auto-generated ID,
-required author reference, title, nullable ISO publication date, summary, a
+required author reference, title, nullable UTC Unix-second publication instant, summary, a
 published flag, and a JSON array of case-preserving string tags. The author is
 the account that created a draft or is credited by the manifest.
 `post_blocks` stores blocks with an auto-generated ID, parent ID, sibling
@@ -14,21 +14,23 @@ position, optional header and body, and optional media fields. A row with
 children is a group; groups can contain only one level of
 children and can also have their own text and media. The content type identifies
 image and video media. Imported posts are always published; HTTP-created posts
-are drafts until a future publish operation sets their publication date. All
+are drafts until their author or an admin publishes them. All
 post and media lookups require a session: `read` accounts can access published
 posts, `write` accounts can also access their own drafts, and `admin` accounts
 can access every draft. Feeds and navigation lists contain published posts
 only.
 
 Post and block IDs are regenerated on each full import. They remain stable for
-in-place edits. Feed ordering is publication date descending, then ID
+in-place edits. Feed ordering is publication instant descending, then ID
 descending. Blocks are ordered by zero-based position among siblings.
 
 ## Manifest import
 
 The JSON manifest is the editable source for this local workflow. Its top
 level contains `posts`; each post requires an `author` username, `title`,
-`published_at` (`YYYY-MM-DD`), `summary`, optional `tags`, and ordered `blocks`.
+`published_at` (an ISO 8601 timestamp with an explicit UTC offset or `Z`),
+`summary`, optional `tags`, and ordered `blocks`. The importer converts each
+timestamp to UTC Unix seconds before storing it.
 Each author must already exist or be added through the manifest's `users` array.
 Each block can have a plain text `header`, plain text `body`, a media `path`
 with optional `alt`, and nested
@@ -77,7 +79,7 @@ website.
 `GET /api/posts` returns `{ "posts": [...], "next_cursor": string | null }`
 with published summaries ordered by `published_at DESC, id DESC`. The default
 page size is 10 and the maximum is 100. Its optional `after` parameter contains
-the last post's `YYYY-MM-DD` publication date and ID separated by a colon. Its
+the last post's Unix-second publication instant and ID separated by a colon. Its
 optional `tag` parameter matches one stored tag exactly, including case. Both
 parameters apply to the same published-post keyset query. Malformed cursors
 return `400`. The database fetches one extra row to tell whether a following
@@ -95,6 +97,15 @@ writers see only their own, while admins see all. A read account receives
 `403`. Draft summaries serialize `published_at` as `null`, and draft HTML omits
 the date element.
 
+`POST /api/posts/{id}/publish` publishes an existing draft immediately. Its
+optional `published_at` integer selects a UTC Unix second; when omitted, the
+server's current second is used. The route applies the origin check and allows
+the draft's `write` author or an `admin`. Other posts and missing posts return
+`404`, already published posts return `409`, and a future timestamp or a post
+without any nonblank block header or body returns `400`. The content validation
+and state transition occur in one immediate SQLite transaction. Success is
+`204 No Content`.
+
 `GET /posts/new` serves the draft form to authenticated `write` and `admin`
 accounts. It accepts a title, optional summary and comma-separated tags, and
 ordered text blocks with optional headers and bodies. Root blocks and one
@@ -102,8 +113,9 @@ level of child blocks can be added, removed, and reordered in the browser; the
 submitted JSON preserves the visible sibling order and has no media fields.
 The form posts to `POST /api/posts`, prevents repeat submissions while the
 request is active, and keeps its contents visible on failure. On success it
-opens the new read-only draft page with a short creation confirmation. Drafts
-remain unavailable to readers and cannot yet be edited or published.
+opens the new read-only draft page with a short creation confirmation. The
+author and admins can publish from that detail page. The confirmation dialog
+uses server time by default or accepts a browser-local date and time override.
 
 `GET /` renders the newest full post and embeds its cursor when older posts
 exist. A small browser script uses `GET /api/posts` to discover one following
@@ -112,7 +124,17 @@ post ID at a time, then fetches its server-rendered HTML from
 loading and retry. Tag feeds at `/tags?tag=...` use that same renderer and
 pagination path, passing the selected tag through every API request. Post tags
 link to their exact-case filtered feed. `/archive/{YYYY-MM}` lists published
-post titles, dates, and summaries for the selected month.
+post titles, publication times, and summaries for the selected month. Every
+publication `<time>` has a UTC ISO 8601 `datetime` value and readable UTC
+fallback text; the browser formats it in local time.
+
+A JavaScript-readable `journey_timezone` cookie stores the browser's IANA time
+zone with `Path=/` and `SameSite=Lax`. Invalid or absent values use UTC. On a
+first visit, or after the browser's zone changes, the script writes and reads
+back the cookie before reloading; blocked cookies therefore do not cause a
+reload loop. The server derives archive month membership in that zone, using
+the local start of a month and the local start of the next month as a
+half-open UTC interval. Feed ordering remains by absolute publication instant.
 
 Every signed-in HTML page shares a server-rendered navigation sidebar. It
 lists drafts near the top for writers and admins: writers see their own, while
@@ -120,7 +142,8 @@ admins see all, ordered newest first with five initially visible. Readers do
 not see a Drafts section. Each draft links to its read-only page. The sidebar
 also lists the five newest published posts, distinct published archive months
 in descending order, and distinct published tags in case-insensitive
-alphabetical order while preserving their stored spelling. The archive list
+alphabetical order while preserving their stored spelling. Archive months are
+derived in the selected browser time zone. The archive list
 starts with six months and the tag list with twelve entries; browser controls
 reveal the rest. A fixed **+ New post** link appears on signed-in pages for
 writers and admins except on the creation page itself; its stacking order
@@ -149,7 +172,7 @@ HTML text and attributes are escaped. Image and video blocks use site media
 URLs that identify a post and block ID, never a storage key. The backend
 confirms the block belongs to an accessible post and is media before asking
 storage for it. It streams response bodies and forwards single byte ranges for
-video. Image ranges are ignored. There are no editing routes in this slice.
+video. Image ranges are ignored. Post editing routes are not implemented.
 
 The `journey-site import` and `journey-site db` commands provide explicit
 imports and read-only database inspection. `JOURNEY_SITE_DB` selects the
@@ -201,8 +224,9 @@ account no write permission.
 
 The development site has no schema migration process. Incompatible database
 changes require recreating the SQLite database and running the destructive
-importer again. Startup rejects an outdated database with this rebuild
-instruction; legacy-row migrations are not part of the development workflow.
+importer again. Startup rejects an outdated database, including a date-text
+`published_at` column, with this rebuild instruction; legacy-row migrations are
+not part of the development workflow.
 
 The browser uses a server-rendered `GET`/`POST /login` form and `POST /logout`;
 the form works without JavaScript and reuses the JSON endpoints' credential,

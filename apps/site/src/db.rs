@@ -8,7 +8,7 @@ CREATE TABLE IF NOT EXISTS posts (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     author_id INTEGER NOT NULL REFERENCES users(id),
     title TEXT NOT NULL CHECK (length(trim(title)) > 0),
-    published_at TEXT,
+    published_at INTEGER,
     summary TEXT NOT NULL,
     published INTEGER NOT NULL DEFAULT 1 CHECK (published IN (0, 1)),
     tags TEXT NOT NULL DEFAULT '[]' CHECK (json_valid(tags) AND json_type(tags) = 'array'),
@@ -91,7 +91,7 @@ CREATE TABLE IF NOT EXISTS login_throttles (
 );
 ";
 
-const CURRENT_SCHEMA_VERSION: i64 = 5;
+const CURRENT_SCHEMA_VERSION: i64 = 6;
 const REBUILD_DATABASE_MESSAGE: &str = "site database schema is outdated; recreate the SQLite database and run the destructive importer again";
 
 const SHARE_SCHEMA: &str = "\
@@ -221,7 +221,7 @@ pub enum ShareAccess {
 pub struct PostSummary {
     pub id: i64,
     pub title: String,
-    pub published_at: Option<String>,
+    pub published_at: Option<i64>,
     pub summary: String,
 }
 
@@ -241,8 +241,18 @@ pub struct SidebarData {
 
 #[derive(Clone, Debug)]
 pub struct FeedCursor {
-    pub published_at: String,
+    pub published_at: i64,
     pub id: i64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PublishPostResult {
+    Published,
+    NotFound,
+    AlreadyPublished,
+    MissingText,
+    FutureTimestamp,
+    InvalidTimestamp,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -276,7 +286,7 @@ pub struct Post {
 pub struct NewPost {
     pub author_username: String,
     pub title: String,
-    pub published_at: Option<String>,
+    pub published_at: Option<i64>,
     pub summary: String,
     pub tags: Vec<String>,
     pub blocks: Vec<NewBlock>,
@@ -319,7 +329,7 @@ impl Database {
     }
 
     pub async fn initialize(&self) -> Result<(), String> {
-        let (user_version, has_site_tables) = self.run(|connection| {
+        let (user_version, has_site_tables, published_at_type) = self.run(|connection| {
             let version = connection.pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))?;
             let has_site_tables = table_exists(connection, "posts")?
                 || table_exists(connection, "post_blocks")?
@@ -329,8 +339,20 @@ impl Database {
                 || table_exists(connection, "share_links")?
                 || table_exists(connection, "share_sessions")?
                 || table_exists(connection, "site_settings")?;
-            Ok((version, has_site_tables))
+            let published_at_type = if table_exists(connection, "posts")? {
+                connection.query_row(
+                    "SELECT type FROM pragma_table_info('posts') WHERE name = 'published_at'",
+                    [],
+                    |row| row.get::<_, String>(0),
+                ).optional()?
+            } else {
+                None
+            };
+            Ok((version, has_site_tables, published_at_type))
         }).await?;
+        if published_at_type.is_some_and(|column_type| !column_type.eq_ignore_ascii_case("INTEGER")) {
+            return Err(REBUILD_DATABASE_MESSAGE.to_owned());
+        }
         if (user_version != 0 && user_version != CURRENT_SCHEMA_VERSION)
             || (user_version == 0 && has_site_tables)
         {
@@ -907,7 +929,7 @@ impl Database {
         tag: Option<String>,
     ) -> Result<FeedPage, String> {
         self.run(move |connection| {
-            let after_date = after.as_ref().map(|cursor| cursor.published_at.as_str());
+            let after_date = after.as_ref().map(|cursor| cursor.published_at);
             let after_id = after.as_ref().map(|cursor| cursor.id);
             let mut statement = connection.prepare(
                 "SELECT id, title, published_at, summary FROM posts \
@@ -940,8 +962,8 @@ impl Database {
         .await
     }
 
-    pub async fn sidebar_data(&self) -> Result<SidebarData, String> {
-        self.run(|connection| {
+    pub async fn sidebar_data(&self, timezone: String) -> Result<SidebarData, String> {
+        self.run(move |connection| {
             let recent_posts = {
                 let mut statement = connection.prepare(
                     "SELECT id, title, published_at, summary FROM posts \
@@ -952,11 +974,19 @@ impl Database {
             };
             let archive_months = {
                 let mut statement = connection.prepare(
-                    "SELECT DISTINCT substr(published_at, 1, 7) FROM posts \
-                     WHERE published = 1 ORDER BY substr(published_at, 1, 7) DESC",
+                    "SELECT published_at FROM posts WHERE published = 1 ORDER BY published_at DESC, id DESC",
                 )?;
-                let rows = statement.query_map([], |row| row.get(0))?;
-                rows.collect::<rusqlite::Result<Vec<_>>>()?
+                let rows = statement.query_map([], |row| row.get::<_, i64>(0))?;
+                let mut months = std::collections::BTreeSet::new();
+                for row in rows {
+                    let timestamp = jiff::Timestamp::from_second(row?)
+                        .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?;
+                    let zoned = timestamp.in_tz(timezone.as_str())
+                        .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?;
+                    let date = zoned.datetime().date();
+                    months.insert(format!("{:04}-{:02}", date.year(), date.month()));
+                }
+                months.into_iter().rev().collect::<Vec<_>>()
             };
             let tags = {
                 let mut statement = connection.prepare(
@@ -974,17 +1004,84 @@ impl Database {
         .await
     }
 
-    pub async fn posts_for_month(&self, month: String) -> Result<Vec<PostSummary>, String> {
+    pub async fn posts_for_month(&self, month: String, timezone: String) -> Result<Vec<PostSummary>, String> {
+        let (start, end) = local_month_bounds(&month, &timezone).map_err(|error| error.to_string())?;
         self.run(move |connection| {
             let mut statement = connection.prepare(
                 "SELECT id, title, published_at, summary FROM posts \
-                 WHERE published = 1 AND substr(published_at, 1, 7) = ?1 \
+                 WHERE published = 1 AND published_at >= ?1 AND published_at < ?2 \
                  ORDER BY published_at DESC, id DESC",
             )?;
-            let rows = statement.query_map([month], post_summary_from_row)?;
+            let rows = statement.query_map(params![start, end], post_summary_from_row)?;
             rows.collect()
         })
         .await
+    }
+
+    pub async fn publish_draft(
+        &self,
+        id: i64,
+        author_username: String,
+        is_admin: bool,
+        requested_published_at: Option<i64>,
+    ) -> Result<PublishPostResult, String> {
+        self.initialize().await?;
+        self.run(move |connection| {
+            let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let post = transaction.query_row(
+                "SELECT p.published, u.username FROM posts AS p \
+                 JOIN users AS u ON u.id = p.author_id WHERE p.id = ?1",
+                [id],
+                |row| Ok((row.get::<_, bool>(0)?, row.get::<_, String>(1)?)),
+            ).optional()?;
+            let Some((published, owner)) = post else {
+                return Ok(PublishPostResult::NotFound);
+            };
+            if !is_admin && !owner.eq_ignore_ascii_case(&author_username) {
+                return Ok(PublishPostResult::NotFound);
+            }
+            if published {
+                return Ok(PublishPostResult::AlreadyPublished);
+            }
+            let now = unix_seconds(unix_time());
+            if requested_published_at.is_some_and(|published_at| published_at > now) {
+                return Ok(PublishPostResult::FutureTimestamp);
+            }
+            if requested_published_at.is_some_and(|published_at| {
+                jiff::Timestamp::from_second(published_at).is_err()
+            }) {
+                return Ok(PublishPostResult::InvalidTimestamp);
+            }
+            let has_text = {
+                let mut statement = transaction.prepare(
+                    "SELECT header, body FROM post_blocks WHERE post_id = ?1",
+                )?;
+                let rows = statement.query_map([id], |row| {
+                    Ok((row.get::<_, Option<String>>(0)?, row.get::<_, Option<String>>(1)?))
+                })?;
+                let mut has_text = false;
+                for row in rows {
+                    let (header, body) = row?;
+                    if header.as_deref().is_some_and(|value| !value.trim().is_empty())
+                        || body.as_deref().is_some_and(|value| !value.trim().is_empty())
+                    {
+                        has_text = true;
+                        break;
+                    }
+                }
+                has_text
+            };
+            if !has_text {
+                return Ok(PublishPostResult::MissingText);
+            }
+            let published_at = requested_published_at.unwrap_or(now);
+            transaction.execute(
+                "UPDATE posts SET published = 1, published_at = ?1 WHERE id = ?2 AND published = 0",
+                params![published_at, id],
+            )?;
+            transaction.commit()?;
+            Ok(PublishPostResult::Published)
+        }).await
     }
 
     pub async fn all_summaries(&self) -> Result<Vec<PostSummary>, String> {
@@ -1151,6 +1248,45 @@ fn initialize_schema(connection: &mut Connection) -> rusqlite::Result<()> {
     transaction.execute_batch(SHARE_SCHEMA)?;
     transaction.pragma_update(None, "user_version", CURRENT_SCHEMA_VERSION)?;
     transaction.commit()
+}
+
+fn local_month_bounds(month: &str, timezone: &str) -> Result<(i64, i64), String> {
+    if month.len() != 7
+        || month.as_bytes()[4] != b'-'
+        || !month.as_bytes().iter().enumerate().all(|(index, byte)| {
+            index == 4 || byte.is_ascii_digit()
+        })
+    {
+        return Err("invalid archive month".to_owned());
+    }
+    let year = month[..4]
+        .parse::<i16>()
+        .map_err(|error| error.to_string())?;
+    let month_number = month[5..]
+        .parse::<i8>()
+        .map_err(|error| error.to_string())?;
+    let start_date = jiff::civil::Date::new(year, month_number, 1)
+        .map_err(|error| error.to_string())?;
+    let (next_year, next_month) = if month_number == 12 {
+        (year + 1, 1)
+    } else {
+        (year, month_number + 1)
+    };
+    let end_date = jiff::civil::Date::new(next_year, next_month, 1)
+        .map_err(|error| error.to_string())?;
+    let start = start_date
+        .at(0, 0, 0, 0)
+        .in_tz(timezone)
+        .map_err(|error| error.to_string())?
+        .timestamp()
+        .as_second();
+    let end = end_date
+        .at(0, 0, 0, 0)
+        .in_tz(timezone)
+        .map_err(|error| error.to_string())?
+        .timestamp()
+        .as_second();
+    Ok((start, end))
 }
 
 fn load_post(
@@ -1343,7 +1479,12 @@ mod tests {
         NewPost {
             author_username: "test-author".to_owned(),
             title: title.to_owned(),
-            published_at: Some(published_at.to_owned()),
+            published_at: Some(
+                format!("{published_at}T12:00:00Z")
+                    .parse::<jiff::Timestamp>()
+                    .unwrap()
+                    .as_second(),
+            ),
             summary: format!("Summary for {title}"),
             tags: Vec::new(),
             blocks: Vec::new(),
@@ -1366,13 +1507,18 @@ mod tests {
             first.posts.iter().map(|post| post.id).collect::<Vec<_>>(),
             vec![8, 7, 6, 5, 4, 3, 2, 1, 12, 11]
         );
-        assert_eq!(first.next_cursor.as_deref(), Some("2026-03-31:11"));
+        let older_timestamp = "2026-03-31T12:00:00Z"
+            .parse::<jiff::Timestamp>()
+            .unwrap()
+            .as_second();
+        let expected_cursor = format!("{older_timestamp}:11");
+        assert_eq!(first.next_cursor.as_deref(), Some(expected_cursor.as_str()));
 
         let second = database
             .feed(
                 10,
                 Some(super::FeedCursor {
-                    published_at: "2026-03-31".to_owned(),
+                    published_at: older_timestamp,
                     id: 11,
                 }),
             )
@@ -1532,7 +1678,7 @@ mod tests {
         let connection = Connection::open(&path).unwrap();
         connection.execute_batch("PRAGMA foreign_keys = ON;").unwrap();
         connection.execute(
-            "INSERT INTO posts (author_id, title, published_at, summary) VALUES (1, 'Post', '2026-01-01', 'Summary')",
+            "INSERT INTO posts (author_id, title, published_at, summary) VALUES (1, 'Post', 1767225600, 'Summary')",
             [],
         ).unwrap();
         connection.execute(
@@ -1728,7 +1874,7 @@ mod tests {
         connection
             .execute(
                 "INSERT INTO posts (author_id, title, published_at, summary, published, tags) \
-                 VALUES ((SELECT id FROM users WHERE username = 'writer-one'), 'Published', '2026-01-01', 'Summary', 1, '[]')",
+                 VALUES ((SELECT id FROM users WHERE username = 'writer-one'), 'Published', 1767225600, 'Summary', 1, '[]')",
                 [],
             )
             .unwrap();

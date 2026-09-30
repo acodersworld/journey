@@ -53,7 +53,7 @@ Create a manifest next to its local media files, for example:
     {
       "author": "alice",
       "title": "A first journey",
-      "published_at": "2026-09-27",
+      "published_at": "2026-09-27T12:00:00Z",
       "summary": "Notes from the road.",
       "tags": ["coast", "weekend"],
       "blocks": [
@@ -149,8 +149,12 @@ may be empty. Blocks support one child level, and media fields are rejected.
 The draft author is always the signed-in account. The response is `201 Created`
 with its ID and a `Location: /posts/{id}` header. `GET /api/drafts` lists a
 write account's drafts by newest ID first; admins receive all drafts. The
-response's `published_at` is `null` until a future publish operation sets it,
-and draft pages omit the publication date.
+response's `published_at` is `null` for a draft. On the draft detail page, its
+author or an admin can publish immediately or choose a past local date and
+time. `POST /api/posts/{id}/publish` accepts an optional UTC Unix-second
+`published_at`; without it, the server's current second is used. Publication
+times are returned as integer seconds. The browser formats them in local time,
+and archive month membership follows the browser's IANA time zone.
 
 This development site has no schema migration process. After an incompatible
 site database change, recreate the SQLite database and run the destructive

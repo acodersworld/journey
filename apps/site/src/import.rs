@@ -65,7 +65,7 @@ struct MediaAsset {
 struct PreparedPost {
     author_username: String,
     title: String,
-    published_at: String,
+    published_at: i64,
     summary: String,
     tags: Vec<String>,
     blocks: Vec<PreparedBlock>,
@@ -119,7 +119,7 @@ pub async fn prepare_manifest(manifest_path: &Path) -> AppResult<PreparedImport>
     let mut assets = BTreeMap::<PathBuf, MediaAsset>::new();
     let mut posts = Vec::with_capacity(manifest.posts.len());
     for post in manifest.posts {
-        validate_post(&post)?;
+        let published_at = validate_post(&post)?;
         let mut blocks = Vec::with_capacity(post.blocks.len());
         for mut block in post.blocks {
             let mut children = Vec::with_capacity(block.blocks.len());
@@ -137,7 +137,7 @@ pub async fn prepare_manifest(manifest_path: &Path) -> AppResult<PreparedImport>
         posts.push(PreparedPost {
             author_username: post.author,
             title: post.title,
-            published_at: post.published_at,
+            published_at,
             summary: post.summary,
             tags: post.tags,
             blocks,
@@ -178,19 +178,40 @@ pub async fn apply_import<S: StorageClient>(
     Ok(())
 }
 
-fn validate_post(post: &ManifestPost) -> AppResult<()> {
+fn validate_post(post: &ManifestPost) -> AppResult<i64> {
     auth::validate_username(&post.author)?;
     if post.title.trim().is_empty() {
         return Err("post title must not be empty".into());
     }
-    validate_publication_date(&post.published_at)?;
+    let published_at = parse_publication_timestamp(&post.published_at)?;
     for block in &post.blocks {
         validate_block(block, false)?;
         for child in &block.blocks {
             validate_block(child, true)?;
         }
     }
-    Ok(())
+    Ok(published_at)
+}
+
+fn parse_publication_timestamp(value: &str) -> AppResult<i64> {
+    let has_explicit_offset = value.ends_with('Z')
+        || value.ends_with('z')
+        || value.rfind(|character| matches!(character, '+' | '-')).is_some_and(|offset_start| {
+            offset_start > 10
+                && matches!(value.len() - offset_start, 3 | 5 | 6)
+                && value[offset_start + 1..]
+                    .bytes()
+                    .enumerate()
+                    .all(|(index, byte)| index == 2 && value.len() - offset_start == 6
+                        || byte.is_ascii_digit())
+        });
+    if !value.contains('T') || !has_explicit_offset {
+        return Err("published_at must be an ISO 8601 timestamp with an explicit offset or Z".into());
+    }
+    let timestamp = value
+        .parse::<jiff::Timestamp>()
+        .map_err(|error| format!("published_at is not a valid ISO 8601 timestamp: {error}"))?;
+    Ok(timestamp.as_second())
 }
 
 fn validate_block(block: &ManifestBlock, nested: bool) -> AppResult<()> {
@@ -242,34 +263,6 @@ async fn prepare_media(
         content_type,
         alt,
     }))
-}
-
-fn validate_publication_date(value: &str) -> AppResult<()> {
-    let bytes = value.as_bytes();
-    if bytes.len() != 10
-        || bytes[4] != b'-'
-        || bytes[7] != b'-'
-        || !bytes
-            .iter()
-            .enumerate()
-            .all(|(index, byte)| matches!(index, 4 | 7) || byte.is_ascii_digit())
-    {
-        return Err(format!("publication date must use YYYY-MM-DD: {value:?}").into());
-    }
-    let year = value[0..4].parse::<u32>()?;
-    let month = value[5..7].parse::<u32>()?;
-    let day = value[8..10].parse::<u32>()?;
-    let month_days = match month {
-        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
-        4 | 6 | 9 | 11 => 30,
-        2 if year % 4 == 0 && (year % 100 != 0 || year % 400 == 0) => 29,
-        2 => 28,
-        _ => return Err(format!("invalid publication date: {value:?}").into()),
-    };
-    if day == 0 || day > month_days {
-        return Err(format!("invalid publication date: {value:?}").into());
-    }
-    Ok(())
 }
 
 async fn validate_media_path(
@@ -457,7 +450,7 @@ mod tests {
             "posts": [{
                 "author": "user",
                 "title": "Imported post",
-                "published_at": "2026-01-02",
+                "published_at": "2026-01-02T12:00:00Z",
                 "summary": "Imported summary",
                 "tags": ["Import test", "CASE-sensitive"],
                 "blocks": blocks
@@ -474,7 +467,7 @@ mod tests {
             .replace_posts(vec![NewPost {
                 author_username: "test-author".to_owned(),
                 title: "Previous post".to_owned(),
-                published_at: Some("2025-12-31".to_owned()),
+                published_at: Some("2025-12-31T12:00:00Z".parse::<jiff::Timestamp>().unwrap().as_second()),
                 summary: "Still available after a failed import".to_owned(),
                 tags: Vec::new(),
                 blocks: Vec::new(),
@@ -506,7 +499,7 @@ mod tests {
             "posts": [{
                 "author": "user",
                 "title": "Nested post",
-                "published_at": "2026-01-02",
+                "published_at": "2026-01-02T12:00:00Z",
                 "summary": "Nested summary",
                 "blocks": [{
                     "header": "Group",

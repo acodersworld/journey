@@ -304,17 +304,15 @@ operations to public browsers.
 The local site now has a SQLite-backed post backend, a server-rendered scrolling
 feed, a sidebar, and `read`, `write`, and `admin` sessions with a browser
 sign-in form. Every post and media request requires a session. Writers can
-create drafts and read their own drafts; admins can read every draft. The next
+create and publish their own text drafts; admins can manage any draft. The next
 work is ordered as follows:
 
-1. **Text drafting UI.** Add the browser workflow for text-only draft creation
-   and draft listing on top of the current backend endpoints.
-2. **Post editing and publishing backend.** Add author-scoped edits and deletes,
-   media uploads and references, and publish/unpublish operations. A post's
-   author needs `write` permission; admins can manage every post.
-3. **Video thumbnail previews.** Generate or store preview images and show
+1. **Post editing and media management.** Add author-scoped edits and deletes,
+   media uploads and references, and any needed unpublishing operation. A
+   post's author needs `write` permission; admins can manage every post.
+2. **Video thumbnail previews.** Generate or store preview images and show
    them on gallery tiles; videos remain playable without previews meanwhile.
-4. **Automatic gallery slideshow.** Add optional timed advance to the existing
+3. **Automatic gallery slideshow.** Add optional timed advance to the existing
    manual slideshow, with pause controls and sensible video behavior.
 
 Temporary links granting access to one published post remain future work;

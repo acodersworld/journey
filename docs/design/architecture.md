@@ -10,8 +10,8 @@ The current local website differs from parts of this exploratory draft: every
 post and media request requires an account session, published posts are visible
 to signed-in `read`, `write`, and `admin` accounts, `write` accounts can read
 their own drafts, and admins can read every draft. It supports text-only draft
-creation but has no editing or publishing routes. Its server-rendered sign-in
-page, feed, and sidebar are described in the
+creation and author/admin publishing, but no post editing routes. Its
+server-rendered sign-in page, feed, and sidebar are described in the
 [implemented website design](website-post-backend.md). References below to a
 public post feed or public-media cache describe earlier or possible future
 architecture, not anonymous access in the current site. The media cache and

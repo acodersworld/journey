@@ -44,6 +44,7 @@ struct ParsedOrigin {
 struct AuthPrincipal {
     username: String,
     role: AccountRole,
+    timezone: String,
 }
 
 #[derive(Deserialize)]
@@ -122,6 +123,13 @@ struct CreatedPostResponse {
     id: i64,
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PublishPostRequest {
+    #[serde(default)]
+    published_at: Option<i64>,
+}
+
 impl SiteSecurity {
     pub fn from_env(bind_address: SocketAddr, allow_insecure_cookies: bool) -> Result<Self, String> {
         if allow_insecure_cookies && !bind_address.ip().is_loopback() {
@@ -187,6 +195,7 @@ pub fn router<S: StorageClient>(state: AppState<S>) -> Router {
         .route("/api/posts", get(feed::<S>).post(create_draft::<S>))
         .route("/api/drafts", get(drafts::<S>))
         .route("/api/posts/{id}", get(api_full_post::<S>))
+        .route("/api/posts/{id}/publish", post(publish_post::<S>))
         .route("/api/posts/{id}/share-links", post(create_share_link::<S>))
         .route("/api/share-links/{id}", delete(revoke_share_link::<S>))
         .route("/posts/{id}/fragment", get(post_fragment::<S>))
@@ -233,7 +242,9 @@ async fn authenticate<S: StorageClient>(
             return no_store(StatusCode::INTERNAL_SERVER_ERROR.into_response());
         }
     };
-    request.extensions_mut().insert(AuthPrincipal::from(account));
+    let mut principal = AuthPrincipal::from(account);
+    principal.timezone = timezone_from_cookie(request.headers());
+    request.extensions_mut().insert(principal);
     no_store(next.run(request).await)
 }
 
@@ -841,6 +852,7 @@ impl From<AuthenticatedAccount> for AuthPrincipal {
         Self {
             username: account.username,
             role: account.role,
+            timezone: "UTC".to_owned(),
         }
     }
 }
@@ -860,6 +872,25 @@ impl AuthPrincipal {
             AccountRole::Write => Some(ShareAccess::Author(self.username.clone())),
             AccountRole::Admin => Some(ShareAccess::Admin),
         }
+    }
+}
+
+fn timezone_from_cookie(headers: &HeaderMap) -> String {
+    let timezone = headers
+        .get(header::COOKIE)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|cookies| {
+            cookies
+                .split(';')
+                .find_map(|cookie| cookie.trim().strip_prefix("journey_timezone="))
+        });
+    let Some(timezone) = timezone else {
+        return "UTC".to_owned();
+    };
+    if jiff::tz::TimeZone::get(timezone).is_ok() {
+        timezone.to_owned()
+    } else {
+        "UTC".to_owned()
     }
 }
 
@@ -993,7 +1024,7 @@ async fn sidebar_data_for_principal(
     database: &Database,
     principal: &AuthPrincipal,
 ) -> Result<SidebarData, String> {
-    let mut sidebar = database.sidebar_data().await?;
+    let mut sidebar = database.sidebar_data(principal.timezone.clone()).await?;
     sidebar.drafts = match principal.role {
         AccountRole::Read => None,
         AccountRole::Write => Some(database.drafts(Some(principal.username.clone())).await?),
@@ -1072,6 +1103,57 @@ fn create_draft_block(block: CreateDraftBlock) -> NewBlock {
         content_type: None,
         alt: None,
         children: block.blocks.into_iter().map(create_draft_block).collect(),
+    }
+}
+
+async fn publish_post<S: StorageClient>(
+    State(state): State<AppState<S>>,
+    Path(id): Path<i64>,
+    Extension(principal): Extension<AuthPrincipal>,
+    headers: HeaderMap,
+    Json(request): Json<PublishPostRequest>,
+) -> Response {
+    if !matches!(principal.role, AccountRole::Write | AccountRole::Admin) {
+        return no_store(StatusCode::FORBIDDEN.into_response());
+    }
+    if !origin_allowed(&headers, &state.security) {
+        return no_store((StatusCode::FORBIDDEN, "origin not allowed\n").into_response());
+    }
+    match state
+        .database
+        .publish_draft(
+            id,
+            principal.username,
+            principal.role == AccountRole::Admin,
+            request.published_at,
+        )
+        .await
+    {
+        Ok(crate::db::PublishPostResult::Published) => {
+            no_store(StatusCode::NO_CONTENT.into_response())
+        }
+        Ok(crate::db::PublishPostResult::NotFound) => {
+            no_store(StatusCode::NOT_FOUND.into_response())
+        }
+        Ok(crate::db::PublishPostResult::AlreadyPublished) => {
+            no_store(StatusCode::CONFLICT.into_response())
+        }
+        Ok(crate::db::PublishPostResult::MissingText) => no_store((
+            StatusCode::BAD_REQUEST,
+            "a post needs a text block with a nonblank header or body before it can be published\n",
+        ).into_response()),
+        Ok(crate::db::PublishPostResult::FutureTimestamp) => no_store((
+            StatusCode::BAD_REQUEST,
+            "published_at must not be later than the server's current second\n",
+        ).into_response()),
+        Ok(crate::db::PublishPostResult::InvalidTimestamp) => no_store((
+            StatusCode::BAD_REQUEST,
+            "published_at is outside the supported timestamp range\n",
+        ).into_response()),
+        Err(error) => {
+            eprintln!("website post publishing failed: {error}");
+            no_store(StatusCode::INTERNAL_SERVER_ERROR.into_response())
+        }
     }
 }
 
@@ -1171,7 +1253,7 @@ async fn archive_page<S: StorageClient>(
     if !valid_archive_month(&month) {
         return StatusCode::NOT_FOUND.into_response();
     }
-    let posts = match state.database.posts_for_month(month.clone()).await {
+    let posts = match state.database.posts_for_month(month.clone(), principal.timezone.clone()).await {
         Ok(posts) => posts,
         Err(error) => {
             eprintln!("website archive query failed: {error}");
@@ -1274,7 +1356,8 @@ async fn site_js() -> impl IntoResponse {
 
 fn parse_cursor(value: &str) -> Option<FeedCursor> {
     let (published_at, encoded_id) = value.split_once(':')?;
-    if !valid_publication_date(published_at) {
+    let parsed_published_at = published_at.parse::<i64>().ok()?;
+    if parsed_published_at.to_string() != published_at {
         return None;
     }
     let id = encoded_id.parse::<i64>().ok()?;
@@ -1282,37 +1365,9 @@ fn parse_cursor(value: &str) -> Option<FeedCursor> {
         return None;
     }
     Some(FeedCursor {
-        published_at: published_at.to_owned(),
+        published_at: parsed_published_at,
         id,
     })
-}
-
-fn valid_publication_date(value: &str) -> bool {
-    let bytes = value.as_bytes();
-    if bytes.len() != 10
-        || bytes[4] != b'-'
-        || bytes[7] != b'-'
-        || !bytes
-            .iter()
-            .enumerate()
-            .all(|(index, byte)| matches!(index, 4 | 7) || byte.is_ascii_digit())
-    {
-        return false;
-    }
-    let year = value[0..4].parse::<u32>().ok();
-    let month = value[5..7].parse::<u32>().ok();
-    let day = value[8..10].parse::<u32>().ok();
-    let (Some(year), Some(month), Some(day)) = (year, month, day) else {
-        return false;
-    };
-    let month_days = match month {
-        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
-        4 | 6 | 9 | 11 => 30,
-        2 if year % 4 == 0 && (year % 100 != 0 || year % 400 == 0) => 29,
-        2 => 28,
-        _ => return false,
-    };
-    day > 0 && day <= month_days
 }
 
 fn valid_archive_month(value: &str) -> bool {
@@ -1339,8 +1394,19 @@ fn render_full_post(
     } else {
         ""
     };
+    let publish_control = if !post.published
+        && matches!(role, AccountRole::Write | AccountRole::Admin)
+        && (role == AccountRole::Admin || post.author_username.eq_ignore_ascii_case(username))
+    {
+        format!(
+            "<div class=\"post-publish-area\"><button class=\"post-publish-button\" type=\"button\" data-publish-post=\"{}\" aria-haspopup=\"dialog\" aria-controls=\"publish-dialog\">Publish</button></div>",
+            post.summary.id,
+        )
+    } else {
+        String::new()
+    };
     let content = format!(
-        "<main class=\"site site-post\"><p class=\"back-link\"><a href=\"/\">All posts</a></p>{confirmation}{}</main>",
+        "<main class=\"site site-post\"><p class=\"back-link\"><a href=\"/\">All posts</a></p>{confirmation}{}{publish_control}</main>",
         render_post(post, true, share_access.is_some_and(|access| can_share_post(post, access))),
     );
     render_site_page(&post.summary.title, sidebar, &content, true, username, role, true)
@@ -1439,7 +1505,7 @@ fn render_new_post_page(sidebar: &SidebarData, username: &str, role: AccountRole
         "<div class=\"draft-field\"><label for=\"draft-tags\">Tags <span class=\"draft-optional\">Optional</span></label><input id=\"draft-tags\" name=\"tags\" type=\"text\" autocomplete=\"off\" aria-describedby=\"draft-tags-help\"><p class=\"draft-field-help\" id=\"draft-tags-help\">Separate tags with commas.</p></div>",
         "<section class=\"draft-block-editor\" aria-labelledby=\"draft-blocks-heading\"><div class=\"draft-block-heading\"><div><h2 id=\"draft-blocks-heading\">Text blocks</h2><p>Arrange blocks and one level of child blocks in the order you want them to appear.</p></div><button class=\"draft-secondary-button\" type=\"button\" data-block-action=\"add-root\">Add text block</button></div><div class=\"draft-root-blocks\" id=\"draft-root-blocks\" data-block-list=\"root\"></div></section>",
         "<p class=\"draft-form-error\" id=\"draft-form-error\" role=\"alert\" hidden></p>",
-        "<div class=\"draft-submit-area\"><p>Saved drafts can currently be viewed, but they cannot yet be edited or published.</p><button class=\"draft-submit-button\" id=\"draft-submit\" type=\"submit\">Create draft</button></div>",
+        "<div class=\"draft-submit-area\"><p>Saved drafts can be opened from the sidebar and published from their post page.</p><button class=\"draft-submit-button\" id=\"draft-submit\" type=\"submit\">Create draft</button></div>",
         "</form></main>",
     );
     render_site_page("Create a draft", sidebar, content, false, username, role, false)
@@ -1474,7 +1540,7 @@ fn render_archive(
         content.push_str("<p class=\"empty-feed\">No published posts in this month.</p>");
     } else {
         for post in posts {
-            let published_at = render_time_element(post.published_at.as_deref());
+            let published_at = render_time_element(post.published_at.as_ref());
             content.push_str(&format!(
                 "<article class=\"archive-post\"><h2><a href=\"/posts/{}\">{}</a></h2>{}<p class=\"summary\">{}</p></article>",
                 post.id,
@@ -1506,13 +1572,14 @@ fn render_site_page(
         ""
     };
     let html = format!(
-        "<!doctype html><html lang=\"en\"><head>{}</head><body><div class=\"site-layout\" id=\"site-layout\"><button class=\"sidebar-toggle\" id=\"sidebar-toggle\" type=\"button\" aria-controls=\"site-sidebar\" aria-expanded=\"false\" aria-label=\"Open sidebar\"><span aria-hidden=\"true\">›</span></button><button class=\"sidebar-backdrop\" id=\"sidebar-backdrop\" type=\"button\" aria-label=\"Close sidebar\" hidden></button>{}{}{}</div>{}{}{}</body></html>",
+        "<!doctype html><html lang=\"en\"><head>{}</head><body><div class=\"site-layout\" id=\"site-layout\"><button class=\"sidebar-toggle\" id=\"sidebar-toggle\" type=\"button\" aria-controls=\"site-sidebar\" aria-expanded=\"false\" aria-label=\"Open sidebar\"><span aria-hidden=\"true\">›</span></button><button class=\"sidebar-backdrop\" id=\"sidebar-backdrop\" type=\"button\" aria-label=\"Close sidebar\" hidden></button>{}{}{}</div>{}{}{}{}</body></html>",
         html_head(title),
         render_sidebar(sidebar),
         render_account_controls(username),
         content,
         new_post_button,
         slideshow,
+        PUBLISH_DIALOG_HTML,
         SHARE_DIALOG_HTML,
     );
     pretty_html(&html)
@@ -1554,7 +1621,7 @@ fn render_sidebar(sidebar: &SidebarData) -> String {
         html.push_str("<li class=\"sidebar-muted\">No published posts yet.</li>");
     } else {
         for post in &sidebar.recent_posts {
-            let published_at = render_time_element(post.published_at.as_deref());
+            let published_at = render_time_element(post.published_at.as_ref());
             html.push_str(&format!(
                 "<li><a href=\"/posts/{}\">{}</a>{}</li>",
                 post.id,
@@ -1648,7 +1715,7 @@ fn render_post_with_media_prefix(
     } else {
         String::new()
     };
-    let published_at = render_time_element(post.summary.published_at.as_deref());
+    let published_at = render_time_element(post.summary.published_at.as_ref());
     format!(
         "<article class=\"post\" data-post-id=\"{}\"><header class=\"post-header\"><h1>{}</h1><div class=\"post-date-row\">{}{}</div><p class=\"summary\">{}</p></header>{}{}</article>",
         post.summary.id,
@@ -1661,13 +1728,33 @@ fn render_post_with_media_prefix(
     )
 }
 
-fn render_time_element(published_at: Option<&str>) -> String {
+fn render_time_element(published_at: Option<&i64>) -> String {
     published_at
         .map(|published_at| {
+            let Ok(timestamp) = jiff::Timestamp::from_second(*published_at) else {
+                return String::new();
+            };
+            let datetime = timestamp.to_string();
+            let Ok(utc) = timestamp.in_tz("UTC") else {
+                return String::new();
+            };
+            let civil = utc.datetime();
+            const MONTH_NAMES: [&str; 12] = [
+                "January", "February", "March", "April", "May", "June", "July", "August",
+                "September", "October", "November", "December",
+            ];
+            let fallback = format!(
+                "{} {}, {} at {:02}:{:02} UTC",
+                MONTH_NAMES[civil.month() as usize - 1],
+                civil.day(),
+                civil.year(),
+                civil.hour(),
+                civil.minute(),
+            );
             format!(
-                "<time datetime=\"{}\">{}</time>",
-                escape_html(published_at),
-                escape_html(published_at),
+                "<time datetime=\"{}\" data-local-time>{}</time>",
+                escape_html(&datetime),
+                escape_html(&fallback),
             )
         })
         .unwrap_or_default()
@@ -2023,6 +2110,8 @@ fn pretty_html(markup: &str) -> String {
 
 const SLIDESHOW_HTML: &str = "<dialog id=\"slideshow\" class=\"slideshow\" aria-label=\"Photo slideshow\"><button class=\"slideshow-close\" type=\"button\" aria-label=\"Close slideshow\">×</button><div class=\"slideshow-stage\"><button class=\"slideshow-nav slideshow-previous\" type=\"button\" aria-label=\"Previous item\">‹</button><div class=\"slideshow-media\" id=\"slideshow-media\"></div><button class=\"slideshow-nav slideshow-next\" type=\"button\" aria-label=\"Next item\">›</button></div><p class=\"slideshow-label\" id=\"slideshow-label\"></p><p class=\"slideshow-caption\" id=\"slideshow-caption\"></p></dialog>";
 
+const PUBLISH_DIALOG_HTML: &str = "<dialog id=\"publish-dialog\" class=\"publish-dialog\" aria-labelledby=\"publish-dialog-heading\"><button class=\"publish-dialog-close\" type=\"button\" aria-label=\"Close publish dialog\">×</button><h2 id=\"publish-dialog-heading\">Publish this post?</h2><form id=\"publish-form\" novalidate><label class=\"publish-override-toggle\"><input id=\"publish-use-time\" type=\"checkbox\">Choose a publication date and time</label><div class=\"publish-time-override\" id=\"publish-time-override\" hidden><label for=\"publish-time\">Local date and time</label><input id=\"publish-time\" type=\"datetime-local\" step=\"60\"></div><p id=\"publish-confirmation\" class=\"publish-confirmation\" role=\"status\" aria-live=\"polite\">The post will be published now using the server time.</p><p id=\"publish-error\" class=\"publish-error\" role=\"alert\" hidden></p><div class=\"publish-dialog-actions\"><button id=\"publish-cancel\" type=\"button\">Cancel</button><button id=\"publish-submit\" type=\"submit\">Publish now</button></div></form></dialog>";
+
 const SHARE_DIALOG_HTML: &str = "<dialog id=\"share-dialog\" class=\"share-dialog\" aria-labelledby=\"share-dialog-heading\"><button class=\"share-dialog-close\" type=\"button\" aria-label=\"Close share panel\">×</button><h2 id=\"share-dialog-heading\">Share post</h2><div class=\"share-preview-actions\"><a id=\"share-full-preview\" href=\"#\" target=\"_blank\" rel=\"noopener\">Open full preview</a></div><div class=\"share-preview-frame\"><iframe id=\"share-preview\" title=\"Guest page preview\" loading=\"lazy\"></iframe></div><div class=\"share-expiry-slot\"><p class=\"share-expiry\" id=\"share-expiry\" hidden></p></div><div class=\"share-controls\"><div class=\"share-copy-row\"><button class=\"share-copy-button\" id=\"share-copy\" type=\"button\">Copy share link</button><span class=\"share-status\" id=\"share-status\" role=\"status\" aria-live=\"polite\"></span></div><div class=\"share-revoke-slot\"><button class=\"share-revoke-button\" id=\"share-revoke\" type=\"button\" hidden>Revoke link</button></div></div></dialog>";
 
 const SITE_CSS: &str = include_str!("../static/site.css");
@@ -2321,7 +2410,7 @@ mod tests {
         assert!(writer_creation_html.contains("id=\"draft-title\" name=\"title\" type=\"text\""));
         assert!(writer_creation_html.contains("data-block-action=\"add-root\""));
         assert!(writer_creation_html.contains("Create draft"));
-        assert!(writer_creation_html.contains("cannot yet be edited or published"));
+        assert!(writer_creation_html.contains("published from their post page"));
         assert!(!writer_creation_html.contains("class=\"new-post-float\""));
 
         assert_eq!(
@@ -2466,9 +2555,9 @@ mod tests {
         connection
             .execute_batch(
                 "INSERT INTO posts (author_id, title, published_at, summary, published, tags) \
-                 VALUES ((SELECT id FROM users WHERE username = 'writer-one'), 'Writer published', '2026-01-01', '', 1, '[]'); \
+                 VALUES ((SELECT id FROM users WHERE username = 'writer-one'), 'Writer published', 1767225600, '', 1, '[]'); \
                  INSERT INTO posts (author_id, title, published_at, summary, published, tags) \
-                 VALUES ((SELECT id FROM users WHERE username = 'writer-two'), 'Other published', '2026-01-02', '', 1, '[]');",
+                 VALUES ((SELECT id FROM users WHERE username = 'writer-two'), 'Other published', 1767312000, '', 1, '[]');",
             )
             .unwrap();
         drop(connection);
@@ -2608,15 +2697,16 @@ mod tests {
             State(state(Database::new(PathBuf::from("unused-test-database")), UnusedStorage)),
             Query(FeedQuery {
                 limit: None,
-                after: Some("2026-02-30:4".to_owned()),
+                after: Some("not-a-second:4".to_owned()),
                 tag: None,
             }),
         )
         .await;
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
-        assert!(parse_cursor("2026-02-28:4").is_some());
-        assert!(parse_cursor("2026-02-28:04").is_none());
-        assert!(parse_cursor("2026-02-28:4:5").is_none());
+        assert!(parse_cursor("1772284800:4").is_some());
+        assert!(parse_cursor("01772284800:4").is_none());
+        assert!(parse_cursor("1772284800:04").is_none());
+        assert!(parse_cursor("1772284800:4:5").is_none());
     }
 
     #[tokio::test]
@@ -2898,7 +2988,7 @@ mod tests {
             .map(|id| NewPost {
                 author_username: "test-author".to_owned(),
                 title: format!("Post {id}"),
-                published_at: Some("2026-01-01".to_owned()),
+                published_at: Some("2026-01-01T12:00:00Z".parse::<jiff::Timestamp>().unwrap().as_second()),
                 summary: format!("Summary {id}"),
                 tags: Vec::new(),
                 blocks: Vec::new(),
@@ -2911,6 +3001,7 @@ mod tests {
             Extension(AuthPrincipal {
                 username: "reader".to_owned(),
                 role: AccountRole::Read,
+                timezone: "UTC".to_owned(),
             }),
         )
         .await;
@@ -2918,7 +3009,7 @@ mod tests {
         let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
         let html = String::from_utf8(body.to_vec()).unwrap();
         assert_eq!(html.matches("<article class=\"post\"").count(), 1);
-        assert!(html.contains("data-next-cursor=\"2026-01-01:12\""));
+        assert!(html.contains("data-next-cursor=\"1767268800:12\""));
         assert!(html.contains("Post 12"));
         assert!(!html.contains("data-post-id=\"11\""));
         assert!(html.contains("id=\"load-more\""));
@@ -2932,7 +3023,7 @@ mod tests {
             summary: PostSummary {
                 id: 7,
                 title: "\"><script>alert(1)</script>".to_owned(),
-                published_at: Some("2026-01-01".to_owned()),
+                published_at: Some("2026-01-01T12:00:00Z".parse::<jiff::Timestamp>().unwrap().as_second()),
                 summary: "A <summary>".to_owned(),
             },
             published: true,
