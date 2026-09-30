@@ -12,7 +12,7 @@ use std::{net::{IpAddr, SocketAddr}, time::{Duration, SystemTime, UNIX_EPOCH}};
 
 use crate::{
     auth,
-    db::{AccountRole, AuthenticatedAccount, Database, FeedCursor, MediaReference, NewBlock, Post, PostAccess, PostSummary, ShareAccess, SidebarData},
+    db::{AccountRole, AuthenticatedAccount, Database, FeedCursor, MediaReference, NewBlock, Post, PostAccess, ShareAccess, SidebarData},
     storage::StorageClient,
 };
 
@@ -88,6 +88,7 @@ struct FeedQuery {
     limit: Option<usize>,
     after: Option<String>,
     tag: Option<String>,
+    month: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -939,7 +940,7 @@ fn is_content_page_path(path: &str) -> bool {
         || path == "/posts/new"
         || path
             .strip_prefix("/archive/")
-            .is_some_and(valid_archive_month)
+            .is_some_and(|month| valid_archive_month(month, "UTC"))
         || path.strip_prefix("/posts/").is_some_and(|id| {
             id.bytes().all(|byte| byte.is_ascii_digit())
                 && id.parse::<i64>().is_ok_and(|parsed_id| {
@@ -981,10 +982,14 @@ fn unix_time() -> Duration {
 async fn feed<S: StorageClient>(
     State(state): State<AppState<S>>,
     Query(query): Query<FeedQuery>,
+    Extension(principal): Extension<AuthPrincipal>,
 ) -> Response {
     let limit = query.limit.unwrap_or(DEFAULT_FEED_LIMIT);
     if !(1..=MAX_FEED_LIMIT).contains(&limit) {
         return (StatusCode::BAD_REQUEST, "limit must be between 1 and 100\n").into_response();
+    }
+    if query.month.as_deref().is_some_and(|month| !valid_archive_month(month, &principal.timezone)) {
+        return (StatusCode::BAD_REQUEST, "month must be a valid YYYY-MM archive month\n").into_response();
     }
     let after = match query.after {
         Some(value) => match parse_cursor(&value) {
@@ -993,7 +998,13 @@ async fn feed<S: StorageClient>(
         },
         None => None,
     };
-    match state.database.feed_filtered(limit, after, query.tag).await {
+    match state.database.feed_filtered_with_month(
+        limit,
+        after,
+        query.tag,
+        query.month,
+        principal.timezone,
+    ).await {
         Ok(page) => Json(page).into_response(),
         Err(error) => {
             eprintln!("website feed query failed: {error}");
@@ -1250,16 +1261,35 @@ async fn archive_page<S: StorageClient>(
     Path(month): Path<String>,
     Extension(principal): Extension<AuthPrincipal>,
 ) -> Response {
-    if !valid_archive_month(&month) {
+    if !valid_archive_month(&month, &principal.timezone) {
         return StatusCode::NOT_FOUND.into_response();
     }
-    let posts = match state.database.posts_for_month(month.clone(), principal.timezone.clone()).await {
-        Ok(posts) => posts,
+    let page = match state.database.feed_filtered_with_month(
+        1,
+        None,
+        None,
+        Some(month.clone()),
+        principal.timezone.clone(),
+    ).await {
+        Ok(page) => page,
         Err(error) => {
             eprintln!("website archive query failed: {error}");
             return StatusCode::INTERNAL_SERVER_ERROR.into_response();
         }
     };
+    let initial_post = match page.posts.first() {
+        Some(summary) => match state.database.post(summary.id).await {
+            Ok(post) => post,
+            Err(error) => {
+                eprintln!("website archive post query failed: {error}");
+                return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+            }
+        },
+        None => None,
+    };
+    let next_cursor = initial_post
+        .as_ref()
+        .and(page.next_cursor.as_deref());
     let sidebar = match sidebar_data_for_principal(&state.database, &principal).await {
         Ok(sidebar) => sidebar,
         Err(error) => {
@@ -1270,9 +1300,11 @@ async fn archive_page<S: StorageClient>(
     Html(render_archive(
         &sidebar,
         &month,
-        &posts,
+        initial_post.as_ref(),
+        next_cursor,
         &principal.username,
         principal.role,
+        principal.share_access().as_ref(),
     ))
     .into_response()
 }
@@ -1370,7 +1402,7 @@ fn parse_cursor(value: &str) -> Option<FeedCursor> {
     })
 }
 
-fn valid_archive_month(value: &str) -> bool {
+fn valid_archive_month(value: &str, timezone: &str) -> bool {
     let bytes = value.as_bytes();
     bytes.len() == 7
         && bytes[4] == b'-'
@@ -1379,6 +1411,7 @@ fn valid_archive_month(value: &str) -> bool {
             .enumerate()
             .all(|(index, byte)| index == 4 || byte.is_ascii_digit())
         && value[5..7].parse::<u32>().is_ok_and(|month| (1..=12).contains(&month))
+        && crate::db::local_month_bounds(value, timezone).is_ok()
 }
 
 fn render_full_post(
@@ -1527,31 +1560,39 @@ fn render_feed_controls(main_open: &str, feed: &str, next_cursor: Option<&str>) 
 fn render_archive(
     sidebar: &SidebarData,
     month: &str,
-    posts: &[PostSummary],
+    initial_post: Option<&Post>,
+    next_cursor: Option<&str>,
     username: &str,
     role: AccountRole,
+    share_access: Option<&ShareAccess>,
 ) -> String {
-    let mut content = format!(
-        "<main class=\"site site-archive\"><p class=\"back-link\"><a href=\"/\">All posts</a></p><h1>{}</h1><section class=\"archive-posts\" aria-label=\"Posts from {}\">",
-        escape_html(&month_label(month)),
-        escape_html(&month_label(month)),
+    let month_label = month_label(month);
+    let mut feed = format!(
+        "<section id=\"feed\" aria-label=\"Posts from {}\" data-next-cursor=\"{}\" data-month=\"{}\">",
+        escape_html(&month_label),
+        escape_html(next_cursor.unwrap_or("")),
+        escape_html(month),
     );
-    if posts.is_empty() {
-        content.push_str("<p class=\"empty-feed\">No published posts in this month.</p>");
+    if let Some(post) = initial_post {
+        feed.push_str(&render_post(
+            post,
+            true,
+            share_access.is_some_and(|access| can_share_post(post, access)),
+        ));
     } else {
-        for post in posts {
-            let published_at = render_time_element(post.published_at.as_ref());
-            content.push_str(&format!(
-                "<article class=\"archive-post\"><h2><a href=\"/posts/{}\">{}</a></h2>{}<p class=\"summary\">{}</p></article>",
-                post.id,
-                escape_html(&post.title),
-                published_at,
-                escape_html(&post.summary),
-            ));
-        }
+        feed.push_str("<p class=\"empty-feed\">No published posts in this month.</p>");
     }
-    content.push_str("</section></main>");
-    render_site_page(&month_label(month), sidebar, &content, false, username, role, true)
+    feed.push_str("</section>");
+    let heading = format!(
+        "<p class=\"back-link\"><a href=\"/\">All posts</a></p><h1>{}</h1>",
+        escape_html(&month_label),
+    );
+    let content = render_feed_controls(
+        &format!("<main class=\"site site-feed site-archive\">{heading}"),
+        &feed,
+        next_cursor,
+    );
+    render_site_page(&month_label, sidebar, &content, true, username, role, true)
 }
 
 fn render_site_page(
@@ -2699,6 +2740,12 @@ mod tests {
                 limit: None,
                 after: Some("not-a-second:4".to_owned()),
                 tag: None,
+                month: None,
+            }),
+            Extension(AuthPrincipal {
+                username: "reader".to_owned(),
+                role: AccountRole::Read,
+                timezone: "UTC".to_owned(),
             }),
         )
         .await;

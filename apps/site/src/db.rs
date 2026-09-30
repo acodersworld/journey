@@ -928,9 +928,26 @@ impl Database {
         after: Option<FeedCursor>,
         tag: Option<String>,
     ) -> Result<FeedPage, String> {
+        self.feed_filtered_with_month(limit, after, tag, None, "UTC".to_owned()).await
+    }
+
+    pub async fn feed_filtered_with_month(
+        &self,
+        limit: usize,
+        after: Option<FeedCursor>,
+        tag: Option<String>,
+        month: Option<String>,
+        timezone: String,
+    ) -> Result<FeedPage, String> {
+        let month_bounds = month
+            .as_deref()
+            .map(|month| local_month_bounds(month, &timezone))
+            .transpose()?;
         self.run(move |connection| {
             let after_date = after.as_ref().map(|cursor| cursor.published_at);
             let after_id = after.as_ref().map(|cursor| cursor.id);
+            let month_start = month_bounds.map(|bounds| bounds.0);
+            let month_end = month_bounds.map(|bounds| bounds.1);
             let mut statement = connection.prepare(
                 "SELECT id, title, published_at, summary FROM posts \
                  WHERE published = 1 \
@@ -939,10 +956,12 @@ impl Database {
                        WHERE post_tag.type = 'text' AND post_tag.value = ?1 \
                    )) \
                    AND (?2 IS NULL OR published_at < ?2 OR (published_at = ?2 AND id < ?3)) \
-                 ORDER BY published_at DESC, id DESC LIMIT ?4",
+                   AND (?4 IS NULL OR published_at >= ?4) \
+                   AND (?5 IS NULL OR published_at < ?5) \
+                 ORDER BY published_at DESC, id DESC LIMIT ?6",
             )?;
             let rows = statement.query_map(
-                params![tag, after_date, after_id, (limit + 1) as i64],
+                params![tag, after_date, after_id, month_start, month_end, (limit + 1) as i64],
                 post_summary_from_row,
             )?;
             let mut posts = rows.collect::<rusqlite::Result<Vec<_>>>()?;
@@ -1000,20 +1019,6 @@ impl Database {
                 rows.collect::<rusqlite::Result<Vec<_>>>()?
             };
             Ok(SidebarData { drafts: None, recent_posts, archive_months, tags })
-        })
-        .await
-    }
-
-    pub async fn posts_for_month(&self, month: String, timezone: String) -> Result<Vec<PostSummary>, String> {
-        let (start, end) = local_month_bounds(&month, &timezone).map_err(|error| error.to_string())?;
-        self.run(move |connection| {
-            let mut statement = connection.prepare(
-                "SELECT id, title, published_at, summary FROM posts \
-                 WHERE published = 1 AND published_at >= ?1 AND published_at < ?2 \
-                 ORDER BY published_at DESC, id DESC",
-            )?;
-            let rows = statement.query_map(params![start, end], post_summary_from_row)?;
-            rows.collect()
         })
         .await
     }
@@ -1250,7 +1255,7 @@ fn initialize_schema(connection: &mut Connection) -> rusqlite::Result<()> {
     transaction.commit()
 }
 
-fn local_month_bounds(month: &str, timezone: &str) -> Result<(i64, i64), String> {
+pub(crate) fn local_month_bounds(month: &str, timezone: &str) -> Result<(i64, i64), String> {
     if month.len() != 7
         || month.as_bytes()[4] != b'-'
         || !month.as_bytes().iter().enumerate().all(|(index, byte)| {

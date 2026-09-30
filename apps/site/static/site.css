@@ -584,35 +584,6 @@ body.sidebar-modal-open {
   letter-spacing: -0.03em;
 }
 
-.archive-post {
-  padding: 0 0 2rem;
-  border-bottom: 1px solid #353a35;
-}
-
-.archive-post + .archive-post {
-  padding-top: 2rem;
-}
-
-.archive-post h2 {
-  margin: 0 0 0.5rem;
-  font-size: 1.45rem;
-  font-weight: 560;
-}
-
-.archive-post h2 a {
-  color: #f3f2ec;
-  text-decoration: none;
-}
-
-.archive-post h2 a:hover {
-  color: #f0d8b3;
-  text-decoration: underline;
-}
-
-.archive-post .summary {
-  margin-top: 0.6rem;
-}
-
 .site-header {
   margin-bottom: 3rem;
 }

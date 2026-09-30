@@ -81,10 +81,13 @@ with published summaries ordered by `published_at DESC, id DESC`. The default
 page size is 10 and the maximum is 100. Its optional `after` parameter contains
 the last post's Unix-second publication instant and ID separated by a colon. Its
 optional `tag` parameter matches one stored tag exactly, including case. Both
-parameters apply to the same published-post keyset query. Malformed cursors
-return `400`. The database fetches one extra row to tell whether a following
-page exists; cursors follow the current ordering and do not preserve a snapshot
-across imports.
+parameters apply to the same published-post keyset query. Its optional
+`month=YYYY-MM` parameter filters publication instants to the selected local
+calendar month, using the authenticated visitor's validated timezone. Month,
+tag, and cursor filters compose while preserving the same ordering. Invalid
+months and malformed cursors return `400`. The database fetches one extra row
+to tell whether a following page exists; cursors follow the current ordering
+and do not preserve a snapshot across imports.
 
 `POST /api/posts` creates a text-only draft for a `write` or `admin` account.
 The signed-in account is always the author. The request accepts a nonblank
@@ -123,9 +126,12 @@ post ID at a time, then fetches its server-rendered HTML from
 `GET /posts/{id}/fragment`. A visible **Load more** button supports manual
 loading and retry. Tag feeds at `/tags?tag=...` use that same renderer and
 pagination path, passing the selected tag through every API request. Post tags
-link to their exact-case filtered feed. `/archive/{YYYY-MM}` lists published
-post titles, publication times, and summaries for the selected month. Every
-publication `<time>` has a UTC ISO 8601 `datetime` value and readable UTC
+link to their exact-case filtered feed. `/archive/{YYYY-MM}` server-renders the
+newest complete post for the selected month and uses the same on-demand feed
+pagination to load later complete posts. The archive uses the normal post
+renderer, including media and slideshow support. Its cursor and month are
+embedded in the feed element so later API requests stay within the archive.
+Every publication `<time>` has a UTC ISO 8601 `datetime` value and readable UTC
 fallback text; the browser formats it in local time.
 
 A JavaScript-readable `journey_timezone` cookie stores the browser's IANA time

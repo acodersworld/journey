@@ -695,6 +695,7 @@ if (feed) {
     try {
       const feedQuery = new URLSearchParams({ limit: '1', after: nextCursor });
       if (feed.hasAttribute('data-tag')) feedQuery.set('tag', feed.dataset.tag);
+      if (feed.hasAttribute('data-month')) feedQuery.set('month', feed.dataset.month);
       const feedResponse = await fetch(`/api/posts?${feedQuery}`);
       if (feedResponse.status === 401) {
         redirectToLogin();
