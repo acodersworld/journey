@@ -3,9 +3,10 @@
 **Status:** Active planning
 **Created:** 23 September 2026
 **Current position:** The transport, filesystem-backed object store, SQLite
-post backend, scrolling feed, sidebar, and account sign-in UI are implemented
-locally. The authoring backend is next; storage diagnostics and administration
-remain deferred.
+post backend, scrolling feed, sidebar, account sign-in, draft authoring and
+media upload, publishing, and published-post share links are implemented
+locally. Video thumbnail previews and automatic gallery slideshows are next;
+storage diagnostics and administration remain deferred.
 
 ## 1. Direction
 
@@ -306,15 +307,16 @@ feed, a sidebar, and `read`, `write`, and `admin` sessions with a browser
 sign-in form. Every post and media request requires a session. Writers can
 create, edit, publish, and upload media to their drafts; admins can manage any
 draft. Draft galleries use media child rows backed by shared content-addressed
-assets. The next work is ordered as follows:
+assets. Published posts can be shared through expiring links with guest-scoped
+sessions. The next work is ordered as follows:
 
 1. **Video thumbnail previews.** Generate or store preview images and show
    them on gallery tiles; videos remain playable without previews meanwhile.
 2. **Automatic gallery slideshow.** Add optional timed advance to the existing
    manual slideshow, with pause controls and sensible video behavior.
 
-Temporary links granting access to one published post remain future work;
-they must not grant draft access.
+The implemented [share links](design/ephemeral-post-share-links.md) grant access
+to one published post and its media, never to drafts.
 
 ## 6. Later horizons
 
