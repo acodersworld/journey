@@ -6,6 +6,7 @@ use std::{
 };
 
 use bytes::Bytes;
+use clap::Parser;
 use h2::server;
 use journey_storage::{
     serve_web_interface, ContentType, FilesystemStore, FilesystemStoreConfig, Key, Object,
@@ -25,54 +26,70 @@ const MAX_HEADER_LIST_SIZE: u32 = 16 * 1024;
 const IMAGE: &[u8] = include_bytes!("assets/image.jpg");
 const VIDEO: &[u8] = include_bytes!("assets/video.mp4");
 
-enum StorageSelection {
-    Help,
-    InMemory,
-    Filesystem(PathBuf),
+#[derive(Parser)]
+#[command(
+    name = "h2c_get_server",
+    about = "Example HTTP/2 storage server",
+    after_help = "Window sizes accept bytes, K/KiB, KB, M/MiB, or MB. K/M are binary; KB/MB are decimal."
+)]
+struct Options {
+    #[arg(long, value_name = "PATH")]
+    storage_dir: Option<PathBuf>,
+    #[arg(long = "connection-window-size", value_name = "SIZE", default_value = "256M", value_parser = parse_window_size)]
+    connection_window_size: u32,
 }
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
-    match storage_selection()? {
-        StorageSelection::Help => Ok(()),
-        StorageSelection::Filesystem(root) => {
+    let options = Options::parse();
+    match options.storage_dir {
+        Some(root) => {
             let store = FilesystemStore::open(FilesystemStoreConfig::new(&root)).await?;
             println!("filesystem storage root: {}", root.display());
-            run_server(store, false).await
+            run_server(store, false, options.connection_window_size).await
         }
-        StorageSelection::InMemory => {
+        None => {
             let store = Store::new([
                 (Key::new("image.jpg").unwrap(), object("image/jpeg", IMAGE)?),
                 (Key::new("video.mp4").unwrap(), object("video/mp4", VIDEO)?),
             ])
             .map_err(std::io::Error::other)?;
-            run_server(store, true).await
+            run_server(store, true, options.connection_window_size).await
         }
     }
 }
 
-fn storage_selection() -> Result<StorageSelection, Box<dyn Error>> {
-    let mut args = std::env::args_os().skip(1);
-    let Some(option) = args.next() else {
-        return Ok(StorageSelection::InMemory);
+fn parse_window_size(value: &str) -> Result<u32, String> {
+    let digit_end = value
+        .find(|character: char| !character.is_ascii_digit())
+        .unwrap_or(value.len());
+    if digit_end == 0 {
+        return Err("size must start with a byte count".to_owned());
+    }
+    let count = value[..digit_end]
+        .parse::<u64>()
+        .map_err(|error| error.to_string())?;
+    let multiplier = match value[digit_end..].to_ascii_lowercase().as_str() {
+        "" | "b" => 1,
+        "k" | "kib" => 1024,
+        "kb" => 1000,
+        "m" | "mib" => 1024 * 1024,
+        "mb" => 1000 * 1000,
+        suffix => return Err(format!("unsupported size suffix: {suffix}")),
     };
-    if option == "--help" && args.next().is_none() {
-        println!("Usage: h2c_get_server [--storage-dir PATH]");
-        return Ok(StorageSelection::Help);
+    let bytes = count
+        .checked_mul(multiplier)
+        .ok_or_else(|| "size is too large".to_owned())?;
+    if bytes > 0x7fff_ffff {
+        return Err("size must be at most 2147483647 bytes".to_owned());
     }
-    if option != "--storage-dir" {
-        return Err("Usage: h2c_get_server [--storage-dir PATH]".into());
-    }
-    let root = args.next().ok_or("--storage-dir requires a path")?;
-    if args.next().is_some() {
-        return Err("Usage: h2c_get_server [--storage-dir PATH]".into());
-    }
-    Ok(StorageSelection::Filesystem(root.into()))
+    Ok(bytes as u32)
 }
 
 async fn run_server<S: StoreInterface + Sync + Send>(
     store: S,
     seeded_fixtures: bool,
+    initial_connection_window_size: u32,
 ) -> Result<(), Box<dyn Error>> {
     let store = Arc::new(store);
     let bind = std::env::var("JOURNEY_STORAGE_BIND").unwrap_or_else(|_| DEFAULT_BIND.to_owned());
@@ -143,7 +160,7 @@ async fn run_server<S: StoreInterface + Sync + Send>(
                 Ok((stream, peer)) => {
                     let service = Arc::clone(&service);
                     connections.spawn(async move {
-                        if let Err(error) = serve_connection(stream, service).await {
+                        if let Err(error) = serve_connection(stream, service, initial_connection_window_size).await {
                             eprintln!("HTTP/2 connection from {peer} failed: {error}");
                         }
                     });
@@ -177,11 +194,13 @@ fn object(
 async fn serve_connection<S: StoreInterface + Sync + Send>(
     stream: TcpStream,
     service: Arc<Service<S>>,
+    initial_connection_window_size: u32,
 ) -> Result<(), Box<dyn Error + Send + Sync>> {
     let mut builder = server::Builder::new();
     builder
         .max_concurrent_streams(MAX_CONCURRENT_STREAMS)
-        .max_header_list_size(MAX_HEADER_LIST_SIZE);
+        .max_header_list_size(MAX_HEADER_LIST_SIZE)
+        .initial_connection_window_size(initial_connection_window_size);
     let mut connection = builder.handshake::<_, Bytes>(stream).await?;
     let mut requests = JoinSet::new();
 

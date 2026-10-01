@@ -57,6 +57,8 @@ pub trait StorageClient: Clone + Send + Sync + 'static {
 #[derive(Clone)]
 pub struct H2cStorageClient {
     address: SocketAddr,
+    initial_window_size: u32,
+    initial_connection_window_size: u32,
     connection: Arc<Mutex<ConnectionState>>,
 }
 
@@ -66,12 +68,18 @@ struct ConnectionState {
 }
 
 impl H2cStorageClient {
-    pub async fn connect(address: SocketAddr) -> Result<Self, Box<dyn Error + Send + Sync>> {
+    pub async fn connect(
+        address: SocketAddr,
+        initial_window_size: u32,
+        initial_connection_window_size: u32,
+    ) -> Result<Self, Box<dyn Error + Send + Sync>> {
         if !address.ip().is_loopback() {
             return Err(format!("storage h2c address must be loopback: {address}").into());
         }
         let client = Self {
             address,
+            initial_window_size,
+            initial_connection_window_size,
             connection: Arc::new(Mutex::new(ConnectionState {
                 generation: 0,
                 sender: None,
@@ -87,10 +95,15 @@ impl H2cStorageClient {
     }
 
     async fn connect_sender(&self, state: &mut ConnectionState) -> Result<(), String> {
+        let mut builder = client::Builder::new();
+        builder
+            .initial_window_size(self.initial_window_size)
+            .initial_connection_window_size(self.initial_connection_window_size);
+
         let stream = TcpStream::connect(self.address)
             .await
             .map_err(|error| error.to_string())?;
-        let (sender, connection) = client::handshake(stream)
+        let (sender, connection) = builder.handshake(stream)
             .await
             .map_err(|error| error.to_string())?;
         let generation = state
@@ -432,7 +445,9 @@ mod tests {
             drop(connection);
             accepted_connections
         });
-        let client = H2cStorageClient::connect(address).await.unwrap();
+        let client = H2cStorageClient::connect(address, 512 * 1024, 4 * 1024 * 1024)
+            .await
+            .unwrap();
         ReconnectingStorageServer {
             client,
             server,

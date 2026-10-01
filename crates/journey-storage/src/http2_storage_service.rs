@@ -1785,7 +1785,7 @@ mod tests {
         store: Arc<S>,
         client_window: Option<u32>,
     ) -> TestConnection {
-        let (client_io, server_io) = duplex(256 * 1024);
+        let (client_io, server_io) = duplex(256 * 1024 * 1024);
         let server_task = tokio::spawn(run_test_server(server_io, Service::new(store)));
         let mut builder = client::Builder::new();
         if let Some(window) = client_window {
