@@ -5,8 +5,9 @@
 **Current position:** The transport, filesystem-backed object store, SQLite
 post backend, scrolling feed, sidebar, account sign-in, draft authoring and
 media upload, publishing, and published-post share links are implemented
-locally. Video thumbnail previews and automatic gallery slideshows are next;
-storage diagnostics and administration remain deferred.
+locally. Browser video first-frame previews are also implemented; automatic
+gallery slideshows are next. Storage diagnostics and administration remain
+deferred.
 
 ## 1. Direction
 
@@ -310,8 +311,9 @@ draft. Draft galleries use media child rows backed by shared content-addressed
 assets. Published posts can be shared through expiring links with guest-scoped
 sessions. The next work is ordered as follows:
 
-1. **Video thumbnail previews.** Generate or store preview images and show
-   them on gallery tiles; videos remain playable without previews meanwhile.
+1. **Browser video first-frame previews (implemented).** Decode a frame in the
+   browser from each existing video URL and show it on gallery tiles without
+   storing thumbnails.
 2. **Automatic gallery slideshow.** Add optional timed advance to the existing
    manual slideshow, with pause controls and sensible video behavior.
 

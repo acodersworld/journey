@@ -2095,7 +2095,7 @@ fn render_standalone_block(
         Some(content_type) if content_type.starts_with("video/") => {
             let media_url = media_url(media_prefix, post_id, block.id);
             html.push_str(&format!(
-                "<figure class=\"single-media\">{}<video controls preload=\"metadata\" aria-label=\"{}\"><source src=\"{}\" type=\"{}\"></video><a class=\"media-download\" href=\"{}?download=1\">Download original</a>{}</figure>",
+                "<figure class=\"single-media\">{}<video controls preload=\"metadata\" data-video-preview aria-label=\"{}\"><source src=\"{}\" type=\"{}\"></video><a class=\"media-download\" href=\"{}?download=1\">Download original</a>{}</figure>",
                 render_media_label(block.header.as_deref()),
                 escape_html(&media_accessible_label(block.header.as_deref(), block.body.as_deref(), "video")),
                 media_url,
@@ -2197,7 +2197,7 @@ fn render_gallery(
                 image_fetch_priority(loading),
             ));
         } else {
-            html.push_str("<span class=\"video-placeholder\" aria-hidden=\"true\"><span class=\"play-icon\">▶</span><span>Video</span></span>");
+            html.push_str("<span class=\"video-preview-frame\" data-video-preview-frame aria-hidden=\"true\"><video class=\"gallery-video-preview\" muted playsinline preload=\"none\" data-gallery-video-preview></video><span class=\"video-placeholder\"><span class=\"play-icon\">▶</span><span>Video</span></span></span>");
         }
         html.push_str(&render_media_label(block.header.as_deref()));
         html.push_str(&render_caption_span(block.body.as_deref()));
@@ -3420,6 +3420,8 @@ mod tests {
         assert!(html.contains("alt=\"photo&quot; onerror=&quot;alert(1)\""));
         assert!(html.contains("<img src=\"/posts/7/blocks/23/media\""));
         assert!(html.contains("data-media-src=\"/posts/7/blocks/22/media\""));
+        assert!(html.contains("class=\"video-preview-frame\" data-video-preview-frame"));
+        assert!(html.contains("<video class=\"gallery-video-preview\" muted playsinline preload=\"none\" data-gallery-video-preview>"));
         assert!(html.contains("<span>Video</span>"));
         assert!(html.contains("class=\"gallery-caption\">&lt;caption&gt;</span>"));
         assert!(html.contains("Nested body"));

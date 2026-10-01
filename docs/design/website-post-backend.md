@@ -192,6 +192,18 @@ first image and lazy-load later images. Direct pages and fragments reuse the
 same original-media URLs; image resizing, format conversion, and variants are
 deferred.
 
+Video frames are previewed in the browser from the existing media URL. A
+gallery tile keeps its **Video** placeholder until a decoded frame is ready and
+sets its source only when it is within 800 CSS pixels of the viewport, using
+`IntersectionObserver` or a bounded scroll/resize check. The tile video is
+muted, inline, paused, and has no controls; playback remains in the slideshow.
+Standalone post videos, slideshow videos, and draft editor previews share a
+browser helper. After metadata loads, it seeks near the start only when no
+current frame is available and the player remains paused; starting playback or
+seeking prevents the preview seek. Draft files use their local object URL until
+the upload is saved, then switch to the authenticated media URL. Preview state
+is not persisted and no thumbnail object or database field is created.
+
 HTML text and attributes are escaped. Image and video blocks use site media
 URLs that identify a post and media child ID, never a storage key. The backend
 confirms the child belongs to an accessible post and references an asset before

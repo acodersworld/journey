@@ -34,6 +34,135 @@ function formatLocalTimes(root) {
 
 syncBrowserTimezone();
 
+const initializedVideoPreviews = new WeakSet();
+let galleryPreviewObserver = null;
+let galleryVisibilityCheckScheduled = false;
+let galleryFallbackListenersAttached = false;
+
+function videoHasCurrentFrame(video) {
+  return video.readyState >= HTMLMediaElement.HAVE_CURRENT_DATA && video.videoWidth > 0;
+}
+
+function initializeVideoPreview(video, onFrameReady = () => {}, onFrameError = () => {}) {
+  if (initializedVideoPreviews.has(video)) return;
+  initializedVideoPreviews.add(video);
+
+  let userStarted = false;
+  let userSeeked = false;
+  let previewSeekRequested = false;
+
+  function revealFrameIfReady() {
+    if (!videoHasCurrentFrame(video)) return false;
+    video.dataset.previewReady = 'true';
+    onFrameReady();
+    return true;
+  }
+
+  function prepareFrame() {
+    if (revealFrameIfReady() || userStarted || userSeeked || !video.paused || previewSeekRequested) return;
+    if (video.readyState < HTMLMediaElement.HAVE_METADATA || !Number.isFinite(video.duration) || video.duration <= 0) return;
+
+    const previewTime = Math.min(0.1, video.duration / 2);
+    if (Math.abs(video.currentTime - previewTime) < 0.001) return;
+    previewSeekRequested = true;
+    try {
+      video.currentTime = previewTime;
+    } catch (_) {
+      previewSeekRequested = false;
+    }
+  }
+
+  video.addEventListener('play', () => { userStarted = true; });
+  video.addEventListener('seeking', () => {
+    if (!previewSeekRequested) userSeeked = true;
+  });
+  video.addEventListener('loadstart', () => {
+    video.removeAttribute('data-preview-ready');
+    previewSeekRequested = false;
+    onFrameError();
+  });
+  video.addEventListener('loadedmetadata', prepareFrame);
+  video.addEventListener('loadeddata', revealFrameIfReady);
+  video.addEventListener('seeked', revealFrameIfReady);
+  video.addEventListener('error', () => {
+    video.removeAttribute('data-preview-ready');
+    onFrameError();
+  });
+
+  if (video.readyState >= HTMLMediaElement.HAVE_CURRENT_DATA) revealFrameIfReady();
+  else if (video.readyState >= HTMLMediaElement.HAVE_METADATA) prepareFrame();
+}
+
+function initializeVideoPreviews(root = document) {
+  if (root.matches?.('video[data-video-preview]')) initializeVideoPreview(root);
+  root.querySelectorAll?.('video[data-video-preview]').forEach(video => initializeVideoPreview(video));
+}
+
+function loadGalleryVideoPreview(video) {
+  if (video.hasAttribute('data-preview-requested')) return;
+  const source = video.closest('.gallery-item')?.dataset.mediaSrc;
+  if (!source) return;
+
+  video.dataset.previewRequested = 'true';
+  const frame = video.closest('[data-video-preview-frame]');
+  initializeVideoPreview(
+    video,
+    () => frame?.setAttribute('data-ready', 'true'),
+    () => frame?.removeAttribute('data-ready'),
+  );
+  video.preload = 'metadata';
+  video.src = source;
+  video.load();
+}
+
+function checkGalleryVideoVisibility() {
+  galleryVisibilityCheckScheduled = false;
+  const margin = 800;
+  document.querySelectorAll('video[data-gallery-video-preview]:not([data-preview-requested])').forEach(video => {
+    const bounds = video.getBoundingClientRect();
+    if (bounds.bottom >= -margin && bounds.top <= window.innerHeight + margin) {
+      loadGalleryVideoPreview(video);
+    }
+  });
+}
+
+function scheduleGalleryVideoVisibilityCheck() {
+  if (galleryVisibilityCheckScheduled) return;
+  galleryVisibilityCheckScheduled = true;
+  window.requestAnimationFrame(checkGalleryVideoVisibility);
+}
+
+function initializeGalleryVideoPreviews(root = document) {
+  const videos = [];
+  if (root.matches?.('video[data-gallery-video-preview]')) videos.push(root);
+  videos.push(...root.querySelectorAll?.('video[data-gallery-video-preview]') || []);
+  if (videos.length === 0) return;
+
+  if ('IntersectionObserver' in window) {
+    if (!galleryPreviewObserver) {
+      galleryPreviewObserver = new IntersectionObserver(entries => {
+        entries.forEach(entry => {
+          if (!entry.isIntersecting) return;
+          galleryPreviewObserver.unobserve(entry.target);
+          loadGalleryVideoPreview(entry.target);
+        });
+      }, { rootMargin: '800px 0px' });
+    }
+    videos.forEach(video => galleryPreviewObserver.observe(video));
+    return;
+  }
+
+  if (!galleryFallbackListenersAttached) {
+    window.addEventListener('scroll', scheduleGalleryVideoVisibilityCheck, { passive: true });
+    window.addEventListener('resize', scheduleGalleryVideoVisibilityCheck, { passive: true });
+    galleryFallbackListenersAttached = true;
+  }
+  scheduleGalleryVideoVisibilityCheck();
+}
+
+initializeVideoPreviews();
+initializeGalleryVideoPreviews();
+
 const sidebarLayout = document.querySelector('#site-layout');
 
 function redirectToLogin() {
@@ -437,9 +566,11 @@ if (draftForm) {
       preview.append(image);
     } else if (source && String(media.content_type || '').startsWith('video/')) {
       const video = document.createElement('video');
-      video.src = source;
       video.preload = 'metadata';
       video.controls = true;
+      video.dataset.videoPreview = '';
+      initializeVideoPreview(video);
+      video.src = source;
       preview.append(video);
     } else {
       preview.textContent = 'Original media';
@@ -1245,6 +1376,8 @@ if (feed) {
         if (!article || !article.matches('article.post')) throw new Error('Invalid post fragment');
         feed.append(article);
         formatLocalTimes(article);
+        initializeVideoPreviews(article);
+        initializeGalleryVideoPreviews(article);
         nextCursor = typeof page.next_cursor === 'string' ? page.next_cursor : null;
       }
 
@@ -1307,7 +1440,9 @@ if (slideshow) {
       const video = document.createElement('video');
       video.controls = true;
       video.preload = 'metadata';
+      video.dataset.videoPreview = '';
       video.setAttribute('aria-label', item.dataset.label || `Video ${slideIndex + 1}`);
+      initializeVideoPreview(video);
       const source = document.createElement('source');
       source.src = mediaUrl;
       source.type = mediaType;
