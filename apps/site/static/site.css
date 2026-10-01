@@ -1239,7 +1239,8 @@ figcaption {
   background: linear-gradient(145deg, #242824, #111311 72%);
 }
 
-.video-preview-frame > video {
+.video-preview-frame > video,
+.video-preview-frame > canvas {
   position: absolute;
   inset: 0;
   width: 100%;
@@ -1248,7 +1249,7 @@ figcaption {
   visibility: hidden;
 }
 
-.video-preview-frame[data-ready] > video {
+.video-preview-frame[data-ready] > canvas {
   visibility: visible;
 }
 

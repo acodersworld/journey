@@ -38,6 +38,9 @@ const initializedVideoPreviews = new WeakSet();
 let galleryPreviewObserver = null;
 let galleryVisibilityCheckScheduled = false;
 let galleryFallbackListenersAttached = false;
+const galleryPreviewQueue = [];
+let activeGalleryPreviews = 0;
+const MAX_ACTIVE_GALLERY_PREVIEWS = 2;
 
 function videoHasCurrentFrame(video) {
   return video.readyState >= HTMLMediaElement.HAVE_CURRENT_DATA && video.videoWidth > 0;
@@ -99,20 +102,76 @@ function initializeVideoPreviews(root = document) {
 }
 
 function loadGalleryVideoPreview(video) {
-  if (video.hasAttribute('data-preview-requested')) return;
   const source = video.closest('.gallery-item')?.dataset.mediaSrc;
-  if (!source) return;
-
-  video.dataset.previewRequested = 'true';
   const frame = video.closest('[data-video-preview-frame]');
-  initializeVideoPreview(
-    video,
-    () => frame?.setAttribute('data-ready', 'true'),
-    () => frame?.removeAttribute('data-ready'),
-  );
+  let finished = false;
+  const timeout = window.setTimeout(finish, 15000);
+
+  function finish() {
+    if (finished) return;
+    finished = true;
+    window.clearTimeout(timeout);
+    video.removeAttribute('src');
+    video.load();
+    video.remove();
+    activeGalleryPreviews -= 1;
+    drainGalleryPreviewQueue();
+  }
+
+  function captureFrame() {
+    if (finished || !frame) return;
+    try {
+      const canvas = document.createElement('canvas');
+      canvas.width = 480;
+      canvas.height = 360;
+      const context = canvas.getContext('2d');
+      if (!context) {
+        finish();
+        return;
+      }
+      const sourceWidth = Math.min(video.videoWidth, video.videoHeight * 4 / 3);
+      const sourceHeight = Math.min(video.videoHeight, video.videoWidth * 3 / 4);
+      context.drawImage(
+        video,
+        (video.videoWidth - sourceWidth) / 2,
+        (video.videoHeight - sourceHeight) / 2,
+        sourceWidth,
+        sourceHeight,
+        0,
+        0,
+        canvas.width,
+        canvas.height,
+      );
+      frame.insertBefore(canvas, video);
+      frame.setAttribute('data-ready', 'true');
+      finish();
+    } catch (_) {
+      finish();
+    }
+  }
+
+  video.addEventListener('error', finish, { once: true });
+  initializeVideoPreview(video, captureFrame);
   video.preload = 'metadata';
   video.src = source;
   video.load();
+}
+
+function drainGalleryPreviewQueue() {
+  while (activeGalleryPreviews < MAX_ACTIVE_GALLERY_PREVIEWS && galleryPreviewQueue.length > 0) {
+    const video = galleryPreviewQueue.shift();
+    if (!video.isConnected) continue;
+    activeGalleryPreviews += 1;
+    loadGalleryVideoPreview(video);
+  }
+}
+
+function queueGalleryVideoPreview(video) {
+  if (video.hasAttribute('data-preview-requested')) return;
+  if (!video.closest('.gallery-item')?.dataset.mediaSrc) return;
+  video.dataset.previewRequested = 'true';
+  galleryPreviewQueue.push(video);
+  drainGalleryPreviewQueue();
 }
 
 function checkGalleryVideoVisibility() {
@@ -121,7 +180,7 @@ function checkGalleryVideoVisibility() {
   document.querySelectorAll('video[data-gallery-video-preview]:not([data-preview-requested])').forEach(video => {
     const bounds = video.getBoundingClientRect();
     if (bounds.bottom >= -margin && bounds.top <= window.innerHeight + margin) {
-      loadGalleryVideoPreview(video);
+      queueGalleryVideoPreview(video);
     }
   });
 }
@@ -144,7 +203,7 @@ function initializeGalleryVideoPreviews(root = document) {
         entries.forEach(entry => {
           if (!entry.isIntersecting) return;
           galleryPreviewObserver.unobserve(entry.target);
-          loadGalleryVideoPreview(entry.target);
+          queueGalleryVideoPreview(entry.target);
         });
       }, { rootMargin: '800px 0px' });
     }
@@ -1345,6 +1404,7 @@ if (feed) {
     loadingFeed = true;
     loadButton.disabled = true;
     status.textContent = 'Loading the next post…';
+    let loaded = false;
 
     try {
       const feedQuery = new URLSearchParams({ limit: '1', after: nextCursor });
@@ -1383,11 +1443,18 @@ if (feed) {
 
       feed.dataset.nextCursor = nextCursor || '';
       status.textContent = nextCursor ? '' : 'You have reached the end of the feed.';
+      loaded = true;
     } catch (_) {
       status.textContent = 'Could not load the next post. Use Load more to retry.';
     } finally {
       loadingFeed = false;
       loadButton.disabled = !nextCursor;
+      if (loaded && nextCursor) {
+        const bounds = sentinel.getBoundingClientRect();
+        if (bounds.bottom >= -800 && bounds.top <= window.innerHeight + 800) {
+          window.requestAnimationFrame(loadNextPost);
+        }
+      }
     }
   }
 
