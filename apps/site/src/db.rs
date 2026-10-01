@@ -7,11 +7,12 @@ const POSTS_SCHEMA: &str = "\
 CREATE TABLE IF NOT EXISTS posts (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     author_id INTEGER NOT NULL REFERENCES users(id),
-    title TEXT NOT NULL CHECK (length(trim(title)) > 0),
+    title TEXT NOT NULL,
     published_at INTEGER,
     summary TEXT NOT NULL,
     published INTEGER NOT NULL DEFAULT 1 CHECK (published IN (0, 1)),
     tags TEXT NOT NULL DEFAULT '[]' CHECK (json_valid(tags) AND json_type(tags) = 'array'),
+    revision INTEGER NOT NULL DEFAULT 1 CHECK (revision > 0),
     CHECK (published = 0 OR published_at IS NOT NULL)
 );
 CREATE INDEX IF NOT EXISTS posts_published_order ON posts(published, published_at DESC, id DESC);
@@ -29,6 +30,14 @@ BEGIN
 END;
 ";
 
+const MEDIA_ASSETS_SCHEMA: &str = "\
+CREATE TABLE IF NOT EXISTS media_assets (
+    storage_key TEXT PRIMARY KEY,
+    content_type TEXT NOT NULL,
+    size_bytes INTEGER CHECK (size_bytes IS NULL OR size_bytes >= 0)
+);
+";
+
 const POST_BLOCKS_SCHEMA: &str = "\
 CREATE TABLE IF NOT EXISTS post_blocks (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -37,13 +46,12 @@ CREATE TABLE IF NOT EXISTS post_blocks (
     position INTEGER NOT NULL CHECK (position >= 0),
     header TEXT,
     body TEXT,
-    storage_key TEXT,
-    content_type TEXT,
+    storage_key TEXT REFERENCES media_assets(storage_key),
     alt_text TEXT,
     UNIQUE (id, post_id),
     FOREIGN KEY (parent_id, post_id) REFERENCES post_blocks(id, post_id) ON DELETE CASCADE,
     CHECK (parent_id IS NULL OR parent_id != id),
-    CHECK ((storage_key IS NULL) = (content_type IS NULL))
+    CHECK ((parent_id IS NULL AND storage_key IS NULL) OR (parent_id IS NOT NULL AND storage_key IS NOT NULL))
 );
 CREATE UNIQUE INDEX IF NOT EXISTS post_blocks_sibling_order
     ON post_blocks(post_id, COALESCE(parent_id, 0), position);
@@ -91,7 +99,7 @@ CREATE TABLE IF NOT EXISTS login_throttles (
 );
 ";
 
-const CURRENT_SCHEMA_VERSION: i64 = 6;
+const CURRENT_SCHEMA_VERSION: i64 = 8;
 const REBUILD_DATABASE_MESSAGE: &str = "site database schema is outdated; recreate the SQLite database and run the destructive importer again";
 
 const SHARE_SCHEMA: &str = "\
@@ -251,6 +259,7 @@ pub enum PublishPostResult {
     NotFound,
     AlreadyPublished,
     MissingText,
+    MissingTitle,
     FutureTimestamp,
     InvalidTimestamp,
 }
@@ -266,6 +275,8 @@ pub struct PostBlock {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub content_type: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub storage_key: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub alt: Option<String>,
     pub children: Vec<PostBlock>,
 }
@@ -279,6 +290,7 @@ pub struct Post {
     #[serde(skip)]
     pub author_username: String,
     pub tags: Vec<String>,
+    pub revision: i64,
     pub blocks: Vec<PostBlock>,
 }
 
@@ -294,6 +306,7 @@ pub struct NewPost {
 
 #[derive(Clone, Debug)]
 pub struct NewBlock {
+    pub id: Option<i64>,
     pub header: Option<String>,
     pub body: Option<String>,
     pub storage_key: Option<String>,
@@ -306,6 +319,14 @@ pub struct NewBlock {
 pub struct MediaReference {
     pub storage_key: String,
     pub content_type: String,
+}
+
+#[derive(Clone, Debug)]
+pub enum SaveDraftResult {
+    Saved(Post),
+    NotFound,
+    Conflict,
+    Published,
 }
 
 #[derive(Clone, Debug)]
@@ -338,7 +359,8 @@ impl Database {
                 || table_exists(connection, "login_throttles")?
                 || table_exists(connection, "share_links")?
                 || table_exists(connection, "share_sessions")?
-                || table_exists(connection, "site_settings")?;
+                || table_exists(connection, "site_settings")?
+                || table_exists(connection, "media_assets")?;
             let published_at_type = if table_exists(connection, "posts")? {
                 connection.query_row(
                     "SELECT type FROM pragma_table_info('posts') WHERE name = 'published_at'",
@@ -431,8 +453,8 @@ impl Database {
                     "INSERT INTO posts (author_id, title, published_at, summary, published, tags) VALUES (?1, ?2, ?3, ?4, 1, ?5)",
                 )?;
                 let mut insert_block = transaction.prepare(
-                    "INSERT INTO post_blocks (post_id, parent_id, position, header, body, storage_key, content_type, alt_text) \
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                    "INSERT INTO post_blocks (post_id, parent_id, position, header, body, storage_key, alt_text) \
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
                 )?;
                 for (post, tags, author_id) in posts {
                     insert_post.execute(params![author_id, post.title, post.published_at, post.summary, tags])?;
@@ -458,6 +480,7 @@ impl Database {
         let tags = serde_json::to_string(&tags).map_err(|error| error.to_string())?;
         self.run(move |connection| {
             let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let title = if title.trim().is_empty() { String::new() } else { title };
             let author_id = transaction.query_row(
                 "SELECT id FROM users WHERE username = ?1 COLLATE NOCASE",
                 [&author_username],
@@ -471,8 +494,8 @@ impl Database {
             let post_id = transaction.last_insert_rowid();
             {
                 let mut insert_block = transaction.prepare(
-                    "INSERT INTO post_blocks (post_id, parent_id, position, header, body, storage_key, content_type, alt_text) \
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                    "INSERT INTO post_blocks (post_id, parent_id, position, header, body, storage_key, alt_text) \
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
                 )?;
                 insert_blocks(&transaction, &mut insert_block, post_id, None, blocks)?;
             }
@@ -480,6 +503,188 @@ impl Database {
             Ok(post_id)
         })
         .await
+    }
+
+    pub async fn save_draft(
+        &self,
+        id: i64,
+        author_username: String,
+        is_admin: bool,
+        expected_revision: i64,
+        title: String,
+        summary: String,
+        tags: Vec<String>,
+        blocks: Vec<NewBlock>,
+    ) -> Result<SaveDraftResult, String> {
+        self.initialize().await?;
+        let tags = serde_json::to_string(&tags).map_err(|error| error.to_string())?;
+        self.run(move |connection| {
+            let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let post = transaction.query_row(
+                "SELECT p.revision, p.published, u.username FROM posts AS p \
+                 JOIN users AS u ON u.id = p.author_id WHERE p.id = ?1",
+                [id],
+                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, bool>(1)?, row.get::<_, String>(2)?)),
+            ).optional()?;
+            let Some((revision, published, owner)) = post else {
+                return Ok(SaveDraftResult::NotFound);
+            };
+            if !is_admin && !owner.eq_ignore_ascii_case(&author_username) {
+                return Ok(SaveDraftResult::NotFound);
+            }
+            if published {
+                return Ok(SaveDraftResult::Published);
+            }
+            if revision != expected_revision {
+                return Ok(SaveDraftResult::Conflict);
+            }
+
+            let title = if title.trim().is_empty() { String::new() } else { title };
+            let existing = {
+                let mut statement = transaction.prepare(
+                    "SELECT id, parent_id, position FROM post_blocks WHERE post_id = ?1",
+                )?;
+                let rows = statement.query_map([id], |row| {
+                    Ok((row.get::<_, i64>(0)?, row.get::<_, Option<i64>>(1)?, row.get::<_, i64>(2)?))
+                })?;
+                rows.collect::<rusqlite::Result<Vec<_>>>()?
+            };
+            let mut existing_by_id = HashMap::new();
+            let mut max_position = 0_i64;
+            for (block_id, parent_id, position) in existing {
+                max_position = max_position.max(position);
+                existing_by_id.insert(block_id, parent_id);
+            }
+
+            let mut desired_roots = Vec::new();
+            let mut desired_children = Vec::new();
+            let mut desired_ids = std::collections::HashSet::new();
+            for root in &blocks {
+                if root.storage_key.is_some() {
+                    return Err(rusqlite::Error::InvalidParameterName("visible blocks cannot reference media assets".to_owned()));
+                }
+                if let Some(block_id) = root.id {
+                    if !desired_ids.insert(block_id) || existing_by_id.get(&block_id) != Some(&None) {
+                        return Err(rusqlite::Error::InvalidParameterName("draft block ID is invalid or duplicated".to_owned()));
+                    }
+                }
+                desired_roots.push(root.id);
+                for child in &root.children {
+                    if child.storage_key.is_none() {
+                        return Err(rusqlite::Error::InvalidParameterName("gallery items must reference a media asset".to_owned()));
+                    }
+                    if let Some(block_id) = child.id {
+                        if !desired_ids.insert(block_id) || existing_by_id.get(&block_id).is_none_or(Option::is_none) {
+                            return Err(rusqlite::Error::InvalidParameterName("gallery item ID is invalid or duplicated".to_owned()));
+                        }
+                    }
+                    desired_children.push((root.id, child.id));
+                }
+            }
+            let total_desired = i64::try_from(desired_ids.len() + desired_roots.iter().filter(|id| id.is_none()).count() + desired_children.iter().filter(|(_, id)| id.is_none()).count())
+                .map_err(|_| rusqlite::Error::IntegralValueOutOfRange(0, i64::MAX))?;
+            let offset = max_position
+                .checked_add(total_desired)
+                .and_then(|value| value.checked_add(1))
+                .ok_or(rusqlite::Error::IntegralValueOutOfRange(0, max_position))?;
+            transaction.execute(
+                "UPDATE post_blocks SET position = position + ?1 WHERE post_id = ?2",
+                params![offset, id],
+            )?;
+
+            let mut root_ids = Vec::with_capacity(blocks.len());
+            let mut insert_block = transaction.prepare(
+                "INSERT INTO post_blocks (post_id, parent_id, position, header, body, storage_key, alt_text) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            )?;
+            for (position, block) in blocks.iter().enumerate() {
+                let block_id = if let Some(block_id) = block.id {
+                    transaction.execute(
+                        "UPDATE post_blocks SET parent_id = NULL, position = ?2, header = ?3, body = ?4, storage_key = NULL, alt_text = NULL \
+                         WHERE id = ?1 AND post_id = ?5",
+                        params![block_id, position as i64, block.header, block.body, id],
+                    )?;
+                    block_id
+                } else {
+                    insert_block.execute(params![id, None::<i64>, position as i64, block.header, block.body, None::<String>, None::<String>])?;
+                    transaction.last_insert_rowid()
+                };
+                root_ids.push(block_id);
+            }
+            for (root_index, block) in blocks.iter().enumerate() {
+                let parent_id = root_ids[root_index];
+                for (position, child) in block.children.iter().enumerate() {
+                    let storage_key = child.storage_key.as_ref().unwrap();
+                    let content_type = child.content_type.as_deref().ok_or_else(|| {
+                        rusqlite::Error::InvalidParameterName("gallery item is missing its content type".to_owned())
+                    })?;
+                    require_media_asset(&transaction, storage_key, content_type)?;
+                    if let Some(block_id) = child.id {
+                        transaction.execute(
+                            "UPDATE post_blocks SET parent_id = ?2, position = ?3, header = ?4, body = ?5, storage_key = ?6, alt_text = ?7 \
+                             WHERE id = ?1 AND post_id = ?8",
+                            params![block_id, parent_id, position as i64, child.header, child.body, storage_key, child.alt, id],
+                        )?;
+                    } else {
+                        insert_block.execute(params![id, parent_id, position as i64, child.header, child.body, storage_key, child.alt])?;
+                    }
+                }
+            }
+
+            for (block_id, parent_id) in &existing_by_id {
+                let kept = desired_ids.contains(block_id)
+                    || (parent_id.is_none() && desired_roots.iter().any(|id| id == &Some(*block_id)));
+                if !kept && parent_id.is_some() {
+                    transaction.execute("DELETE FROM post_blocks WHERE id = ?1", [block_id])?;
+                }
+            }
+            for (block_id, parent_id) in &existing_by_id {
+                if parent_id.is_none() && !desired_roots.iter().any(|id| id == &Some(*block_id)) {
+                    transaction.execute("DELETE FROM post_blocks WHERE id = ?1", [block_id])?;
+                }
+            }
+            drop(insert_block);
+
+            let next_revision = revision.checked_add(1)
+                .ok_or(rusqlite::Error::IntegralValueOutOfRange(0, revision))?;
+            transaction.execute(
+                "UPDATE posts SET title = ?2, summary = ?3, tags = ?4, revision = ?5 WHERE id = ?1",
+                params![id, title, summary, tags, next_revision],
+            )?;
+            let saved_post = load_post(&transaction, id, PostAccess::Admin)?
+                .ok_or(rusqlite::Error::QueryReturnedNoRows)?;
+            transaction.commit()?;
+            Ok(SaveDraftResult::Saved(saved_post))
+        }).await
+    }
+
+    pub async fn draft_root_exists(
+        &self,
+        post_id: i64,
+        block_id: i64,
+        author_username: String,
+        is_admin: bool,
+    ) -> Result<bool, String> {
+        self.run(move |connection| {
+            connection.query_row(
+                "SELECT EXISTS(SELECT 1 FROM post_blocks AS b JOIN posts AS p ON p.id = b.post_id \
+                 WHERE p.id = ?1 AND b.id = ?2 AND b.parent_id IS NULL AND p.published = 0 \
+                   AND (?3 = 1 OR p.author_id = (SELECT id FROM users WHERE username = ?4 COLLATE NOCASE)))",
+                params![post_id, block_id, is_admin, author_username],
+                |row| row.get(0),
+            )
+        }).await
+    }
+
+    pub async fn record_media_asset(
+        &self,
+        storage_key: String,
+        content_type: String,
+        size_bytes: u64,
+    ) -> Result<(), String> {
+        self.initialize().await?;
+        let size_bytes = i64::try_from(size_bytes).map_err(|_| "media file size is too large".to_owned())?;
+        self.run(move |connection| ensure_media_asset(connection, &storage_key, &content_type, Some(size_bytes))).await
     }
 
     pub async fn create_account(
@@ -826,15 +1031,16 @@ impl Database {
             let now_seconds = unix_seconds(now);
             connection
                 .query_row(
-                    "SELECT b.storage_key, b.content_type FROM share_sessions AS s \
-                     JOIN share_links AS l ON l.id = s.share_link_id \
-                     JOIN posts AS p ON p.id = l.post_id \
-                     JOIN post_blocks AS b ON b.post_id = p.id \
+                "SELECT b.storage_key, a.content_type FROM share_sessions AS s \
+                 JOIN share_links AS l ON l.id = s.share_link_id \
+                 JOIN posts AS p ON p.id = l.post_id \
+                 JOIN post_blocks AS b ON b.post_id = p.id \
+                 JOIN media_assets AS a ON a.storage_key = b.storage_key \
                      WHERE s.token_digest = ?1 AND s.share_link_id = ?2 \
                        AND s.expires_at > ?5 AND l.expires_at > ?5 \
                        AND l.revoked_at IS NULL AND p.published = 1 \
                        AND p.id = ?3 AND b.id = ?4 AND b.storage_key IS NOT NULL \
-                       AND (b.content_type LIKE 'image/%' OR b.content_type LIKE 'video/%')",
+                       AND (a.content_type LIKE 'image/%' OR a.content_type LIKE 'video/%')",
                     params![session_token_digest, share_link_id, post_id, block_id, now_seconds],
                     |row| {
                         Ok(MediaReference {
@@ -1034,12 +1240,12 @@ impl Database {
         self.run(move |connection| {
             let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
             let post = transaction.query_row(
-                "SELECT p.published, u.username FROM posts AS p \
+                "SELECT p.published, p.title, u.username FROM posts AS p \
                  JOIN users AS u ON u.id = p.author_id WHERE p.id = ?1",
                 [id],
-                |row| Ok((row.get::<_, bool>(0)?, row.get::<_, String>(1)?)),
+                |row| Ok((row.get::<_, bool>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?)),
             ).optional()?;
-            let Some((published, owner)) = post else {
+            let Some((published, title, owner)) = post else {
                 return Ok(PublishPostResult::NotFound);
             };
             if !is_admin && !owner.eq_ignore_ascii_case(&author_username) {
@@ -1047,6 +1253,9 @@ impl Database {
             }
             if published {
                 return Ok(PublishPostResult::AlreadyPublished);
+            }
+            if title.trim().is_empty() {
+                return Ok(PublishPostResult::MissingTitle);
             }
             let now = unix_seconds(unix_time());
             if requested_published_at.is_some_and(|published_at| published_at > now) {
@@ -1173,13 +1382,14 @@ impl Database {
             let (is_admin, author_username) = access.query_args();
             connection
                 .query_row(
-                    "SELECT b.storage_key, b.content_type \
+                    "SELECT b.storage_key, a.content_type \
                      FROM post_blocks AS b JOIN posts AS p ON p.id = b.post_id \
+                     JOIN media_assets AS a ON a.storage_key = b.storage_key \
                      WHERE p.id = ?1 AND (p.published = 1 OR ?3 = 1 OR (\
                          ?4 IS NOT NULL AND p.author_id = (SELECT id FROM users WHERE username = ?4 COLLATE NOCASE)\
                      )) AND b.id = ?2 \
                        AND b.storage_key IS NOT NULL \
-                       AND (b.content_type LIKE 'image/%' OR b.content_type LIKE 'video/%')",
+                       AND (a.content_type LIKE 'image/%' OR a.content_type LIKE 'video/%')",
                     params![post_id, block_id, is_admin, author_username],
                     |row| {
                         Ok(MediaReference {
@@ -1248,6 +1458,7 @@ impl Database {
 fn initialize_schema(connection: &mut Connection) -> rusqlite::Result<()> {
     let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
     transaction.execute_batch(POSTS_SCHEMA)?;
+    transaction.execute_batch(MEDIA_ASSETS_SCHEMA)?;
     transaction.execute_batch(POST_BLOCKS_SCHEMA)?;
     transaction.execute_batch(AUTH_SCHEMA)?;
     transaction.execute_batch(SHARE_SCHEMA)?;
@@ -1317,7 +1528,7 @@ fn load_post_with_query(
     author_username: Option<&str>,
 ) -> rusqlite::Result<Option<Post>> {
     let query = format!(
-        "SELECT p.id, p.title, p.published_at, p.summary, p.tags, p.published, u.username \
+        "SELECT p.id, p.title, p.published_at, p.summary, p.tags, p.published, u.username, p.revision \
          FROM posts AS p JOIN users AS u ON u.id = p.author_id \
          WHERE p.id = ?1 AND ({access_predicate})"
     );
@@ -1334,19 +1545,20 @@ fn load_post_with_query(
                         Box::new(error),
                     )
                 })?;
-                Ok((post_summary_from_row(row)?, tags, row.get::<_, bool>(5)?, row.get::<_, String>(6)?))
+                Ok((post_summary_from_row(row)?, tags, row.get::<_, bool>(5)?, row.get::<_, String>(6)?, row.get::<_, i64>(7)?))
             },
         )
         .optional()?;
-    let Some((summary, tags, published, author_username)) = post_row else {
+    let Some((summary, tags, published, author_username, revision)) = post_row else {
         return Ok(None);
     };
 
     let (mut blocks, mut children) = {
         let mut statement = connection.prepare(
-            "SELECT id, parent_id, position, header, body, content_type, alt_text \
-             FROM post_blocks WHERE post_id = ?1 \
-             ORDER BY parent_id IS NOT NULL, parent_id, position",
+            "SELECT b.id, b.parent_id, b.position, b.header, b.body, a.content_type, b.storage_key, b.alt_text \
+             FROM post_blocks AS b LEFT JOIN media_assets AS a ON a.storage_key = b.storage_key \
+             WHERE b.post_id = ?1 \
+             ORDER BY b.parent_id IS NOT NULL, b.parent_id, b.position",
         )?;
         let rows = statement.query_map([id], |row| {
             let parent_id: Option<i64> = row.get(1)?;
@@ -1356,7 +1568,8 @@ fn load_post_with_query(
                 header: row.get(3)?,
                 body: row.get(4)?,
                 content_type: row.get(5)?,
-                alt: row.get(6)?,
+                storage_key: row.get(6)?,
+                alt: row.get(7)?,
                 children: Vec::new(),
             };
             Ok((parent_id, block))
@@ -1381,6 +1594,7 @@ fn load_post_with_query(
         published,
         author_username,
         tags,
+        revision,
         blocks,
     }))
 }
@@ -1435,7 +1649,13 @@ fn insert_blocks(
     blocks: Vec<NewBlock>,
 ) -> rusqlite::Result<()> {
     for (position, block) in blocks.into_iter().enumerate() {
-        let NewBlock { header, body, storage_key, content_type, alt, children } = block;
+        let NewBlock { id: _, header, body, storage_key, content_type, alt, children } = block;
+        if let Some(storage_key) = storage_key.as_deref() {
+            let content_type = content_type.as_deref().ok_or_else(|| {
+                rusqlite::Error::InvalidParameterName("media placement is missing its content type".to_owned())
+            })?;
+            ensure_media_asset(connection, storage_key, content_type, None)?;
+        }
         statement.execute(params![
             post_id,
             parent_id,
@@ -1443,13 +1663,59 @@ fn insert_blocks(
             header,
             body,
             storage_key,
-            content_type,
             alt,
         ])?;
         let block_id = connection.last_insert_rowid();
         insert_blocks(connection, statement, post_id, Some(block_id), children)?;
     }
     Ok(())
+}
+
+fn ensure_media_asset(
+    connection: &Connection,
+    storage_key: &str,
+    content_type: &str,
+    size_bytes: Option<i64>,
+) -> rusqlite::Result<()> {
+    connection.execute(
+        "INSERT INTO media_assets (storage_key, content_type, size_bytes) VALUES (?1, ?2, ?3) \
+         ON CONFLICT(storage_key) DO UPDATE SET size_bytes = COALESCE(media_assets.size_bytes, excluded.size_bytes)",
+        params![storage_key, content_type, size_bytes],
+    )?;
+    let stored_content_type: String = connection.query_row(
+        "SELECT content_type FROM media_assets WHERE storage_key = ?1",
+        [storage_key],
+        |row| row.get(0),
+    )?;
+    if stored_content_type != content_type {
+        return Err(rusqlite::Error::InvalidParameterName(
+            "the same media asset was supplied with conflicting content types".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+fn require_media_asset(
+    connection: &Connection,
+    storage_key: &str,
+    content_type: &str,
+) -> rusqlite::Result<()> {
+    let stored_content_type = connection
+        .query_row(
+            "SELECT content_type FROM media_assets WHERE storage_key = ?1",
+            [storage_key],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?;
+    match stored_content_type {
+        Some(stored_content_type) if stored_content_type == content_type => Ok(()),
+        Some(_) => Err(rusqlite::Error::InvalidParameterName(
+            "the media placement content type does not match its asset".to_owned(),
+        )),
+        None => Err(rusqlite::Error::InvalidParameterName(
+            "the media placement references an asset that has not been uploaded".to_owned(),
+        )),
+    }
 }
 
 fn post_summary_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<PostSummary> {
@@ -1581,26 +1847,29 @@ mod tests {
         let path = test_database_path();
         let database = Database::new(path.clone());
         let group = NewBlock {
+            id: None,
             header: Some("Morning".to_owned()),
             body: Some("A quiet start".to_owned()),
-            storage_key: Some("media/group-image".to_owned()),
-            content_type: Some("image/jpeg".to_owned()),
-            alt: Some("A lake at sunrise".to_owned()),
+            storage_key: None,
+            content_type: None,
+            alt: None,
             children: vec![
                 NewBlock {
-                    header: None,
-                    body: Some("The water was still.".to_owned()),
-                    storage_key: None,
-                    content_type: None,
-                    alt: None,
-                    children: Vec::new(),
-                },
-                NewBlock {
+                    id: None,
                     header: None,
                     body: Some("Birdsong by the dock.".to_owned()),
                     storage_key: Some("media/child-video".to_owned()),
                     content_type: Some("video/mp4".to_owned()),
-                    alt: None,
+                    alt: Some("A short video".to_owned()),
+                    children: Vec::new(),
+                },
+                NewBlock {
+                    id: None,
+                    header: None,
+                    body: Some("The water was still.".to_owned()),
+                    storage_key: Some("media/group-image".to_owned()),
+                    content_type: Some("image/jpeg".to_owned()),
+                    alt: Some("A lake at sunrise".to_owned()),
                     children: Vec::new(),
                 },
             ],
@@ -1609,6 +1878,7 @@ mod tests {
         new_post.tags = vec!["Alps".to_owned(), "Morning walk".to_owned()];
         new_post.blocks = vec![
             NewBlock {
+                id: None,
                 header: None,
                 body: Some("Before the group".to_owned()),
                 storage_key: None,
@@ -1618,6 +1888,7 @@ mod tests {
             },
             group,
             NewBlock {
+                id: None,
                 header: Some("After the group".to_owned()),
                 body: None,
                 storage_key: None,
@@ -1657,11 +1928,12 @@ mod tests {
         assert_eq!(post.blocks[0].position, 0);
         assert_eq!(post.blocks[0].header.as_deref(), Some("Morning"));
         assert_eq!(post.blocks[0].body.as_deref(), Some("A quiet start"));
-        assert_eq!(post.blocks[0].content_type.as_deref(), Some("image/jpeg"));
+        assert_eq!(post.blocks[0].content_type, None);
         assert_eq!(post.blocks[0].children.len(), 2);
         assert_eq!(post.blocks[0].children[0].position, 0);
         assert_eq!(post.blocks[0].children[1].position, 1);
-        assert_eq!(post.blocks[0].children[1].content_type.as_deref(), Some("video/mp4"));
+        assert_eq!(post.blocks[0].children[0].content_type.as_deref(), Some("video/mp4"));
+        assert_eq!(post.blocks[0].children[1].content_type.as_deref(), Some("image/jpeg"));
         assert_eq!(post.blocks[1].id, last_id);
         assert_eq!(post.blocks[1].position, 1);
         assert_eq!(post.blocks[2].id, first_id);
@@ -1687,15 +1959,19 @@ mod tests {
             [],
         ).unwrap();
         connection.execute(
+            "INSERT INTO media_assets (storage_key, content_type) VALUES ('media/test', 'image/jpeg')",
+            [],
+        ).unwrap();
+        connection.execute(
             "INSERT INTO post_blocks (post_id, position) VALUES (1, 0)",
             [],
         ).unwrap();
         connection.execute(
-            "INSERT INTO post_blocks (post_id, parent_id, position) VALUES (1, 1, 0)",
+            "INSERT INTO post_blocks (post_id, parent_id, position, storage_key) VALUES (1, 1, 0, 'media/test')",
             [],
         ).unwrap();
         let error = connection.execute(
-            "INSERT INTO post_blocks (post_id, parent_id, position) VALUES (1, 2, 0)",
+            "INSERT INTO post_blocks (post_id, parent_id, position, storage_key) VALUES (1, 2, 0, 'media/test')",
             [],
         ).unwrap_err();
         assert!(error.to_string().contains("one level deep"));
@@ -1710,16 +1986,25 @@ mod tests {
         let database = Database::new(path.clone());
         let mut media_post = post("2026-01-01", "Published post");
         media_post.blocks.push(NewBlock {
+            id: None,
             header: None,
-            body: None,
-            storage_key: Some("media/image-key".to_owned()),
-            content_type: Some("image/jpeg".to_owned()),
+            body: Some("A block".to_owned()),
+            storage_key: None,
+            content_type: None,
             alt: None,
-            children: Vec::new(),
+            children: vec![NewBlock {
+                id: None,
+                header: None,
+                body: None,
+                storage_key: Some("media/image-key".to_owned()),
+                content_type: Some("image/jpeg".to_owned()),
+                alt: None,
+                children: Vec::new(),
+            }],
         });
         database.replace_posts(vec![media_post]).await.unwrap();
         let published = database.post(1).await.unwrap().unwrap();
-        let block_id = published.blocks[0].id;
+        let block_id = published.blocks[0].children[0].id;
         assert_eq!(
             database.media_reference(1, block_id).await.unwrap().unwrap().storage_key,
             "media/image-key"
@@ -1758,21 +2043,24 @@ mod tests {
                 Vec::new(),
                 vec![
                     NewBlock {
+                        id: None,
                         header: Some("First block".to_owned()),
                         body: None,
-                        storage_key: Some("media/draft-image".to_owned()),
-                        content_type: Some("image/jpeg".to_owned()),
+                        storage_key: None,
+                        content_type: None,
                         alt: None,
                         children: vec![NewBlock {
+                            id: None,
                             header: None,
-                            body: Some("Nested text".to_owned()),
-                            storage_key: None,
-                            content_type: None,
-                            alt: None,
+                            body: Some("Nested caption".to_owned()),
+                            storage_key: Some("media/draft-image".to_owned()),
+                            content_type: Some("image/jpeg".to_owned()),
+                            alt: Some("Draft image".to_owned()),
                             children: Vec::new(),
                         }],
                     },
                     NewBlock {
+                        id: None,
                         header: None,
                         body: Some("Second block".to_owned()),
                         storage_key: None,
@@ -1806,9 +2094,9 @@ mod tests {
         assert_eq!(first.summary.summary, "");
         assert_eq!(first.blocks.len(), 2);
         assert_eq!(first.blocks[0].position, 0);
-        assert_eq!(first.blocks[0].children[0].body.as_deref(), Some("Nested text"));
+        assert_eq!(first.blocks[0].children[0].body.as_deref(), Some("Nested caption"));
         assert_eq!(first.blocks[1].position, 1);
-        let media_block_id = first.blocks[0].id;
+        let media_block_id = first.blocks[0].children[0].id;
 
         assert!(database
             .post_with_access(first_id, PostAccess::Author("writer-two".to_owned()))

@@ -304,15 +304,13 @@ operations to public browsers.
 The local site now has a SQLite-backed post backend, a server-rendered scrolling
 feed, a sidebar, and `read`, `write`, and `admin` sessions with a browser
 sign-in form. Every post and media request requires a session. Writers can
-create and publish their own text drafts; admins can manage any draft. The next
-work is ordered as follows:
+create, edit, publish, and upload media to their drafts; admins can manage any
+draft. Draft galleries use media child rows backed by shared content-addressed
+assets. The next work is ordered as follows:
 
-1. **Post editing and media management.** Add author-scoped edits and deletes,
-   media uploads and references, and any needed unpublishing operation. A
-   post's author needs `write` permission; admins can manage every post.
-2. **Video thumbnail previews.** Generate or store preview images and show
+1. **Video thumbnail previews.** Generate or store preview images and show
    them on gallery tiles; videos remain playable without previews meanwhile.
-3. **Automatic gallery slideshow.** Add optional timed advance to the existing
+2. **Automatic gallery slideshow.** Add optional timed advance to the existing
    manual slideshow, with pause controls and sensible video behavior.
 
 Temporary links granting access to one published post remain future work;
@@ -342,6 +340,9 @@ they must not grant draft access.
 - The website uses server-rendered HTML and small browser scripts.
 - Every post and media request requires a session. `read` accounts see
   published posts; `write` accounts can access drafts they authored and admins
-  can access every draft. There is no post editor yet.
+  can access every draft. Writers can edit their own drafts, upload media, and
+  publish them; admins can edit any draft. Published posts remain read-only.
+- Visible draft blocks contain text and ordered media galleries. Gallery
+  placements are child rows backed by shared original-file metadata.
 - The local website streams original media from the storage service and has no
   AWS media cache.

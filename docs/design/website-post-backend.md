@@ -1,7 +1,7 @@
 # Website post backend
 
 **Status:** Implemented local backend and authenticated website UI
-**Updated:** 30 September 2026
+**Updated:** 1 October 2026
 
 ## Runtime data
 
@@ -9,12 +9,16 @@
 required author reference, title, nullable UTC Unix-second publication instant, summary, a
 published flag, and a JSON array of case-preserving string tags. The author is
 the account that created a draft or is credited by the manifest.
-`post_blocks` stores blocks with an auto-generated ID, parent ID, sibling
-position, optional header and body, and optional media fields. A row with
-children is a group; groups can contain only one level of
-children and can also have their own text and media. The content type identifies
-image and video media. Imported posts are always published; HTTP-created posts
-are drafts until their author or an admin publishes them. All
+`post_blocks` stores both visible blocks and media placements. A root row
+(`parent_id IS NULL`) is one visible block with optional header and body text.
+Its children are media placements only; their sibling positions order the
+block's gallery. `media_assets` stores shared original-file metadata keyed by
+the content-derived storage key. Each placement references that asset and
+stores its own label, caption, and alt text. Reusing or duplicating a file adds
+another child row without copying the original. Imported posts are always
+published; HTTP-created posts are drafts until their author or an admin
+publishes them. Draft titles can be blank, but publication requires a title
+and nonblank block text. All
 post and media lookups require a session: `read` accounts can access published
 posts, `write` accounts can also access their own drafts, and `admin` accounts
 can access every draft. Feeds and navigation lists contain published posts
@@ -33,13 +37,14 @@ level contains `posts`; each post requires an `author` username, `title`,
 timestamp to UTC Unix seconds before storing it.
 Each author must already exist or be added through the manifest's `users` array.
 Each block can have a plain text `header`, plain text `body`, a media `path`
-with optional `alt`, and nested
-`blocks`. Nested blocks are allowed only on top-level blocks. Media type is
-inferred from the path extension and stored as its content type. Image and
+with optional `alt`, and nested `blocks`. Nested blocks are allowed only on
+top-level blocks. The importer writes visible roots with media-only children;
+legacy nested text is folded into the root body and media entries keep their
+own placement text. Media type is inferred from the path extension. Image and
 video paths are relative to the manifest directory. The importer canonicalizes
-and confines them to that directory and accepts JPEG, PNG, WebP, GIF, and MP4
-extensions. It indexes media by canonical file path, so multiple blocks that
-refer to the same file share one upload.
+and confines them to that directory and accepts JPEG, PNG, WebP, GIF, HEIC,
+HEIF, MP4, and MOV extensions. It indexes media by canonical file path, so
+multiple manifest references to one path share one upload.
 
 The importer validates the manifest and every referenced file before upload.
 For each unique path, it streams the file once to `PUT /objects/media/` with
@@ -89,36 +94,52 @@ months and malformed cursors return `400`. The database fetches one extra row
 to tell whether a following page exists; cursors follow the current ordering
 and do not preserve a snapshot across imports.
 
-`POST /api/posts` creates a text-only draft for a `write` or `admin` account.
-The signed-in account is always the author. The request accepts a nonblank
-title, optional summary and tags, and ordered blocks nested at most one level;
-summary, tags, and the block list may be empty. Unknown fields reject media
-references. The draft and all blocks are inserted in one transaction. The
-response is `201 Created`, contains the new ID, and sets `Location` to
-`/posts/{id}`. `GET /api/drafts` lists draft summaries by descending post ID;
-writers see only their own, while admins see all. A read account receives
-`403`. Draft summaries serialize `published_at` as `null`, and draft HTML omits
-the date element.
+`POST /api/posts` creates a draft for a `write` or `admin` account. The signed-in
+account is always the author. The request accepts an optional title, summary,
+tags, and ordered root blocks; these may be empty. The first save creates an
+untitled draft, including the save triggered when a user starts an upload. The
+response is `201 Created`, contains the full saved post tree and revision, and
+sets `Location` to `/posts/{id}`.
+`PUT /api/posts/{id}` replaces the full ordered root-and-gallery tree in one
+immediate transaction, requiring the current revision. Existing root and media
+child IDs are kept, including when a child moves to another root. A stale
+revision returns `409`. `GET /api/drafts` lists draft summaries by descending
+post ID; writers see only their own, while admins see all. A read account
+receives `403`. Draft summaries serialize `published_at` as `null`.
+
+`POST /posts/{post_id}/blocks/{block_id}/media` streams one original file from
+the browser through the website to storage, with backpressure and no full-file
+buffer. The route requires an editable draft root, checks the origin and
+content type, and enforces `JOURNEY_SITE_MAX_MEDIA_UPLOAD_BYTES` (default
+2 GiB). Accepted content types are JPEG, PNG, WebP, GIF, HEIC, HEIF, MP4, and
+QuickTime MOV. An interrupted upload is retried from its beginning by the
+editor. The content-derived key identifies a shared `media_assets` row;
+removing a placement leaves the original stored. The editor keeps a session
+pool keyed by the selected `File` object and does not combine separate files
+by name or size.
 
 `POST /api/posts/{id}/publish` publishes an existing draft immediately. Its
 optional `published_at` integer selects a UTC Unix second; when omitted, the
-server's current second is used. The route applies the origin check and allows
-the draft's `write` author or an `admin`. Other posts and missing posts return
-`404`, already published posts return `409`, and a future timestamp or a post
-without any nonblank block header or body returns `400`. The content validation
-and state transition occur in one immediate SQLite transaction. Success is
-`204 No Content`.
+server's current second is used. Publication requires a nonblank title and at
+least one nonblank root header or body. The route applies the origin check and
+allows the draft's `write` author or an `admin`. Other posts and missing posts
+return `404`, already published posts return `409`, and a future timestamp or a
+post without any nonblank block header or body returns `400`. The content
+validation and state transition occur in one immediate SQLite transaction.
+Success is `204 No Content`.
 
-`GET /posts/new` serves the draft form to authenticated `write` and `admin`
-accounts. It accepts a title, optional summary and comma-separated tags, and
-ordered text blocks with optional headers and bodies. Root blocks and one
-level of child blocks can be added, removed, and reordered in the browser; the
-submitted JSON preserves the visible sibling order and has no media fields.
-The form posts to `POST /api/posts`, prevents repeat submissions while the
-request is active, and keeps its contents visible on failure. On success it
-opens the new read-only draft page with a short creation confirmation. The
-author and admins can publish from that detail page. The confirmation dialog
-uses server time by default or accepts a browser-local date and time override.
+`GET /posts/new` serves the empty editor to authenticated `write` and `admin`
+accounts. An existing editable draft opens the same editor prefilled with its
+saved tree; published posts remain read-only. Root blocks have optional header
+and body text and a media gallery. Authors can reorder roots, select or drop
+multiple files in order, drag placements within or between galleries, duplicate
+a placement, and edit each placement's label, caption, and alt text. Save plus
+autosave send the entire tree with its revision. The editor serializes saves
+and uploads and saves a target root before uploading to it. Save and upload
+status remain visible, and a revision conflict asks the author to reload.
+Publishing warns that some browsers may not display original media and
+provides an authenticated `?download=1` fallback. The publish dialog uses
+server time by default or accepts a browser-local date and time override.
 
 `GET /` renders the newest full post and embeds its cursor when older posts
 exist. A small browser script uses `GET /api/posts` to discover one following
@@ -145,7 +166,7 @@ half-open UTC interval. Feed ordering remains by absolute publication instant.
 Every signed-in HTML page shares a server-rendered navigation sidebar. It
 lists drafts near the top for writers and admins: writers see their own, while
 admins see all, ordered newest first with five initially visible. Readers do
-not see a Drafts section. Each draft links to its read-only page. The sidebar
+not see a Drafts section. Each draft links to its editor. The sidebar
 also lists the five newest published posts, distinct published archive months
 in descending order, and distinct published tags in case-insensitive
 alphabetical order while preserving their stored spelling. Archive months are
@@ -164,26 +185,27 @@ Rust post renderer. Its external CSS and JavaScript are served directly by the
 site without a frontend build step. Generated HTML is indented for readable
 browser page source while its text nodes remain intact.
 
-Rows with children render as section introductions followed by their children
-in sibling order; a group parent's body is its description, even when it has
-media fields. Adjacent child image and video blocks form a responsive gallery,
-and text children split gallery runs. Gallery items open in a keyboard and
-touch navigable slideshow; standalone images use a one-item slideshow, while
-standalone videos remain inline playable. Initial page images prioritize the
+Each root row renders its block header and body, followed by its ordered media
+gallery. Gallery children are never shown as text blocks. Gallery items open in
+a keyboard and touch navigable slideshow; initial page images prioritize the
 first image and lazy-load later images. Direct pages and fragments reuse the
 same original-media URLs; image resizing, format conversion, and variants are
 deferred.
 
 HTML text and attributes are escaped. Image and video blocks use site media
-URLs that identify a post and block ID, never a storage key. The backend
-confirms the block belongs to an accessible post and is media before asking
-storage for it. It streams response bodies and forwards single byte ranges for
-video. Image ranges are ignored. Post editing routes are not implemented.
+URLs that identify a post and media child ID, never a storage key. The backend
+confirms the child belongs to an accessible post and references an asset before
+asking storage for it. It streams response bodies and forwards single byte
+ranges for video. Image ranges are ignored. Adding `?download=1` makes the same
+authenticated media route return an attachment for browser-incompatible
+originals.
 
 The `journey-site import` and `journey-site db` commands provide explicit
 imports and read-only database inspection. `JOURNEY_SITE_DB` selects the
-SQLite path, `JOURNEY_SITE_BIND` selects the website HTTP listener, and
-`JOURNEY_STORAGE_H2C` selects the loopback storage listener.
+SQLite path, `JOURNEY_SITE_BIND` selects the website HTTP listener,
+`JOURNEY_STORAGE_H2C` selects the loopback storage listener, and
+`JOURNEY_SITE_MAX_MEDIA_UPLOAD_BYTES` configures the per-file streaming upload
+limit (2 GiB by default).
 
 ## Accounts and sessions
 
@@ -224,9 +246,9 @@ their own drafts, and admins can read every draft. Writers can create or revoke
 share links for their own published posts; admins can manage links for any
 published post. Guest share links remain limited to published posts. Feeds,
 tags, archives, and sidebar data remain published-only for every account.
-Future edit and delete operations require the author to have `write`
+Draft edit and media upload operations require the author to have `write`
 permission or the account to have `admin`; author credit alone gives a `read`
-account no write permission.
+account no write permission. Published posts cannot be edited.
 
 The development site has no schema migration process. Incompatible database
 changes require recreating the SQLite database and running the destructive

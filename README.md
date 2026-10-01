@@ -114,7 +114,8 @@ loopback. Local loopback HTTP origins are accepted when this variable is unset.
 The `journey_session` cookie is host-only, HttpOnly, and SameSite=Strict. It is
 marked Secure when the configured public origin uses HTTPS. Sessions expire
 after seven days by default; set `JOURNEY_SITE_SESSION_TTL_SECONDS` to change
-the absolute lifetime.
+the absolute lifetime. The media upload limit defaults to 2 GiB per file and
+can be changed with `JOURNEY_SITE_MAX_MEDIA_UPLOAD_BYTES`.
 
 The JSON authentication endpoints are `POST /api/auth/login`,
 `GET /api/auth/current`, and `POST /api/auth/logout`. Login and logout require
@@ -138,23 +139,38 @@ the next post and `GET /posts/{id}/fragment` to append its HTML. The API
 defaults to 10 summaries and accepts a maximum `limit` of 100. Feed responses
 include `posts` and a `next_cursor`; pass that cursor as `after` to request the
 next page. `GET /api/posts/{id}` returns tags and nested full content as JSON,
-and the normal link `GET /posts/{id}` renders it as HTML. The collapsible
-sidebar links to recent posts, monthly archives, and tag-filtered feeds.
-Media is served only through `GET` or `HEAD /posts/{id}/blocks/{block_id}/media`.
-Video requests forward one byte range to storage.
+and the normal link `GET /posts/{id}` renders it as HTML. Draft pages use the
+same block editor as `/posts/new`; published posts stay read-only. The editor
+autosaves text and ordered galleries, supports moving and duplicating media
+placements, and keeps each placement's caption and alt text. Saving the first
+time or uploading a file creates an untitled draft. A nonblank title is
+required before publishing. The collapsible sidebar links to recent posts,
+monthly archives, and tag-filtered feeds. Media is served only through `GET`
+or `HEAD /posts/{id}/blocks/{block_id}/media`; adding `?download=1` downloads
+the original through the authenticated site route. Video requests forward one
+byte range to storage.
 
-`POST /api/posts` creates a text-only draft for a signed-in `write` or `admin`
-account. Its title must be nonblank; summary, tags, and the ordered block list
-may be empty. Blocks support one child level, and media fields are rejected.
-The draft author is always the signed-in account. The response is `201 Created`
-with its ID and a `Location: /posts/{id}` header. `GET /api/drafts` lists a
-write account's drafts by newest ID first; admins receive all drafts. The
-response's `published_at` is `null` for a draft. On the draft detail page, its
-author or an admin can publish immediately or choose a past local date and
-time. `POST /api/posts/{id}/publish` accepts an optional UTC Unix-second
-`published_at`; without it, the server's current second is used. Publication
-times are returned as integer seconds. The browser formats them in local time,
-and archive month membership follows the browser's IANA time zone.
+`POST /api/posts` creates a draft for a signed-in `write` or `admin` account.
+Its title may be blank while drafting; summary, tags, and blocks may also be
+empty. The response is `201 Created` with the draft JSON and a
+`Location: /posts/{id}` header. `PUT /api/posts/{id}` replaces the entire
+ordered block tree with a revision check, keeping existing block IDs stable.
+`POST /posts/{id}/blocks/{block_id}/media` streams one original file through
+the site to storage and returns its content-derived asset key. The default
+per-file limit is 2 GiB; set `JOURNEY_SITE_MAX_MEDIA_UPLOAD_BYTES` to change
+it. JPEG, PNG, WebP, GIF, HEIC, HEIF, MP4, and MOV are accepted. Each gallery
+placement is a media child row and references shared `media_assets` metadata;
+duplicating a placement never duplicates the stored file. `GET /api/drafts`
+lists a write account's drafts by newest ID first; admins receive all drafts.
+
+The author or an admin can publish from the draft editor. A title and at least
+one nonblank block header or body are required. The publish dialog warns that
+original media may not display in every browser and offers an optional past
+local date and time. `POST /api/posts/{id}/publish` accepts an optional UTC
+Unix-second `published_at`; without it, the server's current second is used.
+Publication times are returned as integer seconds. The browser formats them
+in local time, and archive month membership follows the browser's IANA time
+zone.
 
 This development site has no schema migration process. After an incompatible
 site database change, recreate the SQLite database and run the destructive

@@ -9,7 +9,7 @@ use std::{
 };
 
 use bytes::Bytes;
-use futures_util::{stream, Stream};
+use futures_util::{stream, Stream, StreamExt};
 use h2::client::{self, SendRequest};
 use http::{header, Method, Request, StatusCode, Version};
 use tokio::{
@@ -19,10 +19,11 @@ use tokio::{
     sync::Mutex,
 };
 
-const STORAGE_CHUNK_SIZE: usize = 64 * 1024;
+const STORAGE_CHUNK_SIZE: usize = 64 * 1024 * 1024;
 const MEDIA_KEY_PREFIX: &str = "media/";
 
 pub type StorageBody = Pin<Box<dyn Stream<Item = Result<Bytes, std::io::Error>> + Send>>;
+pub const UPLOAD_LIMIT_ERROR: &str = "media file exceeds configured size limit";
 
 pub struct StorageResponse {
     pub status: StatusCode,
@@ -36,6 +37,14 @@ pub trait StorageClient: Clone + Send + Sync + 'static {
         content_type: &str,
         path: &Path,
     ) -> impl Future<Output = Result<String, String>> + Send;
+
+    fn put_stream(
+        &self,
+        content_type: &str,
+        content_length: Option<u64>,
+        body: StorageBody,
+        max_bytes: u64,
+    ) -> impl Future<Output = Result<(String, u64), String>> + Send;
 
     fn get(
         &self,
@@ -245,6 +254,51 @@ impl StorageClient for H2cStorageClient {
             return Err(format!("storage upload failed with HTTP {}", response.status()));
         }
         extract_generated_media_key(response.headers())
+    }
+
+    async fn put_stream(
+        &self,
+        content_type: &str,
+        content_length: Option<u64>,
+        mut body: StorageBody,
+        max_bytes: u64,
+    ) -> Result<(String, u64), String> {
+        let request = Self::request(
+            Method::PUT,
+            MEDIA_KEY_PREFIX,
+            None,
+            Some(content_type),
+            content_length,
+            false,
+            true,
+        )?;
+        let (response, mut send) = self.start_request(request, false).await?;
+        let mut sent = 0_u64;
+        while let Some(chunk) = body.next().await {
+            let chunk = chunk.map_err(|error| {
+                format!("incoming upload request body failed after {sent} bytes: {error}")
+            })?;
+            let next_sent = sent
+                .checked_add(chunk.len() as u64)
+                .ok_or_else(|| UPLOAD_LIMIT_ERROR.to_owned())?;
+            if next_sent > max_bytes {
+                return Err(UPLOAD_LIMIT_ERROR.to_owned());
+            }
+            send_data(&mut send, chunk)
+                .await
+                .map_err(|error| format!("forwarding upload body to storage failed after {sent} bytes: {error}"))?;
+            sent = next_sent;
+        }
+        if content_length.is_some_and(|length| length != sent) {
+            return Err("media upload length did not match Content-Length".to_owned());
+        }
+        send.send_data(Bytes::new(), true)
+            .map_err(|error| error.to_string())?;
+        let response = response.await.map_err(|error| error.to_string())?;
+        if response.status() != StatusCode::OK {
+            return Err(format!("storage upload failed with HTTP {}", response.status()));
+        }
+        Ok((extract_generated_media_key(response.headers())?, sent))
     }
 
     async fn get(

@@ -44,6 +44,7 @@ Environment:
   JOURNEY_STORAGE_H2C   loopback h2c address (default: 127.0.0.1:8081)
   JOURNEY_SITE_PUBLIC_ORIGIN      site's public origin (required off loopback)
   JOURNEY_SITE_SESSION_TTL_SECONDS absolute session lifetime (default: 604800)
+  JOURNEY_SITE_MAX_MEDIA_UPLOAD_BYTES per-file media limit (default: 2147483648)
 ";
 const DB_HELP: &str = "\
 Usage:

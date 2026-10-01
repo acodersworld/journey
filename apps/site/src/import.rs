@@ -299,7 +299,10 @@ fn content_type_for_path(path: &Path) -> AppResult<String> {
         "png" => Ok("image/png".to_owned()),
         "webp" => Ok("image/webp".to_owned()),
         "gif" => Ok("image/gif".to_owned()),
+        "heic" => Ok("image/heic".to_owned()),
+        "heif" => Ok("image/heif".to_owned()),
         "mp4" => Ok("video/mp4".to_owned()),
+        "mov" => Ok("video/quicktime".to_owned()),
         _ => Err(format!("unsupported media extension: .{extension}").into()),
     }
 }
@@ -330,26 +333,76 @@ fn resolve_blocks(
 ) -> AppResult<Vec<NewBlock>> {
     blocks
         .into_iter()
-        .map(|block| {
-            let media = block
-                .media
-                .map(|media| -> AppResult<_> {
-                    let storage_key = storage_keys.get(&media.path).cloned().ok_or_else(|| {
-                        format!("media asset was not uploaded: {}", media.path.display())
-                    })?;
-                    Ok((storage_key, media.content_type, media.alt))
-                })
-                .transpose()?;
-            Ok(NewBlock {
-                header: block.header,
-                body: block.body,
-                storage_key: media.as_ref().map(|(storage_key, _, _)| storage_key.clone()),
-                content_type: media.as_ref().map(|(_, content_type, _)| content_type.clone()),
-                alt: media.and_then(|(_, _, alt)| alt),
-                children: resolve_blocks(block.children, storage_keys)?,
-            })
-        })
+        .map(|block| resolve_root_block(block, storage_keys))
         .collect()
+}
+
+fn resolve_root_block(
+    block: PreparedBlock,
+    storage_keys: &BTreeMap<PathBuf, String>,
+) -> AppResult<NewBlock> {
+    let mut children = Vec::new();
+    if let Some(media) = block.media {
+        children.push(resolve_media_item(media, None, None, storage_keys)?);
+    }
+    let mut body_parts = Vec::new();
+    if let Some(body) = block.body {
+        body_parts.push(body);
+    }
+    for child in block.children {
+        collect_import_content(child, storage_keys, &mut children, &mut body_parts)?;
+    }
+    Ok(NewBlock {
+        id: None,
+        header: block.header,
+        body: (!body_parts.is_empty()).then(|| body_parts.join("\n\n")),
+        storage_key: None,
+        content_type: None,
+        alt: None,
+        children,
+    })
+}
+
+fn collect_import_content(
+    block: PreparedBlock,
+    storage_keys: &BTreeMap<PathBuf, String>,
+    gallery: &mut Vec<NewBlock>,
+    body_parts: &mut Vec<String>,
+) -> AppResult<()> {
+    if let Some(media) = block.media {
+        gallery.push(resolve_media_item(media, block.header, block.body, storage_keys)?);
+    } else {
+        if let Some(header) = block.header {
+            body_parts.push(header);
+        }
+        if let Some(body) = block.body {
+            body_parts.push(body);
+        }
+    }
+    for child in block.children {
+        collect_import_content(child, storage_keys, gallery, body_parts)?;
+    }
+    Ok(())
+}
+
+fn resolve_media_item(
+    media: PreparedMedia,
+    header: Option<String>,
+    body: Option<String>,
+    storage_keys: &BTreeMap<PathBuf, String>,
+) -> AppResult<NewBlock> {
+    let storage_key = storage_keys.get(&media.path).cloned().ok_or_else(|| {
+        format!("media asset was not uploaded: {}", media.path.display())
+    })?;
+    Ok(NewBlock {
+        id: None,
+        header,
+        body,
+        storage_key: Some(storage_key),
+        content_type: Some(media.content_type),
+        alt: media.alt,
+        children: Vec::new(),
+    })
 }
 
 #[cfg(test)]
@@ -364,7 +417,7 @@ mod tests {
     };
 
     use super::*;
-    use crate::storage::StorageResponse;
+    use crate::storage::{StorageBody, StorageResponse};
 
     static NEXT_TEMP_ID: AtomicU64 = AtomicU64::new(0);
 
@@ -401,6 +454,16 @@ mod tests {
                     .pop_front()
                     .unwrap_or_else(|| Err("no stubbed upload response".to_owned()))
             }
+        }
+
+        fn put_stream(
+            &self,
+            _content_type: &str,
+            _content_length: Option<u64>,
+            _body: StorageBody,
+            _max_bytes: u64,
+        ) -> impl std::future::Future<Output = Result<(String, u64), String>> + Send {
+            async { Err("stream uploads are unused in import tests".to_owned()) }
         }
 
         fn get(
@@ -549,8 +612,10 @@ mod tests {
         assert!(database.drafts(None).await.unwrap().is_empty());
         assert_eq!(post.tags, vec!["Import test", "CASE-sensitive"]);
         for block in &post.blocks {
-            let media = database.media_reference(summary.id, block.id).await.unwrap().unwrap();
-            assert_eq!(media.storage_key, key);
+            for placement in &block.children {
+                let media = database.media_reference(summary.id, placement.id).await.unwrap().unwrap();
+                assert_eq!(media.storage_key, key);
+            }
         }
     }
 
@@ -569,8 +634,10 @@ mod tests {
         let summary = database.all_summaries().await.unwrap().remove(0);
         let post = database.post(summary.id).await.unwrap().unwrap();
         for block in &post.blocks {
-            let media = database.media_reference(summary.id, block.id).await.unwrap().unwrap();
-            assert_eq!(media.storage_key, key);
+            for placement in &block.children {
+                let media = database.media_reference(summary.id, placement.id).await.unwrap().unwrap();
+                assert_eq!(media.storage_key, key);
+            }
         }
     }
 

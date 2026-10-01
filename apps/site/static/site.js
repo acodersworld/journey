@@ -205,6 +205,21 @@ if (publishDialog) {
       return;
     }
 
+    if (draftForm && !document.querySelector('#draft-title').value.trim()) {
+      errorMessage.textContent = 'Add a title before publishing this post.';
+      errorMessage.hidden = false;
+      return;
+    }
+    if (typeof window.journeySaveDraft === 'function') {
+      try {
+        await window.journeySaveDraft();
+      } catch (_) {
+        errorMessage.textContent = 'Save the latest draft changes before publishing.';
+        errorMessage.hidden = false;
+        return;
+      }
+    }
+
     let payload = {};
     if (useTimeCheckbox.checked) {
       const instant = new Date(timeInput.value);
@@ -243,7 +258,9 @@ if (publishDialog) {
         errorMessage.textContent = 'This post has already been published.';
       } else {
         const returnedError = (await response.text()).trim();
-        errorMessage.textContent = returnedError || 'Could not publish this post. Try again.';
+        errorMessage.textContent = returnedError.includes('title')
+          ? 'Add a title before publishing this post.'
+          : returnedError || 'Could not publish this post. Try again.';
       }
       errorMessage.hidden = false;
     } catch (_) {
@@ -272,7 +289,17 @@ if (draftForm) {
   const tagsInput = document.querySelector('#draft-tags');
   const submitButton = document.querySelector('#draft-submit');
   const errorMessage = document.querySelector('#draft-form-error');
-  let draftBusy = false;
+  const statusMessage = document.querySelector('#draft-status');
+  const publishButton = document.querySelector('#draft-publish');
+  const publishHelp = document.querySelector('#draft-publish-help');
+  let postId = Number(draftForm.dataset.draftPostId) || null;
+  let revision = null;
+  let editVersion = 0;
+  let dirty = false;
+  let saveTimer = null;
+  let operationQueue = Promise.resolve();
+  const uploadedFiles = new WeakMap();
+  let draggedMedia = null;
 
   function clearDraftError() {
     errorMessage.hidden = true;
@@ -284,12 +311,37 @@ if (draftForm) {
     errorMessage.hidden = false;
   }
 
+  function queueOperation(operation) {
+    const result = operationQueue.then(operation);
+    operationQueue = result.catch(() => {});
+    return result;
+  }
+
+  function updatePublishButton() {
+    publishButton.hidden = !postId;
+    publishButton.dataset.publishPost = postId ? String(postId) : '';
+    const titleIsBlank = !titleInput.value.trim();
+    publishButton.disabled = titleIsBlank;
+    publishHelp.hidden = !postId || !titleIsBlank;
+  }
+
+  function updateStatus(message) {
+    statusMessage.textContent = message;
+  }
+
   function makeActionButton(label, action, className = '') {
     const button = document.createElement('button');
     button.type = 'button';
     button.className = `draft-small-button ${className}`.trim();
     button.dataset.blockAction = action;
     button.textContent = label;
+    return button;
+  }
+
+  function makeMediaActionButton(label, action, className = '') {
+    const button = makeActionButton(label, action, className);
+    delete button.dataset.blockAction;
+    button.dataset.mediaAction = action;
     return button;
   }
 
@@ -309,13 +361,13 @@ if (draftForm) {
     return label;
   }
 
-  function makeDraftBlock(isChild = false) {
+  function makeDraftBlock() {
     const block = document.createElement('fieldset');
-    block.className = isChild ? 'draft-block draft-child-block' : 'draft-block';
+    block.className = 'draft-block';
     block.dataset.draftBlock = '';
 
     const legend = document.createElement('legend');
-    legend.textContent = isChild ? 'Child block' : 'Text block';
+    legend.textContent = 'Block';
     block.append(legend);
 
     const actions = document.createElement('div');
@@ -323,7 +375,7 @@ if (draftForm) {
     actions.append(
       makeActionButton('Move up', 'move-up'),
       makeActionButton('Move down', 'move-down'),
-      makeActionButton('Remove', 'remove', 'draft-remove-button'),
+      makeActionButton('Remove block', 'remove', 'draft-remove-button'),
     );
     block.append(actions);
 
@@ -333,30 +385,120 @@ if (draftForm) {
     fields.append(makeBlockField('Body (optional)', 'body', true));
     block.append(fields);
 
-    if (!isChild) {
-      const childArea = document.createElement('div');
-      childArea.className = 'draft-child-area';
-      const childHeading = document.createElement('h3');
-      childHeading.textContent = 'Child blocks';
-      const childList = document.createElement('div');
-      childList.className = 'draft-child-list';
-      childList.dataset.blockList = 'child';
-      const addChildButton = makeActionButton('Add child block', 'add-child');
-      childArea.append(childHeading, childList, addChildButton);
-      block.append(childArea);
-    }
+    const gallery = document.createElement('section');
+    gallery.className = 'draft-gallery';
+    const galleryHeading = document.createElement('h3');
+    galleryHeading.textContent = 'Gallery';
+    const galleryList = document.createElement('div');
+    galleryList.className = 'draft-gallery-list';
+    galleryList.dataset.galleryList = '';
+    const fileInput = document.createElement('input');
+    fileInput.className = 'draft-file-input';
+    fileInput.type = 'file';
+    fileInput.multiple = true;
+    fileInput.accept = 'image/jpeg,image/png,image/webp,image/gif,image/heic,image/heif,video/mp4,video/quicktime,.jpg,.jpeg,.png,.webp,.gif,.heic,.heif,.mp4,.mov';
+    const addMedia = makeActionButton('Add media', 'select-media');
+    const dropHelp = document.createElement('p');
+    dropHelp.className = 'draft-drop-help';
+    dropHelp.textContent = 'Drop files here or choose several. Drag a thumbnail to move it between blocks.';
+    gallery.append(galleryHeading, galleryList, fileInput, addMedia, dropHelp);
+    block.append(gallery);
 
     return block;
   }
 
+  function makeMediaField(labelText, name, multiline = false) {
+    const label = makeBlockField(labelText, name, multiline);
+    label.classList.add('draft-media-field');
+    return label;
+  }
+
+  function makeMediaItem(media = {}, pendingFileName = null) {
+    const item = document.createElement('article');
+    item.className = 'draft-media-item';
+    item.dataset.draftMedia = '';
+    item.draggable = !pendingFileName;
+    if (pendingFileName) item.dataset.uploadPending = '';
+    if (media.id) item.dataset.blockId = String(media.id);
+    if (media.storage_key) item.dataset.storageKey = media.storage_key;
+    if (media.content_type) item.dataset.contentType = media.content_type;
+    if (media.alt) item.dataset.alt = media.alt;
+    if (media.previewUrl) item.dataset.previewUrl = media.previewUrl;
+
+    const preview = document.createElement('div');
+    preview.className = 'draft-media-preview';
+    const source = media.previewUrl || (postId && media.id
+      ? `/posts/${encodeURIComponent(postId)}/blocks/${encodeURIComponent(media.id)}/media`
+      : '');
+    if (source && String(media.content_type || '').startsWith('image/')) {
+      const image = document.createElement('img');
+      image.src = source;
+      image.alt = media.alt || '';
+      preview.append(image);
+    } else if (source && String(media.content_type || '').startsWith('video/')) {
+      const video = document.createElement('video');
+      video.src = source;
+      video.preload = 'metadata';
+      video.controls = true;
+      preview.append(video);
+    } else {
+      preview.textContent = 'Original media';
+    }
+    if (pendingFileName) {
+      const upload = document.createElement('div');
+      upload.className = 'draft-media-upload';
+      const name = document.createElement('strong');
+      name.className = 'draft-media-upload-name';
+      name.textContent = pendingFileName;
+      const progress = document.createElement('progress');
+      progress.className = 'draft-media-upload-progress';
+      progress.max = 100;
+      progress.value = 0;
+      progress.setAttribute('aria-label', `Uploading ${pendingFileName}`);
+      const detail = document.createElement('span');
+      detail.className = 'draft-media-upload-detail';
+      detail.textContent = 'Waiting to upload…';
+      upload.append(name, progress, detail);
+      preview.append(upload);
+    }
+
+    const fields = document.createElement('div');
+    fields.className = 'draft-media-fields';
+    const labelField = makeMediaField('Label (optional)', 'header');
+    const captionField = makeMediaField('Caption (optional)', 'body', true);
+    const altField = makeMediaField('Alt text (optional)', 'alt');
+    labelField.querySelector('[data-block-field="header"]').value = media.header || '';
+    captionField.querySelector('[data-block-field="body"]').value = media.body || '';
+    altField.querySelector('[data-block-field="alt"]').value = media.alt || '';
+    fields.append(labelField, captionField, altField);
+
+    const actions = document.createElement('div');
+    actions.className = 'draft-media-actions';
+    actions.append(
+      makeMediaActionButton('Duplicate', 'duplicate-media'),
+      makeMediaActionButton('Remove media', 'remove-media', 'draft-remove-button'),
+    );
+    if (pendingFileName) {
+      actions.querySelectorAll('button').forEach(button => { button.disabled = true; });
+    }
+    if (postId && media.id) {
+      const download = document.createElement('a');
+      download.className = 'media-download';
+      download.href = `/posts/${encodeURIComponent(postId)}/blocks/${encodeURIComponent(media.id)}/media?download=1`;
+      download.textContent = 'Download original';
+      actions.append(download);
+    }
+    item.append(preview, fields, actions);
+    return item;
+  }
+
   function updateDraftBlockControls() {
-    document.querySelectorAll('[data-block-list]').forEach(list => {
+    document.querySelectorAll('[data-block-list="root"]').forEach(list => {
       const blocks = Array.from(list.children).filter(child => child.matches('[data-draft-block]'));
       blocks.forEach((block, index) => {
         const legend = block.querySelector(':scope > legend');
         const actions = block.querySelector(':scope > .draft-block-actions');
-        const isChild = list.dataset.blockList === 'child';
-        const label = `${isChild ? 'Child block' : 'Text block'} ${index + 1}`;
+        const label = `Block ${index + 1}`;
         legend.textContent = label;
         const moveUp = actions.querySelector('[data-block-action="move-up"]');
         const moveDown = actions.querySelector('[data-block-action="move-down"]');
@@ -370,20 +512,378 @@ if (draftForm) {
   }
 
   function blockFieldValue(block, name) {
-    const field = block.querySelector(`:scope > .draft-block-fields [data-block-field="${name}"]`);
+    const field = block.querySelector(`[data-block-field="${name}"]`);
     return field.value.trim() ? field.value : null;
   }
 
+  function blockId(node) {
+    const id = Number(node.dataset.blockId);
+    return Number.isSafeInteger(id) && id > 0 ? id : undefined;
+  }
+
   function serializeBlock(block) {
-    const childList = block.querySelector(':scope > .draft-child-area > [data-block-list="child"]');
-    const children = childList
-      ? Array.from(childList.children).filter(child => child.matches('[data-draft-block]')).map(serializeBlock)
-      : [];
-    return {
+    const mediaList = block.querySelector(':scope > .draft-gallery > [data-gallery-list]');
+    const children = Array.from(mediaList.children)
+      .filter(child => child.matches('[data-draft-media]') && !child.hasAttribute('data-upload-pending'))
+      .map(item => {
+        const child = {
+          header: blockFieldValue(item, 'header'),
+          body: blockFieldValue(item, 'body'),
+          storage_key: item.dataset.storageKey || null,
+          content_type: item.dataset.contentType || null,
+          alt: blockFieldValue(item, 'alt'),
+          children: [],
+        };
+        const id = blockId(item);
+        if (id) child.id = id;
+        return child;
+      });
+    const serialized = {
       header: blockFieldValue(block, 'header'),
       body: blockFieldValue(block, 'body'),
-      blocks: children,
+      children,
     };
+    const id = blockId(block);
+    if (id) serialized.id = id;
+    return serialized;
+  }
+
+  function snapshotEditor() {
+    const rootNodes = Array.from(rootBlockList.children).filter(block => block.matches('[data-draft-block]'));
+    const blocks = rootNodes.map(serializeBlock);
+    const mediaNodes = rootNodes.map(root => Array.from(root.querySelector('[data-gallery-list]').children)
+      .filter(child => child.matches('[data-draft-media]') && !child.hasAttribute('data-upload-pending')));
+    return {
+      version: editVersion,
+      rootNodes,
+      mediaNodes,
+      payload: {
+        title: titleInput.value,
+        summary: summaryInput.value,
+        tags: tagsInput.value.split(',').map(tag => tag.trim()).filter(Boolean),
+        blocks,
+      },
+    };
+  }
+
+  function applySavedIds(post, snapshot) {
+    post.blocks.forEach((root, index) => {
+      const rootNode = snapshot.rootNodes[index];
+      if (rootNode) rootNode.dataset.blockId = String(root.id);
+      (root.children || []).forEach((child, childIndex) => {
+        const mediaNode = snapshot.mediaNodes[index]?.[childIndex];
+        if (!mediaNode) return;
+        mediaNode.dataset.blockId = String(child.id);
+        if (child.storage_key) mediaNode.dataset.storageKey = child.storage_key;
+        if (child.content_type) mediaNode.dataset.contentType = child.content_type;
+        const download = mediaNode.querySelector('.media-download');
+        if (!download) {
+          const link = document.createElement('a');
+          link.className = 'media-download';
+          link.textContent = 'Download original';
+          mediaNode.querySelector('.draft-media-actions').append(link);
+        }
+        const savedLink = mediaNode.querySelector('.media-download');
+        savedLink.href = `/posts/${encodeURIComponent(postId)}/blocks/${encodeURIComponent(child.id)}/media?download=1`;
+        const preview = mediaNode.querySelector('.draft-media-preview');
+        const mediaUrl = `/posts/${encodeURIComponent(postId)}/blocks/${encodeURIComponent(child.id)}/media`;
+        const image = preview.querySelector('img');
+        const video = preview.querySelector('video');
+        if (image) image.src = mediaUrl;
+        if (video) video.src = mediaUrl;
+      });
+    });
+  }
+
+  async function saveDraftNow(force = false) {
+    if (saveTimer) window.clearTimeout(saveTimer);
+    saveTimer = null;
+    if (postId && !dirty && !force) return true;
+    clearDraftError();
+    const snapshot = snapshotEditor();
+    const payload = { ...snapshot.payload };
+    const url = postId ? `/api/posts/${encodeURIComponent(postId)}` : '/api/posts';
+    const method = postId ? 'PUT' : 'POST';
+    if (postId) payload.revision = revision;
+    submitButton.disabled = true;
+    submitButton.textContent = 'Saving…';
+    draftForm.setAttribute('aria-busy', 'true');
+    updateStatus('Saving…');
+    try {
+      const response = await fetch(url, {
+        method,
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+      });
+      if (response.status === 409) {
+        throw new Error('This draft changed in another session. Reload the page before saving again.');
+      }
+      if (!response.ok) {
+        if (response.status === 401) throw new Error('Your session is no longer active. Sign in again before retrying.');
+        if (response.status === 403) throw new Error('This account is not allowed to edit this draft.');
+        if (response.status === 404) throw new Error('This draft is no longer available.');
+        throw new Error('Could not save the draft. Your entries are still here; please try again.');
+      }
+      const saved = await response.json();
+      if (!saved || !Number.isInteger(saved.id) || !Number.isInteger(saved.revision)) {
+        throw new Error('The server could not confirm the saved draft. Your entries are still here; please retry.');
+      }
+      const wasNew = !postId;
+      postId = saved.id;
+      revision = saved.revision;
+      draftForm.dataset.draftPostId = String(postId);
+      if (wasNew) window.history.replaceState(null, '', `/posts/${encodeURIComponent(postId)}`);
+      applySavedIds(saved, snapshot);
+      updatePublishButton();
+      if (editVersion === snapshot.version) {
+        dirty = false;
+        updateStatus(`Saved at ${new Date().toLocaleTimeString()}`);
+      } else {
+        updateStatus('New changes need saving…');
+        scheduleSave();
+      }
+      return true;
+    } catch (error) {
+      const message = error instanceof Error ? error.message : 'Could not save the draft. Your entries are still here; please try again.';
+      showDraftError(message);
+      updateStatus('Save failed');
+      throw error;
+    } finally {
+      submitButton.disabled = false;
+      submitButton.textContent = 'Save draft';
+      draftForm.removeAttribute('aria-busy');
+    }
+  }
+
+  function scheduleSave() {
+    if (saveTimer) window.clearTimeout(saveTimer);
+    saveTimer = window.setTimeout(() => {
+      saveTimer = null;
+      queueOperation(() => saveDraftNow()).catch(() => {});
+    }, 800);
+  }
+
+  function markDirty() {
+    editVersion += 1;
+    dirty = true;
+    clearDraftError();
+    updateStatus('Unsaved changes');
+    scheduleSave();
+  }
+
+  function contentTypeForFile(file) {
+    const accepted = new Set(['image/jpeg', 'image/png', 'image/webp', 'image/gif', 'image/heic', 'image/heif', 'video/mp4', 'video/quicktime']);
+    const declared = (file.type || '').toLowerCase();
+    if (accepted.has(declared)) return declared;
+    const extension = file.name.split('.').pop().toLowerCase();
+    return ({
+      jpg: 'image/jpeg', jpeg: 'image/jpeg', png: 'image/png', webp: 'image/webp', gif: 'image/gif',
+      heic: 'image/heic', heif: 'image/heif', mp4: 'video/mp4', mov: 'video/quicktime',
+    })[extension] || null;
+  }
+
+  function makePendingMediaItem(file) {
+    const previewUrl = URL.createObjectURL(file);
+    const element = makeMediaItem({ content_type: contentTypeForFile(file), previewUrl }, file.name);
+    return {
+      element,
+      previewUrl,
+      progress: element.querySelector('.draft-media-upload-progress'),
+      detail: element.querySelector('.draft-media-upload-detail'),
+    };
+  }
+
+  function updateUploadProgress(upload, loaded, total) {
+    if (!upload) return;
+    if (total > 0) {
+      const percent = Math.min(100, Math.round((loaded / total) * 100));
+      upload.progress.value = percent;
+      upload.detail.textContent = percent >= 100 ? 'Finishing upload…' : `${percent}% uploaded`;
+    } else {
+      upload.detail.textContent = 'Uploading…';
+    }
+  }
+
+  function sendUploadRequest(url, file, contentType, onProgress) {
+    return new Promise((resolve, reject) => {
+      const request = new XMLHttpRequest();
+      request.open('POST', url);
+      request.setRequestHeader('Content-Type', contentType);
+      request.upload.addEventListener('progress', event => {
+        onProgress(event.loaded, event.lengthComputable ? event.total : file.size);
+      });
+      request.addEventListener('load', () => resolve({ status: request.status, text: request.responseText }));
+      request.addEventListener('error', () => reject(new Error('the connection was interrupted')));
+      request.addEventListener('abort', () => reject(new Error('the upload was canceled')));
+      request.send(file);
+    });
+  }
+
+  async function uploadFile(file, targetBlockId, onProgress, onRetry) {
+    const contentType = contentTypeForFile(file);
+    if (!contentType) throw new Error(`Unsupported media type: ${file.name}`);
+    const pooled = uploadedFiles.get(file);
+    if (pooled) {
+      const uploaded = await pooled;
+      onProgress(file.size, file.size);
+      return uploaded;
+    }
+    const upload = (async () => {
+      const url = `/posts/${encodeURIComponent(postId)}/blocks/${encodeURIComponent(targetBlockId)}/media`;
+      let response = null;
+      for (let attempt = 0; attempt < 2; attempt += 1) {
+        try {
+          response = await sendUploadRequest(url, file, contentType, onProgress);
+        } catch (error) {
+          if (attempt === 0) {
+            onRetry();
+            continue;
+          }
+          throw new Error(`Upload connection failed for ${file.name}: ${error instanceof Error ? error.message : 'check the connection and retry.'}`);
+        }
+        if (response.status === 502 && attempt === 0) {
+          onRetry();
+          continue;
+        }
+        break;
+      }
+      if (response.status === 413) throw new Error(`${file.name} is larger than the configured per-file upload limit.`);
+      if (response.status < 200 || response.status >= 300) throw new Error(`Could not upload ${file.name} (HTTP ${response.status}). Check the connection and retry.`);
+      let uploaded;
+      try {
+        uploaded = JSON.parse(response.text);
+      } catch (_) {
+        throw new Error(`The server could not confirm the upload of ${file.name}.`);
+      }
+      if (!uploaded || !uploaded.storage_key || uploaded.content_type !== contentType) {
+        throw new Error(`The server could not confirm the upload of ${file.name}.`);
+      }
+      return {
+        storage_key: uploaded.storage_key,
+        content_type: uploaded.content_type,
+      };
+    })();
+    uploadedFiles.set(file, upload);
+    upload.catch(() => uploadedFiles.delete(file));
+    return upload;
+  }
+
+  function discardPendingUpload(upload) {
+    if (!upload.element.hasAttribute('data-upload-pending')) return;
+    upload.element.removeAttribute('data-upload-pending');
+    upload.element.remove();
+    URL.revokeObjectURL(upload.previewUrl);
+  }
+
+  function queueMediaUpload(root, files) {
+    if (!root || !root.isConnected || files.length === 0) return;
+    const pendingUploads = files.map(file => makePendingMediaItem(file));
+    const list = root.querySelector('[data-gallery-list]');
+    pendingUploads.forEach(upload => list.append(upload.element));
+    queueOperation(() => addFilesToBlock(root, files, pendingUploads)).catch(error => {
+      showDraftError(error instanceof Error ? error.message : 'Media upload failed.');
+      updateStatus('Upload failed');
+    });
+  }
+
+  async function addFilesToBlock(root, files, pendingUploads) {
+    if (!root.isConnected || files.length === 0) {
+      pendingUploads.forEach(discardPendingUpload);
+      return;
+    }
+    const failures = [];
+    try {
+      updateStatus('Preparing media upload…');
+      await saveDraftNow();
+      if (!root.isConnected) return;
+      const targetBlockId = Number(root.dataset.blockId);
+      if (!postId || !Number.isSafeInteger(targetBlockId) || targetBlockId < 1) {
+        throw new Error('Save this block before uploading media to it.');
+      }
+      for (let index = 0; index < files.length; index += 1) {
+        if (!root.isConnected) return;
+        const file = files[index];
+        const pending = pendingUploads[index];
+        pending.detail.textContent = `Uploading ${index + 1} of ${files.length}…`;
+        updateStatus(`Uploading ${index + 1} of ${files.length}: ${file.name}`);
+        let uploaded;
+        try {
+          uploaded = await uploadFile(
+            file,
+            targetBlockId,
+            (loaded, total) => updateUploadProgress(pending, loaded, total),
+            () => {
+              pending.progress.value = 0;
+              pending.detail.textContent = 'Connection interrupted; retrying from the beginning…';
+              updateStatus(`Connection interrupted; retrying ${file.name}…`);
+            },
+          );
+        } catch (error) {
+          const message = error instanceof Error ? error.message : 'upload failed';
+          failures.push(`${file.name}: ${message}`);
+          discardPendingUpload(pending);
+          updateStatus(`Could not upload ${file.name}; continuing with the next file…`);
+          continue;
+        }
+        if (!root.isConnected) return;
+        pending.element.dataset.storageKey = uploaded.storage_key;
+        pending.element.dataset.contentType = uploaded.content_type;
+        pending.element.removeAttribute('data-upload-pending');
+        pending.element.draggable = true;
+        pending.element.querySelector('.draft-media-upload').remove();
+        pending.element.querySelectorAll('[data-media-action]').forEach(button => { button.disabled = false; });
+        markDirty();
+        await saveDraftNow();
+      }
+      if (failures.length > 0) {
+        throw new Error(`${failures.length} file${failures.length === 1 ? '' : 's'} failed to upload: ${failures.join('; ')}`);
+      }
+    } finally {
+      pendingUploads.forEach(discardPendingUpload);
+    }
+  }
+
+  function loadBlock(root, block) {
+    root.dataset.blockId = String(block.id);
+    root.querySelector('[data-block-field="header"]').value = block.header || '';
+    root.querySelector('[data-block-field="body"]').value = block.body || '';
+    const list = root.querySelector('[data-gallery-list]');
+    (block.children || []).forEach(media => list.append(makeMediaItem(media)));
+  }
+
+  async function loadExistingDraft() {
+    if (!postId) {
+      updatePublishButton();
+      updateStatus('Not saved yet.');
+      return;
+    }
+    updateStatus('Loading draft…');
+    rootBlockList.setAttribute('aria-busy', 'true');
+    const controls = Array.from(draftForm.querySelectorAll('input, textarea, button'));
+    controls.forEach(control => { control.disabled = true; });
+    try {
+      const response = await fetch(`/api/posts/${encodeURIComponent(postId)}`);
+      if (!response.ok) throw new Error('Could not load this draft. Reload the page or check your access.');
+      const post = await response.json();
+      revision = post.revision;
+      titleInput.value = post.title || '';
+      summaryInput.value = post.summary || '';
+      tagsInput.value = (post.tags || []).join(', ');
+      (post.blocks || []).forEach(block => {
+        const root = makeDraftBlock();
+        loadBlock(root, block);
+        rootBlockList.append(root);
+      });
+      updateDraftBlockControls();
+      updatePublishButton();
+      updateStatus('All changes saved');
+    } catch (error) {
+      showDraftError(error instanceof Error ? error.message : 'Could not load this draft.');
+      updateStatus('Draft could not be loaded');
+    } finally {
+      controls.forEach(control => { control.disabled = false; });
+      rootBlockList.removeAttribute('aria-busy');
+    }
   }
 
   draftForm.addEventListener('click', event => {
@@ -397,17 +897,12 @@ if (draftForm) {
       rootBlockList.append(block);
       updateDraftBlockControls();
       block.querySelector('[data-block-field="header"]').focus();
+      markDirty();
       return;
     }
 
-    if (action === 'add-child') {
-      const parent = button.closest('[data-draft-block]');
-      const childList = parent?.querySelector(':scope > .draft-child-area > [data-block-list="child"]');
-      if (!childList) return;
-      const block = makeDraftBlock(true);
-      childList.append(block);
-      updateDraftBlockControls();
-      block.querySelector('[data-block-field="header"]').focus();
+    if (action === 'select-media') {
+      button.closest('[data-draft-block]')?.querySelector('.draft-file-input').click();
       return;
     }
 
@@ -418,82 +913,110 @@ if (draftForm) {
     const index = siblings.indexOf(block);
     if (action === 'remove') {
       const nextFocus = siblings[index + 1] || siblings[index - 1];
-      const parentAddChild = list.closest('[data-draft-block]')
-        ?.querySelector(':scope > .draft-child-area > [data-block-action="add-child"]');
       block.remove();
       updateDraftBlockControls();
-      (nextFocus?.querySelector('[data-block-field="header"]') || parentAddChild || document.querySelector('[data-block-action="add-root"]')).focus();
+      (nextFocus?.querySelector('[data-block-field="header"]') || document.querySelector('[data-block-action="add-root"]')).focus();
+      markDirty();
     } else if (action === 'move-up' && index > 0) {
       list.insertBefore(block, siblings[index - 1]);
       updateDraftBlockControls();
       button.focus();
+      markDirty();
     } else if (action === 'move-down' && index < siblings.length - 1) {
       list.insertBefore(siblings[index + 1], block);
       updateDraftBlockControls();
       button.focus();
+      markDirty();
     }
   });
 
-  titleInput.addEventListener('input', () => {
-    titleInput.removeAttribute('aria-invalid');
-    clearDraftError();
+  draftForm.addEventListener('click', event => {
+    if (!(event.target instanceof Element)) return;
+    const button = event.target.closest('[data-media-action]');
+    if (!button) return;
+    const item = button.closest('[data-draft-media]');
+    if (!item) return;
+    if (button.dataset.mediaAction === 'remove-media') {
+      item.remove();
+      markDirty();
+    } else if (button.dataset.mediaAction === 'duplicate-media') {
+      const copy = makeMediaItem({
+        storage_key: item.dataset.storageKey,
+        content_type: item.dataset.contentType,
+        alt: blockFieldValue(item, 'alt'),
+        header: blockFieldValue(item, 'header'),
+        body: blockFieldValue(item, 'body'),
+        previewUrl: item.dataset.previewUrl,
+      });
+      item.after(copy);
+      markDirty();
+    }
   });
 
-  draftForm.addEventListener('submit', async event => {
-    event.preventDefault();
-    if (draftBusy) return;
-    clearDraftError();
-    if (!titleInput.value.trim()) {
-      titleInput.setAttribute('aria-invalid', 'true');
-      showDraftError('Enter a title before creating this draft.');
-      titleInput.focus();
+  draftForm.addEventListener('input', event => {
+    if (event.target instanceof HTMLInputElement || event.target instanceof HTMLTextAreaElement) {
+      if (event.target === titleInput) updatePublishButton();
+      markDirty();
+    }
+  });
+
+  draftForm.addEventListener('change', event => {
+    if (!(event.target instanceof HTMLInputElement) || event.target.type !== 'file') return;
+    const root = event.target.closest('[data-draft-block]');
+    const files = Array.from(event.target.files || []);
+    event.target.value = '';
+    queueMediaUpload(root, files);
+  });
+
+  rootBlockList.addEventListener('dragstart', event => {
+    const media = event.target instanceof Element ? event.target.closest('[data-draft-media]') : null;
+    if (!media || media.hasAttribute('data-upload-pending')) return;
+    draggedMedia = media;
+    event.dataTransfer.effectAllowed = 'move';
+    event.dataTransfer.setData('text/plain', 'gallery-placement');
+  });
+
+  rootBlockList.addEventListener('dragend', () => { draggedMedia = null; });
+
+  rootBlockList.addEventListener('dragover', event => {
+    const list = event.target instanceof Element ? event.target.closest('[data-gallery-list]') : null;
+    if (!list) return;
+    if (event.dataTransfer.files.length > 0 || draggedMedia) event.preventDefault();
+  });
+
+  rootBlockList.addEventListener('drop', event => {
+    const list = event.target instanceof Element ? event.target.closest('[data-gallery-list]') : null;
+    if (!list) return;
+    if (event.dataTransfer.files.length > 0) {
+      event.preventDefault();
+      const root = list.closest('[data-draft-block]');
+      const files = Array.from(event.dataTransfer.files);
+      queueMediaUpload(root, files);
       return;
     }
-
-    const payload = {
-      title: titleInput.value,
-      summary: summaryInput.value,
-      tags: tagsInput.value.split(',').map(tag => tag.trim()).filter(Boolean),
-      blocks: Array.from(rootBlockList.children)
-        .filter(block => block.matches('[data-draft-block]'))
-        .map(serializeBlock),
-    };
-
-    draftBusy = true;
-    submitButton.disabled = true;
-    submitButton.textContent = 'Creating…';
-    draftForm.setAttribute('aria-busy', 'true');
-
-    let failureMessage = 'Could not create the draft. Your entries are still here; please try again.';
-
-    try {
-      const response = await fetch('/api/posts', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(payload),
-      });
-      if (!response.ok) {
-        if (response.status === 401) failureMessage = 'Your session is no longer active. Your entries are still here; sign in again before retrying.';
-        if (response.status === 403) failureMessage = 'This account is not allowed to create drafts. Your entries are still here.';
-        showDraftError(failureMessage);
-        return;
-      }
-      const created = await response.json();
-      if (!created || !Number.isInteger(created.id) || created.id < 1) {
-        failureMessage = 'The server could not confirm the new draft. Your entries are still here; please try again.';
-        showDraftError(failureMessage);
-        return;
-      }
-      window.location.assign(`/posts/${encodeURIComponent(created.id)}?created=1`);
-    } catch (_) {
-      showDraftError(failureMessage);
-    } finally {
-      draftBusy = false;
-      submitButton.disabled = false;
-      submitButton.textContent = 'Create draft';
-      draftForm.removeAttribute('aria-busy');
-    }
+    if (!draggedMedia) return;
+    event.preventDefault();
+    const target = event.target instanceof Element ? event.target.closest('[data-draft-media]') : null;
+    if (target === draggedMedia) return;
+    if (target) list.insertBefore(draggedMedia, target);
+    else list.append(draggedMedia);
+    draggedMedia = null;
+    markDirty();
   });
+
+  draftForm.addEventListener('submit', event => {
+    event.preventDefault();
+    queueOperation(() => saveDraftNow(true)).catch(() => {});
+  });
+
+  window.journeySaveDraft = () => {
+    if (saveTimer) window.clearTimeout(saveTimer);
+    saveTimer = null;
+    return queueOperation(() => saveDraftNow());
+  };
+
+  updatePublishButton();
+  loadExistingDraft();
 }
 
 const shareDialog = document.querySelector('#share-dialog');

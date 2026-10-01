@@ -7,17 +7,19 @@ use axum::{
     routing::{delete, get, post},
     Json, Router,
 };
+use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
-use std::{net::{IpAddr, SocketAddr}, time::{Duration, SystemTime, UNIX_EPOCH}};
+use std::{io, net::{IpAddr, SocketAddr}, time::{Duration, SystemTime, UNIX_EPOCH}};
 
 use crate::{
     auth,
-    db::{AccountRole, AuthenticatedAccount, Database, FeedCursor, MediaReference, NewBlock, Post, PostAccess, ShareAccess, SidebarData},
-    storage::StorageClient,
+    db::{AccountRole, AuthenticatedAccount, Database, FeedCursor, MediaReference, NewBlock, Post, PostAccess, SaveDraftResult, ShareAccess, SidebarData},
+    storage::{StorageBody, StorageClient, UPLOAD_LIMIT_ERROR},
 };
 
 const DEFAULT_FEED_LIMIT: usize = 10;
 const MAX_FEED_LIMIT: usize = 100;
+const DEFAULT_MAX_MEDIA_UPLOAD_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 
 #[derive(Clone)]
 pub struct AppState<S: StorageClient> {
@@ -31,6 +33,7 @@ pub struct SiteSecurity {
     public_origin: Option<ParsedOrigin>,
     secure_cookie: bool,
     session_lifetime: Duration,
+    max_media_upload_bytes: u64,
 }
 
 #[derive(Clone)]
@@ -99,7 +102,8 @@ struct TagPageQuery {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct CreateDraftRequest {
-    title: String,
+    #[serde(default)]
+    title: Option<String>,
     #[serde(default)]
     summary: Option<String>,
     #[serde(default)]
@@ -112,16 +116,39 @@ struct CreateDraftRequest {
 #[serde(deny_unknown_fields)]
 struct CreateDraftBlock {
     #[serde(default)]
+    id: Option<i64>,
+    #[serde(default)]
     header: Option<String>,
     #[serde(default)]
     body: Option<String>,
+    #[serde(default)]
+    storage_key: Option<String>,
+    #[serde(default)]
+    content_type: Option<String>,
+    #[serde(default)]
+    alt: Option<String>,
+    #[serde(default)]
+    children: Vec<CreateDraftBlock>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SaveDraftRequest {
+    revision: i64,
+    title: String,
+    #[serde(default)]
+    summary: String,
+    #[serde(default)]
+    tags: Vec<String>,
     #[serde(default)]
     blocks: Vec<CreateDraftBlock>,
 }
 
 #[derive(Serialize)]
-struct CreatedPostResponse {
-    id: i64,
+struct UploadedMediaResponse {
+    storage_key: String,
+    content_type: String,
+    size_bytes: u64,
 }
 
 #[derive(Deserialize)]
@@ -158,11 +185,19 @@ impl SiteSecurity {
         if session_lifetime_seconds <= 0 {
             return Err("JOURNEY_SITE_SESSION_TTL_SECONDS must be a positive integer".to_owned());
         }
+        let max_media_upload_bytes = std::env::var("JOURNEY_SITE_MAX_MEDIA_UPLOAD_BYTES")
+            .unwrap_or_else(|_| DEFAULT_MAX_MEDIA_UPLOAD_BYTES.to_string())
+            .parse::<u64>()
+            .map_err(|_| "JOURNEY_SITE_MAX_MEDIA_UPLOAD_BYTES must be a positive integer".to_owned())?;
+        if max_media_upload_bytes == 0 || max_media_upload_bytes > i64::MAX as u64 {
+            return Err("JOURNEY_SITE_MAX_MEDIA_UPLOAD_BYTES must be between 1 and 9223372036854775807".to_owned());
+        }
         let secure_cookie = !allow_insecure_cookies;
         Ok(Self {
             public_origin,
             secure_cookie,
             session_lifetime: Duration::from_secs(session_lifetime_seconds as u64),
+            max_media_upload_bytes,
         })
     }
 }
@@ -195,7 +230,7 @@ pub fn router<S: StorageClient>(state: AppState<S>) -> Router {
         .route("/posts/new", get(new_post_page::<S>))
         .route("/api/posts", get(feed::<S>).post(create_draft::<S>))
         .route("/api/drafts", get(drafts::<S>))
-        .route("/api/posts/{id}", get(api_full_post::<S>))
+        .route("/api/posts/{id}", get(api_full_post::<S>).put(save_draft::<S>))
         .route("/api/posts/{id}/publish", post(publish_post::<S>))
         .route("/api/posts/{id}/share-links", post(create_share_link::<S>))
         .route("/api/share-links/{id}", delete(revoke_share_link::<S>))
@@ -204,7 +239,7 @@ pub fn router<S: StorageClient>(state: AppState<S>) -> Router {
         .route("/posts/{id}", get(post_page::<S>))
         .route(
             "/posts/{post_id}/blocks/{block_id}/media",
-            get(media::<S>).head(media::<S>),
+            get(media::<S>).head(media::<S>).post(upload_media::<S>),
         )
         .route_layer(middleware::from_fn_with_state(state.clone(), authenticate::<S>));
 
@@ -319,6 +354,7 @@ async fn shared_media<S: StorageClient>(
     Path((share_link_id, post_id, block_id)): Path<(String, i64, i64)>,
     method: Method,
     headers: HeaderMap,
+    uri: Uri,
 ) -> Response {
     let Some(token) = share_cookie_token(&headers, &share_link_id) else {
         return share_not_found();
@@ -341,7 +377,7 @@ async fn shared_media<S: StorageClient>(
             return no_store(StatusCode::INTERNAL_SERVER_ERROR.into_response());
         }
     };
-    no_store(proxy_media(&state.storage, media, method, headers).await)
+    no_store(proxy_media(&state.storage, media, method, headers, uri.query().is_some_and(|query| query.split('&').any(|item| item == "download=1")), block_id).await)
 }
 
 async fn share_preview<S: StorageClient>(
@@ -1073,18 +1109,15 @@ async fn create_draft<S: StorageClient>(
     if !origin_allowed(&headers, &state.security) {
         return no_store((StatusCode::FORBIDDEN, "origin not allowed\n").into_response());
     }
-    if request.title.trim().is_empty() {
-        return no_store((StatusCode::BAD_REQUEST, "title must not be blank\n").into_response());
-    }
-    if request.blocks.iter().any(|block| block.blocks.iter().any(|child| !child.blocks.is_empty())) {
-        return no_store((StatusCode::BAD_REQUEST, "post blocks may only be nested one level deep\n").into_response());
+    if !valid_editor_blocks(&request.blocks) || request.blocks.iter().any(|block| !block.children.is_empty()) {
+        return no_store((StatusCode::BAD_REQUEST, "new drafts must be saved before media is uploaded\n").into_response());
     }
     let blocks = request.blocks.into_iter().map(create_draft_block).collect();
     match state
         .database
         .create_draft(
-            principal.username,
-            request.title,
+            principal.username.clone(),
+            request.title.unwrap_or_default(),
             request.summary.unwrap_or_default(),
             request.tags.unwrap_or_default(),
             blocks,
@@ -1092,7 +1125,15 @@ async fn create_draft<S: StorageClient>(
         .await
     {
         Ok(id) => {
-            let mut response = Json(CreatedPostResponse { id }).into_response();
+            let post = match state.database.post_with_access(id, principal.post_access()).await {
+                Ok(Some(post)) => post,
+                Ok(None) => return no_store(StatusCode::INTERNAL_SERVER_ERROR.into_response()),
+                Err(error) => {
+                    eprintln!("website created-draft query failed: {error}");
+                    return no_store(StatusCode::INTERNAL_SERVER_ERROR.into_response());
+                }
+            };
+            let mut response = Json(post).into_response();
             *response.status_mut() = StatusCode::CREATED;
             if let Ok(location) = HeaderValue::from_str(&format!("/posts/{id}")) {
                 response.headers_mut().insert(header::LOCATION, location);
@@ -1108,13 +1149,147 @@ async fn create_draft<S: StorageClient>(
 
 fn create_draft_block(block: CreateDraftBlock) -> NewBlock {
     NewBlock {
+        id: block.id,
         header: block.header,
         body: block.body,
-        storage_key: None,
-        content_type: None,
-        alt: None,
-        children: block.blocks.into_iter().map(create_draft_block).collect(),
+        storage_key: block.storage_key,
+        content_type: block.content_type,
+        alt: block.alt,
+        children: block.children.into_iter().map(create_draft_block).collect(),
     }
+}
+
+fn valid_editor_blocks(blocks: &[CreateDraftBlock]) -> bool {
+    blocks.iter().all(|root| {
+        root.storage_key.is_none()
+            && root.content_type.is_none()
+            && root.alt.is_none()
+            && root.children.iter().all(|child| {
+                child.storage_key.is_some()
+                    && child.content_type.is_some()
+                    && child.children.is_empty()
+            })
+    })
+}
+
+async fn save_draft<S: StorageClient>(
+    State(state): State<AppState<S>>,
+    Path(id): Path<i64>,
+    Extension(principal): Extension<AuthPrincipal>,
+    headers: HeaderMap,
+    Json(request): Json<SaveDraftRequest>,
+) -> Response {
+    if !matches!(principal.role, AccountRole::Write | AccountRole::Admin) {
+        return no_store(StatusCode::FORBIDDEN.into_response());
+    }
+    if !origin_allowed(&headers, &state.security) {
+        return no_store((StatusCode::FORBIDDEN, "origin not allowed\n").into_response());
+    }
+    if request.revision < 1 || !valid_editor_blocks(&request.blocks) {
+        return no_store((StatusCode::BAD_REQUEST, "invalid draft revision or block tree\n").into_response());
+    }
+    match state.database.save_draft(
+        id,
+        principal.username.clone(),
+        principal.role == AccountRole::Admin,
+        request.revision,
+        request.title,
+        request.summary,
+        request.tags,
+        request.blocks.into_iter().map(create_draft_block).collect(),
+    ).await {
+        Ok(SaveDraftResult::Saved(post)) => no_store(Json(post).into_response()),
+        Ok(SaveDraftResult::NotFound) => no_store(StatusCode::NOT_FOUND.into_response()),
+        Ok(SaveDraftResult::Conflict) => no_store((StatusCode::CONFLICT, "draft revision conflict; reload before saving\n").into_response()),
+        Ok(SaveDraftResult::Published) => no_store((StatusCode::CONFLICT, "published posts are read-only\n").into_response()),
+        Err(error) => {
+            if ["block ID", "gallery item", "media placement", "visible blocks"]
+                .iter()
+                .any(|message| error.contains(message))
+            {
+                return no_store((StatusCode::BAD_REQUEST, "invalid draft block tree or media reference\n").into_response());
+            }
+            eprintln!("website draft save failed: {error}");
+            no_store(StatusCode::INTERNAL_SERVER_ERROR.into_response())
+        }
+    }
+}
+
+async fn upload_media<S: StorageClient>(
+    State(state): State<AppState<S>>,
+    Path((post_id, block_id)): Path<(i64, i64)>,
+    Extension(principal): Extension<AuthPrincipal>,
+    request: Request,
+) -> Response {
+    if !matches!(principal.role, AccountRole::Write | AccountRole::Admin) {
+        return no_store(StatusCode::FORBIDDEN.into_response());
+    }
+    if !origin_allowed(request.headers(), &state.security) {
+        return no_store((StatusCode::FORBIDDEN, "origin not allowed\n").into_response());
+    }
+    let content_type = match single_header(request.headers(), header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+    {
+        Some(content_type) if supported_upload_content_type(content_type) => content_type.to_ascii_lowercase(),
+        _ => return no_store(StatusCode::UNSUPPORTED_MEDIA_TYPE.into_response()),
+    };
+    let content_length = match single_header(request.headers(), header::CONTENT_LENGTH) {
+        Some(value) => match value.to_str().ok().and_then(|value| value.parse::<u64>().ok()) {
+            Some(length) => Some(length),
+            None => return no_store(StatusCode::BAD_REQUEST.into_response()),
+        },
+        None => None,
+    };
+    if content_length.is_some_and(|length| length > state.security.max_media_upload_bytes) {
+        return no_store(StatusCode::PAYLOAD_TOO_LARGE.into_response());
+    }
+    match state.database.draft_root_exists(
+        post_id,
+        block_id,
+        principal.username,
+        principal.role == AccountRole::Admin,
+    ).await {
+        Ok(true) => {}
+        Ok(false) => return no_store(StatusCode::NOT_FOUND.into_response()),
+        Err(error) => {
+            eprintln!("website upload authorization query failed: {error}");
+            return no_store(StatusCode::INTERNAL_SERVER_ERROR.into_response());
+        }
+    }
+    let body: StorageBody = Box::pin(
+        request.into_body().into_data_stream().map(|chunk| chunk.map_err(io::Error::other)),
+    );
+    match state.storage.put_stream(
+        &content_type,
+        content_length,
+        body,
+        state.security.max_media_upload_bytes,
+    ).await {
+        Ok((storage_key, size_bytes)) => {
+            if let Err(error) = state.database.record_media_asset(storage_key.clone(), content_type.clone(), size_bytes).await {
+                eprintln!("website media metadata registration failed: {error}");
+                return no_store(StatusCode::INTERNAL_SERVER_ERROR.into_response());
+            }
+            no_store(Json(UploadedMediaResponse { storage_key, content_type, size_bytes }).into_response())
+        }
+        Err(error) if error == UPLOAD_LIMIT_ERROR => no_store(StatusCode::PAYLOAD_TOO_LARGE.into_response()),
+        Err(error) => {
+            eprintln!("website media upload failed: {error}");
+            no_store(StatusCode::BAD_GATEWAY.into_response())
+        }
+    }
+}
+
+fn single_header<'a>(headers: &'a HeaderMap, name: header::HeaderName) -> Option<&'a HeaderValue> {
+    let mut values = headers.get_all(name).iter();
+    let value = values.next()?;
+    values.next().is_none().then_some(value)
+}
+
+fn supported_upload_content_type(content_type: &str) -> bool {
+    matches!(content_type.to_ascii_lowercase().as_str(),
+        "image/jpeg" | "image/png" | "image/webp" | "image/gif" | "image/heic" | "image/heif"
+            | "video/mp4" | "video/quicktime")
 }
 
 async fn publish_post<S: StorageClient>(
@@ -1152,6 +1327,10 @@ async fn publish_post<S: StorageClient>(
         Ok(crate::db::PublishPostResult::MissingText) => no_store((
             StatusCode::BAD_REQUEST,
             "a post needs a text block with a nonblank header or body before it can be published\n",
+        ).into_response()),
+        Ok(crate::db::PublishPostResult::MissingTitle) => no_store((
+            StatusCode::BAD_REQUEST,
+            "a post needs a nonblank title before it can be published\n",
         ).into_response()),
         Ok(crate::db::PublishPostResult::FutureTimestamp) => no_store((
             StatusCode::BAD_REQUEST,
@@ -1339,16 +1518,24 @@ async fn post_page<S: StorageClient>(
                     return StatusCode::INTERNAL_SERVER_ERROR.into_response();
                 }
             };
+            if !post.published {
+                let created = query.ok().is_some_and(|Query(query)| query.created.as_deref() == Some("1"));
+                return Html(render_draft_editor_page(
+                    &sidebar,
+                    &post,
+                    &principal.username,
+                    principal.role,
+                    created,
+                )).into_response();
+            }
             Html(render_full_post(
                 &sidebar,
                 &post,
                 &principal.username,
                 principal.role,
-                !post.published
-                    && query.ok().is_some_and(|Query(query)| query.created.as_deref() == Some("1")),
+                false,
                 principal.share_access().as_ref(),
-            ))
-            .into_response()
+            )).into_response()
         }
         Ok(None) => StatusCode::NOT_FOUND.into_response(),
         Err(error) => {
@@ -1529,19 +1716,53 @@ fn render_tag_feed(
 }
 
 fn render_new_post_page(sidebar: &SidebarData, username: &str, role: AccountRole) -> String {
+    render_draft_editor(sidebar, None, username, role, false)
+}
+
+fn render_draft_editor_page(
+    sidebar: &SidebarData,
+    post: &Post,
+    username: &str,
+    role: AccountRole,
+    created: bool,
+) -> String {
+    render_draft_editor(sidebar, Some(post), username, role, created)
+}
+
+fn render_draft_editor(
+    sidebar: &SidebarData,
+    post: Option<&Post>,
+    username: &str,
+    role: AccountRole,
+    created: bool,
+) -> String {
+    let post_id = post.map(|post| post.summary.id.to_string()).unwrap_or_default();
+    let heading = if post.is_some() { "Edit draft" } else { "New draft" };
+    let confirmation = if created {
+        "<p class=\"creation-confirmation\" data-created-confirmation role=\"status\">Draft created. Continue editing it here.</p>"
+    } else {
+        ""
+    };
     let content = concat!(
         "<main class=\"site site-new-post\">",
-        "<header class=\"new-post-heading\"><p class=\"back-link\"><a href=\"/\">All posts</a></p><h1>Create a draft</h1></header>",
-        "<form class=\"draft-form\" id=\"draft-form\" novalidate>",
-        "<div class=\"draft-field\"><label for=\"draft-title\">Title <span aria-hidden=\"true\">*</span></label><input id=\"draft-title\" name=\"title\" type=\"text\" autocomplete=\"off\" aria-describedby=\"draft-title-help\" required><p class=\"draft-field-help\" id=\"draft-title-help\">A title is required.</p></div>",
+        "<header class=\"new-post-heading\"><p class=\"back-link\"><a href=\"/\">All posts</a></p><h1 data-editor-heading></h1></header>",
+        "<form class=\"draft-form\" id=\"draft-form\" data-draft-post-id=\"",
+    );
+    let mut content = content.to_owned();
+    content.push_str(&escape_html(&post_id));
+    content.push_str(concat!(
+        "\" novalidate>",
+        "<div class=\"draft-field\"><label for=\"draft-title\">Title <span class=\"draft-optional\">Required before publishing</span></label><input id=\"draft-title\" name=\"title\" type=\"text\" autocomplete=\"off\" aria-describedby=\"draft-title-help\"><p class=\"draft-field-help\" id=\"draft-title-help\">You can save an untitled draft and add a title later.</p></div>",
         "<div class=\"draft-field\"><label for=\"draft-summary\">Summary <span class=\"draft-optional\">Optional</span></label><textarea id=\"draft-summary\" name=\"summary\" rows=\"4\"></textarea></div>",
         "<div class=\"draft-field\"><label for=\"draft-tags\">Tags <span class=\"draft-optional\">Optional</span></label><input id=\"draft-tags\" name=\"tags\" type=\"text\" autocomplete=\"off\" aria-describedby=\"draft-tags-help\"><p class=\"draft-field-help\" id=\"draft-tags-help\">Separate tags with commas.</p></div>",
-        "<section class=\"draft-block-editor\" aria-labelledby=\"draft-blocks-heading\"><div class=\"draft-block-heading\"><div><h2 id=\"draft-blocks-heading\">Text blocks</h2><p>Arrange blocks and one level of child blocks in the order you want them to appear.</p></div><button class=\"draft-secondary-button\" type=\"button\" data-block-action=\"add-root\">Add text block</button></div><div class=\"draft-root-blocks\" id=\"draft-root-blocks\" data-block-list=\"root\"></div></section>",
+        "<section class=\"draft-block-editor\" aria-labelledby=\"draft-blocks-heading\"><div class=\"draft-block-heading\"><div><h2 id=\"draft-blocks-heading\">Blocks</h2><p>Each block has its own text and an optional ordered media gallery.</p></div></div><div class=\"draft-root-blocks\" id=\"draft-root-blocks\" data-block-list=\"root\"></div><div class=\"draft-block-add-area\"><button class=\"draft-secondary-button\" type=\"button\" data-block-action=\"add-root\">Add block</button></div></section>",
         "<p class=\"draft-form-error\" id=\"draft-form-error\" role=\"alert\" hidden></p>",
-        "<div class=\"draft-submit-area\"><p>Saved drafts can be opened from the sidebar and published from their post page.</p><button class=\"draft-submit-button\" id=\"draft-submit\" type=\"submit\">Create draft</button></div>",
+        "<div class=\"draft-submit-area\"><p id=\"draft-status\" role=\"status\" aria-live=\"polite\">Not saved yet.</p><div class=\"draft-submit-actions\"><div class=\"draft-action-group\"><button class=\"draft-submit-button\" id=\"draft-submit\" type=\"submit\">Save draft</button><div class=\"draft-publish-control\"><button class=\"post-publish-button\" id=\"draft-publish\" type=\"button\" data-publish-post=\"\" aria-describedby=\"draft-publish-help\" hidden>Publish</button><p class=\"draft-publish-help\" id=\"draft-publish-help\" hidden>Add a title before publishing.</p></div></div></div></div>",
         "</form></main>",
-    );
-    render_site_page("Create a draft", sidebar, content, false, username, role, false)
+    ));
+    let content = content.replace("<h1 data-editor-heading></h1>", &format!("<h1 data-editor-heading>{}</h1>", escape_html(heading)))
+        .replace("</header>", &format!("</header>{confirmation}"));
+    render_site_page(heading, sidebar, &content, false, username, role, false)
 }
 
 fn render_feed_controls(main_open: &str, feed: &str, next_cursor: Option<&str>) -> String {
@@ -1643,11 +1864,12 @@ fn render_sidebar(sidebar: &SidebarData) -> String {
             html.push_str("<li class=\"sidebar-muted\">No drafts yet.</li>");
         } else {
             for (index, post) in drafts.iter().enumerate() {
+                let title = if post.title.trim().is_empty() { "Untitled draft" } else { &post.title };
                 html.push_str(&format!(
                     "<li{}><a href=\"/posts/{}\">{}</a></li>",
                     if index >= 5 { " data-overflow-item=\"true\"" } else { "" },
                     post.id,
-                    escape_html(&post.title),
+                    escape_html(title),
                 ));
             }
         }
@@ -1853,7 +2075,7 @@ fn render_standalone_block(
             let alt = block.alt.as_deref().unwrap_or("");
             let label = media_accessible_label(block.header.as_deref(), block.body.as_deref(), alt);
             html.push_str(&format!(
-                "<figure class=\"single-media\"><button class=\"gallery-item solo-media\" type=\"button\" data-gallery=\"solo-{post_id}-{}\" data-media-type=\"{}\" data-media-src=\"{}\" data-alt=\"{}\" data-label=\"{}\" data-caption=\"{}\" aria-label=\"Open image: {}\"><img src=\"{}\" alt=\"{}\" loading=\"{}\"{}></button>{}{}</figure>",
+                "<figure class=\"single-media\"><button class=\"gallery-item solo-media\" type=\"button\" data-gallery=\"solo-{post_id}-{}\" data-media-type=\"{}\" data-media-src=\"{}\" data-alt=\"{}\" data-label=\"{}\" data-caption=\"{}\" aria-label=\"Open image: {}\"><img src=\"{}\" alt=\"{}\" loading=\"{}\"{}></button><a class=\"media-download\" href=\"{}?download=1\">Download original</a>{}{}</figure>",
                 block.id,
                 escape_html(content_type),
                 media_url,
@@ -1865,6 +2087,7 @@ fn render_standalone_block(
                 escape_html(alt),
                 loading,
                 image_fetch_priority(loading),
+                media_url,
                 render_media_label(block.header.as_deref()),
                 render_caption(block.body.as_deref()),
             ));
@@ -1872,11 +2095,12 @@ fn render_standalone_block(
         Some(content_type) if content_type.starts_with("video/") => {
             let media_url = media_url(media_prefix, post_id, block.id);
             html.push_str(&format!(
-                "<figure class=\"single-media\">{}<video controls preload=\"metadata\" aria-label=\"{}\"><source src=\"{}\" type=\"{}\"></video>{}</figure>",
+                "<figure class=\"single-media\">{}<video controls preload=\"metadata\" aria-label=\"{}\"><source src=\"{}\" type=\"{}\"></video><a class=\"media-download\" href=\"{}?download=1\">Download original</a>{}</figure>",
                 render_media_label(block.header.as_deref()),
                 escape_html(&media_accessible_label(block.header.as_deref(), block.body.as_deref(), "video")),
                 media_url,
                 escape_html(content_type),
+                media_url,
                 render_caption(block.body.as_deref()),
             ));
         }
@@ -1953,6 +2177,7 @@ fn render_gallery(
         let header = block.header.as_deref().unwrap_or("");
         let caption = block.body.as_deref().unwrap_or("");
         let label = media_accessible_label(block.header.as_deref(), block.body.as_deref(), alt);
+        html.push_str("<div class=\"gallery-entry\">");
         html.push_str(&format!(
             "<button class=\"gallery-item\" type=\"button\" data-gallery=\"{gallery_id}\" data-media-type=\"{}\" data-media-src=\"{}\" data-alt=\"{}\" data-label=\"{}\" data-caption=\"{}\" aria-label=\"Open media: {}\">",
             escape_html(content_type),
@@ -1976,7 +2201,10 @@ fn render_gallery(
         }
         html.push_str(&render_media_label(block.header.as_deref()));
         html.push_str(&render_caption_span(block.body.as_deref()));
-        html.push_str("</button>");
+        html.push_str(&format!(
+            "</button><a class=\"media-download\" href=\"{}?download=1\">Download original</a></div>",
+            media_url,
+        ));
     }
     html.push_str("</div>");
     html
@@ -2151,7 +2379,7 @@ fn pretty_html(markup: &str) -> String {
 
 const SLIDESHOW_HTML: &str = "<dialog id=\"slideshow\" class=\"slideshow\" aria-label=\"Photo slideshow\"><button class=\"slideshow-close\" type=\"button\" aria-label=\"Close slideshow\">×</button><div class=\"slideshow-stage\"><button class=\"slideshow-nav slideshow-previous\" type=\"button\" aria-label=\"Previous item\">‹</button><div class=\"slideshow-media\" id=\"slideshow-media\"></div><button class=\"slideshow-nav slideshow-next\" type=\"button\" aria-label=\"Next item\">›</button></div><p class=\"slideshow-label\" id=\"slideshow-label\"></p><p class=\"slideshow-caption\" id=\"slideshow-caption\"></p></dialog>";
 
-const PUBLISH_DIALOG_HTML: &str = "<dialog id=\"publish-dialog\" class=\"publish-dialog\" aria-labelledby=\"publish-dialog-heading\"><button class=\"publish-dialog-close\" type=\"button\" aria-label=\"Close publish dialog\">×</button><h2 id=\"publish-dialog-heading\">Publish this post?</h2><form id=\"publish-form\" novalidate><label class=\"publish-override-toggle\"><input id=\"publish-use-time\" type=\"checkbox\">Choose a publication date and time</label><div class=\"publish-time-override\" id=\"publish-time-override\" hidden><label for=\"publish-time\">Local date and time</label><input id=\"publish-time\" type=\"datetime-local\" step=\"60\"></div><p id=\"publish-confirmation\" class=\"publish-confirmation\" role=\"status\" aria-live=\"polite\">The post will be published now using the server time.</p><p id=\"publish-error\" class=\"publish-error\" role=\"alert\" hidden></p><div class=\"publish-dialog-actions\"><button id=\"publish-cancel\" type=\"button\">Cancel</button><button id=\"publish-submit\" type=\"submit\">Publish now</button></div></form></dialog>";
+const PUBLISH_DIALOG_HTML: &str = "<dialog id=\"publish-dialog\" class=\"publish-dialog\" aria-labelledby=\"publish-dialog-heading\"><button class=\"publish-dialog-close\" type=\"button\" aria-label=\"Close publish dialog\">×</button><h2 id=\"publish-dialog-heading\">Publish this post?</h2><p class=\"publish-media-warning\">Original media may not display in every browser. Viewers can download the original file.</p><form id=\"publish-form\" novalidate><label class=\"publish-override-toggle\"><input id=\"publish-use-time\" type=\"checkbox\">Choose a publication date and time</label><div class=\"publish-time-override\" id=\"publish-time-override\" hidden><label for=\"publish-time\">Local date and time</label><input id=\"publish-time\" type=\"datetime-local\" step=\"60\"></div><p id=\"publish-confirmation\" class=\"publish-confirmation\" role=\"status\" aria-live=\"polite\">The post will be published now using the server time.</p><p id=\"publish-error\" class=\"publish-error\" role=\"alert\" hidden></p><div class=\"publish-dialog-actions\"><button id=\"publish-cancel\" type=\"button\">Cancel</button><button id=\"publish-submit\" type=\"submit\">Publish now</button></div></form></dialog>";
 
 const SHARE_DIALOG_HTML: &str = "<dialog id=\"share-dialog\" class=\"share-dialog\" aria-labelledby=\"share-dialog-heading\"><button class=\"share-dialog-close\" type=\"button\" aria-label=\"Close share panel\">×</button><h2 id=\"share-dialog-heading\">Share post</h2><div class=\"share-preview-actions\"><a id=\"share-full-preview\" href=\"#\" target=\"_blank\" rel=\"noopener\">Open full preview</a></div><div class=\"share-preview-frame\"><iframe id=\"share-preview\" title=\"Guest page preview\" loading=\"lazy\"></iframe></div><div class=\"share-expiry-slot\"><p class=\"share-expiry\" id=\"share-expiry\" hidden></p></div><div class=\"share-controls\"><div class=\"share-copy-row\"><button class=\"share-copy-button\" id=\"share-copy\" type=\"button\">Copy share link</button><span class=\"share-status\" id=\"share-status\" role=\"status\" aria-live=\"polite\"></span></div><div class=\"share-revoke-slot\"><button class=\"share-revoke-button\" id=\"share-revoke\" type=\"button\" hidden>Revoke link</button></div></div></dialog>";
 
@@ -2179,6 +2407,7 @@ async fn media<S: StorageClient>(
     Extension(principal): Extension<AuthPrincipal>,
     method: Method,
     headers: HeaderMap,
+    uri: Uri,
 ) -> Response {
     let media = match state
         .database
@@ -2192,7 +2421,7 @@ async fn media<S: StorageClient>(
             return StatusCode::INTERNAL_SERVER_ERROR.into_response();
         }
     };
-    proxy_media(&state.storage, media, method, headers).await
+    proxy_media(&state.storage, media, method, headers, uri.query().is_some_and(|query| query.split('&').any(|item| item == "download=1")), block_id).await
 }
 
 async fn proxy_media<S: StorageClient>(
@@ -2200,6 +2429,8 @@ async fn proxy_media<S: StorageClient>(
     media: MediaReference,
     method: Method,
     headers: HeaderMap,
+    download: bool,
+    block_id: i64,
 ) -> Response {
     let head = method == Method::HEAD;
     let range = if media.content_type.starts_with("video/") && !head {
@@ -2228,8 +2459,22 @@ async fn proxy_media<S: StorageClient>(
     };
     let mut builder = Response::builder()
         .status(stored.status)
-        .header(header::CONTENT_TYPE, media.content_type)
+        .header(header::CONTENT_TYPE, media.content_type.clone())
         .header(header::X_CONTENT_TYPE_OPTIONS, "nosniff");
+    if download {
+        let extension = match media.content_type.as_str() {
+            "image/jpeg" => "jpg",
+            "image/png" => "png",
+            "image/webp" => "webp",
+            "image/gif" => "gif",
+            "image/heic" => "heic",
+            "image/heif" => "heif",
+            "video/mp4" => "mp4",
+            "video/quicktime" => "mov",
+            _ => "bin",
+        };
+        builder = builder.header(header::CONTENT_DISPOSITION, format!("attachment; filename=\"media-{block_id}.{extension}\""));
+    }
     for name in [header::CONTENT_LENGTH, header::ACCEPT_RANGES, header::CONTENT_RANGE] {
         if let Some(value) = stored.headers.get(&name) {
             builder = builder.header(name, value);
@@ -2255,6 +2500,7 @@ pub fn state<S: StorageClient>(database: Database, storage: S) -> AppState<S> {
             public_origin: None,
             secure_cookie: false,
             session_lifetime: Duration::from_secs(7 * 24 * 60 * 60),
+            max_media_upload_bytes: DEFAULT_MAX_MEDIA_UPLOAD_BYTES,
         },
     }
 }
@@ -2284,7 +2530,7 @@ mod tests {
     use crate::{
         auth,
         db::{AccountRole, Database, NewPost, Post, PostAccess, PostBlock, PostSummary, ShareAccess, SidebarData},
-        storage::{StorageClient, StorageResponse},
+        storage::{StorageBody, StorageClient, StorageResponse},
     };
     use axum::{
         body::{to_bytes, Body},
@@ -2299,6 +2545,16 @@ mod tests {
 
     impl StorageClient for UnusedStorage {
         async fn put_file(&self, _content_type: &str, _path: &Path) -> Result<String, String> {
+            unreachable!()
+        }
+
+        async fn put_stream(
+            &self,
+            _content_type: &str,
+            _content_length: Option<u64>,
+            _body: StorageBody,
+            _max_bytes: u64,
+        ) -> Result<(String, u64), String> {
             unreachable!()
         }
 
@@ -2421,7 +2677,7 @@ mod tests {
             "POST",
             "/api/posts",
             &writer_cookie,
-            Some(r#"{"title":"My draft","summary":"Short intro","tags":["road","field-notes"],"blocks":[{"header":"First","blocks":[{"body":"Child"}]},{"body":"Second"}]}"#),
+            Some(r#"{"title":"My draft","summary":"Short intro","tags":["road","field-notes"],"blocks":[{"header":"First","body":"Child"},{"body":"Second"}]}"#),
         )
         .await;
         assert_eq!(created.status(), StatusCode::CREATED);
@@ -2439,7 +2695,7 @@ mod tests {
         assert_eq!(post.summary.summary, "Short intro");
         assert_eq!(post.tags, vec!["road".to_owned(), "field-notes".to_owned()]);
         assert_eq!(post.blocks.len(), 2);
-        assert_eq!(post.blocks[0].children[0].body.as_deref(), Some("Child"));
+        assert_eq!(post.blocks[0].body.as_deref(), Some("Child"));
         assert_eq!(post.blocks[1].body.as_deref(), Some("Second"));
         assert!(!super::render_post(&post, true, false).contains("<time"));
 
@@ -2450,8 +2706,8 @@ mod tests {
         assert!(writer_creation_html.contains("id=\"draft-form\""));
         assert!(writer_creation_html.contains("id=\"draft-title\" name=\"title\" type=\"text\""));
         assert!(writer_creation_html.contains("data-block-action=\"add-root\""));
-        assert!(writer_creation_html.contains("Create draft"));
-        assert!(writer_creation_html.contains("published from their post page"));
+        assert!(writer_creation_html.contains("Save draft"));
+        assert!(writer_creation_html.contains("Required before publishing"));
         assert!(!writer_creation_html.contains("class=\"new-post-float\""));
 
         assert_eq!(
@@ -2577,7 +2833,7 @@ mod tests {
             )
             .await
             .status(),
-            StatusCode::BAD_REQUEST,
+            StatusCode::CREATED,
         );
         assert_eq!(
             request(
@@ -2585,7 +2841,7 @@ mod tests {
                 "POST",
                 "/api/posts",
                 &writer_cookie,
-                Some(r#"{"title":"Too deep","blocks":[{"blocks":[{"blocks":[{"body":"No"}]}]}]}"#),
+                Some(r#"{"title":"Too deep","blocks":[{"children":[{"children":[{"body":"No"}]}]}]}"#),
             )
             .await
             .status(),
@@ -3076,6 +3332,7 @@ mod tests {
             published: true,
             author_username: "owner".to_owned(),
             tags: vec!["<tag>".to_owned()],
+            revision: 1,
             blocks: vec![
                 PostBlock {
                     id: 17,
@@ -3083,6 +3340,7 @@ mod tests {
                     header: Some("A <header>".to_owned()),
                     body: Some("<script>body</script>".to_owned()),
                     content_type: None,
+                    storage_key: None,
                     alt: None,
                     children: Vec::new(),
                 },
@@ -3091,14 +3349,16 @@ mod tests {
                     position: 1,
                     header: Some("Grouped media".to_owned()),
                     body: Some("<caption>".to_owned()),
-                    content_type: Some("image/jpeg".to_owned()),
+                    content_type: None,
+                    storage_key: None,
                     alt: None,
                     children: vec![PostBlock {
                         id: 19,
                         position: 0,
                         header: None,
                         body: Some("Nested body".to_owned()),
-                        content_type: None,
+                        content_type: Some("image/jpeg".to_owned()),
+                        storage_key: Some("media/nested-image".to_owned()),
                         alt: None,
                         children: Vec::new(),
                     }],
@@ -3108,18 +3368,38 @@ mod tests {
                     position: 2,
                     header: None,
                     body: None,
-                    content_type: Some("video/mp4".to_owned()),
+                    content_type: None,
+                    storage_key: None,
                     alt: None,
-                    children: Vec::new(),
+                    children: vec![PostBlock {
+                        id: 22,
+                        position: 0,
+                        header: None,
+                        body: None,
+                        content_type: Some("video/mp4".to_owned()),
+                        storage_key: Some("media/video".to_owned()),
+                        alt: None,
+                        children: Vec::new(),
+                    }],
                 },
                 PostBlock {
                     id: 21,
                     position: 3,
                     header: None,
-                    body: Some("<caption>".to_owned()),
-                    content_type: Some("image/jpeg".to_owned()),
-                    alt: Some("photo\" onerror=\"alert(1)".to_owned()),
-                    children: Vec::new(),
+                    body: None,
+                    content_type: None,
+                    storage_key: None,
+                    alt: None,
+                    children: vec![PostBlock {
+                        id: 23,
+                        position: 0,
+                        header: None,
+                        body: Some("<caption>".to_owned()),
+                        content_type: Some("image/jpeg".to_owned()),
+                        storage_key: Some("media/image".to_owned()),
+                        alt: Some("photo\" onerror=\"alert(1)".to_owned()),
+                        children: Vec::new(),
+                    }],
                 },
             ],
         };
@@ -3138,11 +3418,11 @@ mod tests {
         assert!(html.contains("&lt;script&gt;body&lt;/script&gt;"));
         assert!(html.contains("&quot;&gt;&lt;script&gt;alert(1)&lt;/script&gt;"));
         assert!(html.contains("alt=\"photo&quot; onerror=&quot;alert(1)\""));
-        assert!(html.contains("<img src=\"/posts/7/blocks/21/media\""));
-        assert!(html.contains("<video controls preload=\"metadata\" aria-label=\"video\">"));
-        assert!(html.contains("<source src=\"/posts/7/blocks/20/media\""));
-        assert!(html.contains("<figcaption>&lt;caption&gt;</figcaption>"));
-        assert!(html.contains("<p>Nested body</p>"));
+        assert!(html.contains("<img src=\"/posts/7/blocks/23/media\""));
+        assert!(html.contains("data-media-src=\"/posts/7/blocks/22/media\""));
+        assert!(html.contains("<span>Video</span>"));
+        assert!(html.contains("class=\"gallery-caption\">&lt;caption&gt;</span>"));
+        assert!(html.contains("Nested body"));
         assert!(!html.contains("/posts/7/blocks/18/media"));
         assert!(!html.contains("<script>body</script>"));
         assert!(html.contains("Signed in as <strong>owner</strong>"));
