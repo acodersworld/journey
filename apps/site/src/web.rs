@@ -2829,18 +2829,6 @@ mod tests {
                 "POST",
                 "/api/posts",
                 &writer_cookie,
-                Some(r#"{"title":"  "}"#),
-            )
-            .await
-            .status(),
-            StatusCode::CREATED,
-        );
-        assert_eq!(
-            request(
-                &app,
-                "POST",
-                "/api/posts",
-                &writer_cookie,
                 Some(r#"{"title":"Too deep","blocks":[{"children":[{"children":[{"body":"No"}]}]}]}"#),
             )
             .await
@@ -2983,6 +2971,18 @@ mod tests {
                 .await
                 .status(),
             StatusCode::OK,
+        );
+        assert_eq!(
+            request(
+                &app,
+                "POST",
+                "/api/posts",
+                &writer_cookie,
+                Some(r#"{"title":"  "}"#),
+            )
+            .await
+            .status(),
+            StatusCode::CREATED,
         );
 
         std::fs::remove_file(path).unwrap();
