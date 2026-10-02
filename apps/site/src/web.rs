@@ -1640,7 +1640,7 @@ fn render_shared_post(post: &Post, share_prefix: &str) -> String {
     pretty_html(&format!(
         "<!doctype html><html lang=\"en\"><head>{}</head><body><div class=\"site-layout\">{content}</div>{}</body></html>",
         html_head(&format!("{} · Journey", post.summary.title)),
-        SLIDESHOW_HTML,
+        GALLERY_PANEL_HTML,
     ))
 }
 
@@ -1820,12 +1820,12 @@ fn render_site_page(
     title: &str,
     sidebar: &SidebarData,
     content: &str,
-    include_slideshow: bool,
+    include_gallery_panel: bool,
     username: &str,
     role: AccountRole,
     show_new_post: bool,
 ) -> String {
-    let slideshow = if include_slideshow { SLIDESHOW_HTML } else { "" };
+    let gallery_panel = if include_gallery_panel { GALLERY_PANEL_HTML } else { "" };
     let new_post_button = if show_new_post
         && matches!(role, AccountRole::Write | AccountRole::Admin)
     {
@@ -1840,7 +1840,7 @@ fn render_site_page(
         render_account_controls(username),
         content,
         new_post_button,
-        slideshow,
+        gallery_panel,
         PUBLISH_DIALOG_HTML,
         SHARE_DIALOG_HTML,
     );
@@ -2377,7 +2377,7 @@ fn pretty_html(markup: &str) -> String {
     formatted
 }
 
-const SLIDESHOW_HTML: &str = "<dialog id=\"slideshow\" class=\"slideshow\" aria-label=\"Photo slideshow\"><button class=\"slideshow-close\" type=\"button\" aria-label=\"Close slideshow\">×</button><div class=\"slideshow-stage\"><button class=\"slideshow-nav slideshow-previous\" type=\"button\" aria-label=\"Previous item\">‹</button><div class=\"slideshow-media\" id=\"slideshow-media\"></div><button class=\"slideshow-nav slideshow-next\" type=\"button\" aria-label=\"Next item\">›</button></div><p class=\"slideshow-label\" id=\"slideshow-label\"></p><p class=\"slideshow-caption\" id=\"slideshow-caption\"></p></dialog>";
+const GALLERY_PANEL_HTML: &str = "<dialog id=\"gallery-panel\" class=\"gallery-panel\" aria-label=\"Gallery\"><div class=\"gallery-panel-header\"><form method=\"dialog\"><button class=\"gallery-panel-close\" type=\"submit\" aria-label=\"Close gallery\">×</button></form></div><div class=\"gallery-panel-items\" id=\"gallery-panel-items\" role=\"region\" aria-label=\"Gallery items\" tabindex=\"0\"></div></dialog>";
 
 const PUBLISH_DIALOG_HTML: &str = "<dialog id=\"publish-dialog\" class=\"publish-dialog\" aria-labelledby=\"publish-dialog-heading\"><button class=\"publish-dialog-close\" type=\"button\" aria-label=\"Close publish dialog\">×</button><h2 id=\"publish-dialog-heading\">Publish this post?</h2><p class=\"publish-media-warning\">Original media may not display in every browser. Viewers can download the original file.</p><form id=\"publish-form\" novalidate><label class=\"publish-override-toggle\"><input id=\"publish-use-time\" type=\"checkbox\">Choose a publication date and time</label><div class=\"publish-time-override\" id=\"publish-time-override\" hidden><label for=\"publish-time\">Local date and time</label><input id=\"publish-time\" type=\"datetime-local\" step=\"60\"></div><p id=\"publish-confirmation\" class=\"publish-confirmation\" role=\"status\" aria-live=\"polite\">The post will be published now using the server time.</p><p id=\"publish-error\" class=\"publish-error\" role=\"alert\" hidden></p><div class=\"publish-dialog-actions\"><button id=\"publish-cancel\" type=\"button\">Cancel</button><button id=\"publish-submit\" type=\"submit\">Publish now</button></div></form></dialog>";
 

@@ -150,7 +150,7 @@ pagination path, passing the selected tag through every API request. Post tags
 link to their exact-case filtered feed. `/archive/{YYYY-MM}` server-renders the
 newest complete post for the selected month and uses the same on-demand feed
 pagination to load later complete posts. The archive uses the normal post
-renderer, including media and slideshow support. Its cursor and month are
+renderer, including media and gallery panel support. Its cursor and month are
 embedded in the feed element so later API requests stay within the archive.
 Every publication `<time>` has a UTC ISO 8601 `datetime` value and readable UTC
 fallback text; the browser formats it in local time.
@@ -186,23 +186,31 @@ site without a frontend build step. Generated HTML is indented for readable
 browser page source while its text nodes remain intact.
 
 Each root row renders its block header and body, followed by its ordered media
-gallery. Gallery children are never shown as text blocks. Gallery items open in
-a keyboard and touch navigable slideshow; initial page images prioritize the
-first image and lazy-load later images. Direct pages and fragments reuse the
-same original-media URLs; image resizing, format conversion, and variants are
-deferred.
+gallery. Gallery children are never shown as text blocks. Gallery items open
+in a modal vertical panel at the selected item, with the rest of the ordered
+gallery available through native wheel, touch, and keyboard scrolling. Each
+item keeps its heading and caption below its media, allowing the media to use
+the full panel width; standalone images use the same panel with one item. Panel
+images and video previews load as they approach the visible region; initial
+page images prioritize the first image and lazy-load later images. Direct pages
+and fragments reuse the same original-media URLs;
+image resizing, format conversion, and variants are deferred.
 
 Video frames are previewed in the browser from the existing media URL. A
 gallery tile keeps its **Video** placeholder until a decoded frame is ready and
 sets its source only when it is within 800 CSS pixels of the viewport, using
-`IntersectionObserver` or a bounded scroll/resize check. The tile video is
-muted, inline, paused, and has no controls; playback remains in the slideshow.
-Standalone post videos, slideshow videos, and draft editor previews share a
-browser helper. After metadata loads, it seeks near the start only when no
-current frame is available and the player remains paused; starting playback or
-seeking prevents the preview seek. Draft files use their local object URL until
-the upload is saved, then switch to the authenticated media URL. Preview state
-is not persisted and no thumbnail object or database field is created.
+`IntersectionObserver` or a bounded scroll/resize check. Gallery panel previews
+use the same browser-generated first frame, load near the panel's visible
+region, and share a limit of two simultaneous preview requests. Video playback
+starts only after the visitor chooses **Play video**; the player then exposes
+native controls for playback and seeking. Closing the panel stops active
+players and preview requests. Standalone post videos and draft editor previews
+share the browser helper. After metadata loads, it seeks near the start only
+when no current frame is available and the player remains paused; starting
+playback or seeking prevents the preview seek. Draft files use their local
+object URL until the upload is saved, then switch to the authenticated media
+URL. Preview state is not persisted and no thumbnail object or database field
+is created.
 
 HTML text and attributes are escaped. Image and video blocks use site media
 URLs that identify a post and media child ID, never a storage key. The backend

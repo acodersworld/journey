@@ -35,6 +35,7 @@ function formatLocalTimes(root) {
 syncBrowserTimezone();
 
 const initializedVideoPreviews = new WeakSet();
+const activeGalleryPreviewCleanup = new WeakMap();
 let galleryPreviewObserver = null;
 let galleryVisibilityCheckScheduled = false;
 let galleryFallbackListenersAttached = false;
@@ -102,7 +103,7 @@ function initializeVideoPreviews(root = document) {
 }
 
 function loadGalleryVideoPreview(video) {
-  const source = video.closest('.gallery-item')?.dataset.mediaSrc;
+  const source = video.closest('[data-media-src]')?.dataset.mediaSrc;
   const frame = video.closest('[data-video-preview-frame]');
   let finished = false;
   const timeout = window.setTimeout(finish, 15000);
@@ -111,6 +112,8 @@ function loadGalleryVideoPreview(video) {
     if (finished) return;
     finished = true;
     window.clearTimeout(timeout);
+    activeGalleryPreviewCleanup.delete(video);
+    video.pause();
     video.removeAttribute('src');
     video.load();
     video.remove();
@@ -122,26 +125,34 @@ function loadGalleryVideoPreview(video) {
     if (finished || !frame) return;
     try {
       const canvas = document.createElement('canvas');
-      canvas.width = 480;
-      canvas.height = 360;
       const context = canvas.getContext('2d');
       if (!context) {
         finish();
         return;
       }
-      const sourceWidth = Math.min(video.videoWidth, video.videoHeight * 4 / 3);
-      const sourceHeight = Math.min(video.videoHeight, video.videoWidth * 3 / 4);
-      context.drawImage(
-        video,
-        (video.videoWidth - sourceWidth) / 2,
-        (video.videoHeight - sourceHeight) / 2,
-        sourceWidth,
-        sourceHeight,
-        0,
-        0,
-        canvas.width,
-        canvas.height,
-      );
+      if (video.hasAttribute('data-gallery-panel-video-preview')) {
+        const scale = Math.min(1, 800 / Math.max(video.videoWidth, video.videoHeight));
+        canvas.width = Math.max(1, Math.round(video.videoWidth * scale));
+        canvas.height = Math.max(1, Math.round(video.videoHeight * scale));
+        context.drawImage(video, 0, 0, canvas.width, canvas.height);
+        frame.style.aspectRatio = `${video.videoWidth} / ${video.videoHeight}`;
+      } else {
+        canvas.width = 480;
+        canvas.height = 360;
+        const sourceWidth = Math.min(video.videoWidth, video.videoHeight * 4 / 3);
+        const sourceHeight = Math.min(video.videoHeight, video.videoWidth * 3 / 4);
+        context.drawImage(
+          video,
+          (video.videoWidth - sourceWidth) / 2,
+          (video.videoHeight - sourceHeight) / 2,
+          sourceWidth,
+          sourceHeight,
+          0,
+          0,
+          canvas.width,
+          canvas.height,
+        );
+      }
       frame.insertBefore(canvas, video);
       frame.setAttribute('data-ready', 'true');
       finish();
@@ -151,6 +162,7 @@ function loadGalleryVideoPreview(video) {
   }
 
   video.addEventListener('error', finish, { once: true });
+  activeGalleryPreviewCleanup.set(video, finish);
   initializeVideoPreview(video, captureFrame);
   video.preload = 'metadata';
   video.src = source;
@@ -168,7 +180,7 @@ function drainGalleryPreviewQueue() {
 
 function queueGalleryVideoPreview(video) {
   if (video.hasAttribute('data-preview-requested')) return;
-  if (!video.closest('.gallery-item')?.dataset.mediaSrc) return;
+  if (!video.closest('[data-media-src]')?.dataset.mediaSrc) return;
   video.dataset.previewRequested = 'true';
   galleryPreviewQueue.push(video);
   drainGalleryPreviewQueue();
@@ -1476,127 +1488,209 @@ if (feed) {
   loadButton.disabled = !nextCursor;
 }
 
-const slideshow = document.querySelector('#slideshow');
+const galleryPanel = document.querySelector('#gallery-panel');
 
-if (slideshow) {
-  const mediaRegion = document.querySelector('#slideshow-media');
-  const labelRegion = document.querySelector('#slideshow-label');
-  const captionRegion = document.querySelector('#slideshow-caption');
-  const closeButton = slideshow.querySelector('.slideshow-close');
-  const previousButton = slideshow.querySelector('.slideshow-previous');
-  const nextButton = slideshow.querySelector('.slideshow-next');
-  let slideItems = [];
-  let slideIndex = 0;
+if (galleryPanel) {
+  const galleryRegion = document.querySelector('#gallery-panel-items');
+  const closeButton = galleryPanel.querySelector('.gallery-panel-close');
   let openingItem = null;
-  let touchStart = null;
+  let panelMediaObserver = null;
+  let panelVisibilityCheckScheduled = false;
 
-  function renderSlide() {
-    const item = slideItems[slideIndex];
-    if (!item) return;
-    const focusedElement = slideshow.contains(document.activeElement) ? document.activeElement : null;
-    mediaRegion.replaceChildren();
+  function loadPanelEntry(entry) {
+    if (!galleryPanel.open || !entry.isConnected) return;
+    if (entry.dataset.panelLoaded) return;
+    entry.dataset.panelLoaded = 'true';
+    entry.querySelectorAll('img[data-src]').forEach(image => {
+      image.src = image.dataset.src;
+      image.removeAttribute('data-src');
+    });
+    entry.querySelectorAll('video[data-gallery-video-preview]').forEach(queueGalleryVideoPreview);
+  }
 
+  function checkPanelMediaVisibility() {
+    panelVisibilityCheckScheduled = false;
+    if (!galleryPanel.open) return;
+    const regionBounds = galleryRegion.getBoundingClientRect();
+    const margin = 800;
+    galleryRegion.querySelectorAll('.gallery-panel-entry:not([data-panel-loaded])').forEach(entry => {
+      const bounds = entry.getBoundingClientRect();
+      if (bounds.bottom >= regionBounds.top - margin && bounds.top <= regionBounds.bottom + margin) {
+        loadPanelEntry(entry);
+      }
+    });
+  }
+
+  function schedulePanelMediaVisibilityCheck() {
+    if (panelVisibilityCheckScheduled) return;
+    panelVisibilityCheckScheduled = true;
+    window.requestAnimationFrame(checkPanelMediaVisibility);
+  }
+
+  function observePanelMedia() {
+    const entries = galleryRegion.querySelectorAll('.gallery-panel-entry:not([data-panel-loaded])');
+    if ('IntersectionObserver' in window) {
+      const observer = new IntersectionObserver(observations => {
+        observations.forEach(observation => {
+          if (!observation.isIntersecting || !galleryPanel.open || !observation.target.isConnected) return;
+          observer.unobserve(observation.target);
+          loadPanelEntry(observation.target);
+        });
+      }, { root: galleryRegion, rootMargin: '800px 0px' });
+      panelMediaObserver = observer;
+      entries.forEach(entry => observer.observe(entry));
+      return;
+    }
+
+    galleryRegion.addEventListener('scroll', schedulePanelMediaVisibilityCheck, { passive: true });
+    window.addEventListener('resize', schedulePanelMediaVisibilityCheck, { passive: true });
+    schedulePanelMediaVisibilityCheck();
+  }
+
+  function createPanelEntry(item, index) {
     const mediaType = item.dataset.mediaType || '';
     const mediaUrl = item.dataset.mediaSrc || '';
+    const itemLabel = item.dataset.label || '';
+    const article = document.createElement('article');
+    article.className = 'gallery-panel-entry';
+    article.id = `gallery-panel-item-${index + 1}`;
+
+    const media = document.createElement('div');
+    media.className = 'gallery-panel-media';
+    media.dataset.mediaSrc = mediaUrl;
+
     if (mediaType.startsWith('image/')) {
       const image = document.createElement('img');
-      image.src = mediaUrl;
+      image.className = 'gallery-panel-image';
       image.alt = item.dataset.alt || '';
-      mediaRegion.append(image);
+      image.dataset.src = mediaUrl;
+      media.append(image);
     } else if (mediaType.startsWith('video/')) {
-      const video = document.createElement('video');
-      video.controls = true;
-      video.preload = 'metadata';
-      video.dataset.videoPreview = '';
-      video.setAttribute('aria-label', item.dataset.label || `Video ${slideIndex + 1}`);
-      initializeVideoPreview(video);
-      const source = document.createElement('source');
-      source.src = mediaUrl;
-      source.type = mediaType;
-      video.append(source);
-      mediaRegion.append(video);
+      const frame = document.createElement('div');
+      frame.className = 'video-preview-frame gallery-panel-video-frame';
+      frame.dataset.videoPreviewFrame = '';
+
+      const preview = document.createElement('video');
+      preview.className = 'gallery-video-preview';
+      preview.muted = true;
+      preview.playsInline = true;
+      preview.preload = 'none';
+      preview.dataset.galleryVideoPreview = '';
+      preview.dataset.galleryPanelVideoPreview = '';
+      preview.setAttribute('aria-hidden', 'true');
+
+      const placeholder = document.createElement('div');
+      placeholder.className = 'video-placeholder';
+      const videoLabel = document.createElement('span');
+      videoLabel.textContent = 'Video';
+      const playButton = document.createElement('button');
+      playButton.className = 'gallery-panel-play';
+      playButton.type = 'button';
+      playButton.textContent = 'Play video';
+      playButton.setAttribute('aria-label', itemLabel ? `Play ${itemLabel}` : `Play video ${index + 1}`);
+      playButton.addEventListener('click', () => {
+        if (!frame.isConnected) return;
+        const queuedPreviewIndex = galleryPreviewQueue.indexOf(preview);
+        if (queuedPreviewIndex >= 0) galleryPreviewQueue.splice(queuedPreviewIndex, 1);
+        activeGalleryPreviewCleanup.get(preview)?.();
+        const player = document.createElement('video');
+        player.className = 'gallery-panel-player';
+        player.controls = true;
+        player.playsInline = true;
+        player.preload = 'metadata';
+        player.setAttribute('aria-label', itemLabel || `Video ${index + 1}`);
+        frame.replaceChildren(player);
+        player.src = mediaUrl;
+        player.play().catch(() => {});
+      });
+      placeholder.append(videoLabel, playButton);
+      frame.append(preview, placeholder);
+      media.append(frame);
     }
 
-    const itemLabel = item.dataset.label || '';
-    labelRegion.textContent = itemLabel ? `${itemLabel} · ${slideIndex + 1} of ${slideItems.length}` : `${slideIndex + 1} of ${slideItems.length}`;
-    captionRegion.textContent = item.dataset.caption || '';
-    captionRegion.hidden = !captionRegion.textContent;
-    previousButton.disabled = slideItems.length < 2;
-    nextButton.disabled = slideItems.length < 2;
-    slideshow.setAttribute('aria-label', `Photo slideshow, item ${slideIndex + 1} of ${slideItems.length}`);
-
-    if (focusedElement && !focusedElement.isConnected) {
-      nextButton.focus({ preventScroll: true });
+    const copy = document.createElement('div');
+    copy.className = 'gallery-panel-copy';
+    if (itemLabel) {
+      const heading = document.createElement('h2');
+      heading.textContent = itemLabel;
+      copy.append(heading);
+      article.setAttribute('aria-labelledby', `${article.id}-heading`);
+      heading.id = `${article.id}-heading`;
+    } else {
+      article.setAttribute('aria-label', `${mediaType.startsWith('video/') ? 'Video' : 'Image'} ${index + 1}`);
     }
+    const caption = item.dataset.caption || '';
+    if (caption) {
+      const description = document.createElement('p');
+      description.textContent = caption;
+      copy.append(description);
+    }
+
+    article.append(media);
+    if (copy.childElementCount > 0) article.append(copy);
+    return article;
   }
 
-  function moveSlide(direction) {
-    if (slideItems.length < 2) return;
-    slideIndex = (slideIndex + direction + slideItems.length) % slideItems.length;
-    renderSlide();
-  }
-
-  function openSlideshow(item) {
+  function openGalleryPanel(item) {
     const galleryId = item.dataset.gallery;
-    slideItems = Array.from(document.querySelectorAll('.gallery-item[data-gallery]'))
+    const items = Array.from(document.querySelectorAll('.gallery-item[data-gallery]'))
       .filter(candidate => candidate.dataset.gallery === galleryId);
-    slideIndex = slideItems.indexOf(item);
-    if (slideIndex < 0) return;
+    const selectedIndex = items.indexOf(item);
+    if (selectedIndex < 0) return;
+
     openingItem = item;
-    renderSlide();
-    slideshow.showModal();
+    const fragment = document.createDocumentFragment();
+    items.forEach((galleryItem, index) => fragment.append(createPanelEntry(galleryItem, index)));
+    galleryRegion.replaceChildren(fragment);
+    galleryPanel.showModal();
+
+    const selectedEntry = galleryRegion.children[selectedIndex];
+    const regionBounds = galleryRegion.getBoundingClientRect();
+    const entryBounds = selectedEntry.getBoundingClientRect();
+    const topPadding = Number.parseFloat(window.getComputedStyle(galleryRegion).paddingTop) || 0;
+    galleryRegion.scrollTop += entryBounds.top - regionBounds.top - topPadding;
+    loadPanelEntry(selectedEntry);
+    observePanelMedia();
     closeButton.focus({ preventScroll: true });
   }
 
   document.addEventListener('click', event => {
     if (!(event.target instanceof Element)) return;
     const item = event.target.closest('.gallery-item[data-gallery]');
-    if (item) openSlideshow(item);
+    if (item) openGalleryPanel(item);
   });
 
-  closeButton.addEventListener('click', () => slideshow.close());
-  previousButton.addEventListener('click', () => moveSlide(-1));
-  nextButton.addEventListener('click', () => moveSlide(1));
-
-  slideshow.addEventListener('click', event => {
-    if (event.target === slideshow) slideshow.close();
+  galleryPanel.addEventListener('click', event => {
+    if (event.target === galleryPanel) galleryPanel.close();
   });
 
-  slideshow.addEventListener('close', () => {
-    mediaRegion.replaceChildren();
+  galleryPanel.addEventListener('close', () => {
+    panelMediaObserver?.disconnect();
+    panelMediaObserver = null;
+    galleryRegion.removeEventListener('scroll', schedulePanelMediaVisibilityCheck);
+    window.removeEventListener('resize', schedulePanelMediaVisibilityCheck);
+    panelVisibilityCheckScheduled = false;
+
+    const previews = Array.from(galleryRegion.querySelectorAll('video[data-gallery-video-preview]'));
+    for (const preview of previews) {
+      const queuedIndex = galleryPreviewQueue.indexOf(preview);
+      if (queuedIndex >= 0) galleryPreviewQueue.splice(queuedIndex, 1);
+    }
+    previews.forEach(preview => {
+      activeGalleryPreviewCleanup.get(preview)?.();
+    });
+    galleryRegion.querySelectorAll('img').forEach(image => {
+      image.removeAttribute('src');
+      image.removeAttribute('srcset');
+    });
+    galleryRegion.querySelectorAll('video:not([data-gallery-video-preview])').forEach(video => {
+      video.pause();
+      video.removeAttribute('src');
+      video.querySelectorAll('source').forEach(source => source.remove());
+      video.load();
+    });
+    galleryRegion.replaceChildren();
     if (openingItem && openingItem.isConnected) openingItem.focus({ preventScroll: true });
     openingItem = null;
-    slideItems = [];
-    slideIndex = 0;
   });
-
-  document.addEventListener('keydown', event => {
-    if (!slideshow.open) return;
-    if (event.key === 'Escape') {
-      event.preventDefault();
-      slideshow.close();
-    } else if (event.key === 'ArrowLeft') {
-      event.preventDefault();
-      moveSlide(-1);
-    } else if (event.key === 'ArrowRight') {
-      event.preventDefault();
-      moveSlide(1);
-    }
-  });
-
-  slideshow.addEventListener('touchstart', event => {
-    if (event.changedTouches.length === 1) {
-      touchStart = { x: event.changedTouches[0].clientX, y: event.changedTouches[0].clientY };
-    }
-  }, { passive: true });
-
-  slideshow.addEventListener('touchend', event => {
-    if (!touchStart || event.changedTouches.length !== 1) return;
-    const deltaX = event.changedTouches[0].clientX - touchStart.x;
-    const deltaY = event.changedTouches[0].clientY - touchStart.y;
-    touchStart = null;
-    if (Math.abs(deltaX) > 55 && Math.abs(deltaX) > Math.abs(deltaY)) {
-      moveSlide(deltaX < 0 ? 1 : -1);
-    }
-  }, { passive: true });
 }

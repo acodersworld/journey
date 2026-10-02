@@ -5,8 +5,8 @@
 **Current position:** The transport, filesystem-backed object store, SQLite
 post backend, scrolling feed, sidebar, account sign-in, draft authoring and
 media upload, publishing, and published-post share links are implemented
-locally. Browser video first-frame previews are also implemented; automatic
-gallery slideshows are next. Storage diagnostics and administration remain
+locally. Browser video first-frame previews and vertical scrolling gallery
+panels are also implemented. Storage diagnostics and administration remain
 deferred.
 
 ## 1. Direction
@@ -301,7 +301,7 @@ operations to public browsers.
 - Restoring the home connection restores media without restarting the public
   web service.
 
-## 5. Next website work
+## 5. Website work
 
 The local site now has a SQLite-backed post backend, a server-rendered scrolling
 feed, a sidebar, and `read`, `write`, and `admin` sessions with a browser
@@ -309,13 +309,14 @@ sign-in form. Every post and media request requires a session. Writers can
 create, edit, publish, and upload media to their drafts; admins can manage any
 draft. Draft galleries use media child rows backed by shared content-addressed
 assets. Published posts can be shared through expiring links with guest-scoped
-sessions. The next work is ordered as follows:
+sessions. The completed browser work is:
 
 1. **Browser video first-frame previews (implemented).** Decode a frame in the
    browser from each existing video URL and show it on gallery tiles without
    storing thumbnails.
-2. **Automatic gallery slideshow.** Add optional timed advance to the existing
-   manual slideshow, with pause controls and sensible video behavior.
+2. **Vertical scrolling gallery panel (implemented).** Open any tile directly
+   in an ordered, scrollable panel with on-demand media loading and user-started
+   video playback.
 
 The implemented [share links](design/ephemeral-post-share-links.md) grant access
 to one published post and its media, never to drafts.
