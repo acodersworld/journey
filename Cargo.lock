@@ -840,6 +840,7 @@ dependencies = [
  "futures-util",
  "h2",
  "http",
+ "rustls",
  "tokio",
  "tokio-tungstenite",
 ]

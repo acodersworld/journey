@@ -8,5 +8,7 @@ bytes = "1"
 futures-util = "0.3"
 h2 = "0.4"
 http = "1"
+# tokio-tungstenite enables rustls without selecting its crypto provider.
+rustls = { version = "0.23", features = ["aws_lc_rs"] }
 tokio = { version = "1", features = ["io-util", "macros", "rt", "sync", "time"] }
 tokio-tungstenite = { version = "0.27", features = ["rustls-tls-native-roots"] }
