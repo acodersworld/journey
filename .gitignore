@@ -1,0 +1,17 @@
+/target/
+.env
+.env.*
+!.env.example
+/journey-site.toml
+/journey-storage.toml
+site.toml
+storage.toml
+deploy/**/*.env
+deploy/tls/
+deploy/fixtures/
+deploy/uploads/
+validation-results/
+*.key
+*.crt
+*.csr
+*.pem

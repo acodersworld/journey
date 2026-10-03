@@ -1,0 +1,14 @@
+target
+.git
+.gitignore
+AGENTS.md
+docs
+deploy/tls
+deploy/fixtures
+deploy/uploads
+validation-results
+*.env
+*.key
+*.crt
+*.csr
+*.pem
