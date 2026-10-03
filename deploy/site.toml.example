@@ -1,0 +1,20 @@
+# Site runtime configuration. Copy to site.toml and edit before starting.
+
+[site]
+bind = "0.0.0.0:8080"
+database_path = "/home/ben/src/journey/deploy/data/journey-site.sqlite3"
+#public_origin = "http://192.168.0.48"
+public_origin = "http://127.0.0.1:8080"
+#control_socket = "/run/journey-site/control.sock"
+control_socket = "/home/ben/src/journey/deploy/data/control.sock"
+allow_insecure_lan_http = true
+session_ttl_seconds = 604800
+max_media_upload_bytes = 2147483648
+
+[storage]
+transport = "websocket"
+h2c_address = "127.0.0.1:8081"
+websocket_bind = "0.0.0.0:8081"
+websocket_secret = "replace-with-a-long-random-secret"
+initial_window_size = 33554432
+initial_connection_window_size = 67108864

@@ -1,0 +1,29 @@
+services:
+  storage:
+    image: ${JOURNEY_IMAGE:?set JOURNEY_IMAGE to the built image tag}
+    command: ["/usr/local/bin/journey-storage-service"]
+    environment:
+      JOURNEY_CONFIG: /etc/journey/storage.toml
+    ports:
+      - "${STORAGE_LAN_IP:?set STORAGE_LAN_IP}:8082:8082"
+    volumes:
+      - ./storage.toml:/etc/journey/storage.toml:ro,Z
+      - object-data:/var/lib/journey/objects
+    user: "65532:65532"
+    read_only: true
+    tmpfs:
+      - /tmp:size=8m,uid=65532,gid=65532,mode=0700
+    mem_limit: 512m
+    restart: unless-stopped
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    logging:
+      driver: json-file
+      options:
+        max-size: 2m
+        max-file: "2"
+
+volumes:
+  object-data:

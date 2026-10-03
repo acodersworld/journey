@@ -110,8 +110,8 @@ receives `403`. Draft summaries serialize `published_at` as `null`.
 `POST /posts/{post_id}/blocks/{block_id}/media` streams one original file from
 the browser through the website to storage, with backpressure and no full-file
 buffer. The route requires an editable draft root, checks the origin and
-content type, and enforces `JOURNEY_SITE_MAX_MEDIA_UPLOAD_BYTES` (default
-2 GiB). Accepted content types are JPEG, PNG, WebP, GIF, HEIC, HEIF, MP4, and
+content type, and enforces `site.max_media_upload_bytes` from the TOML
+configuration (2 GiB by default). Accepted content types are JPEG, PNG, WebP, GIF, HEIC, HEIF, MP4, and
 QuickTime MOV. An interrupted upload is retried from its beginning by the
 editor. The content-derived key identifies a shared `media_assets` row;
 removing a placement leaves the original stored. The editor keeps a session
@@ -221,11 +221,9 @@ authenticated media route return an attachment for browser-incompatible
 originals.
 
 The `journey-site import` and `journey-site db` commands provide explicit
-imports and read-only database inspection. `JOURNEY_SITE_DB` selects the
-SQLite path, `JOURNEY_SITE_BIND` selects the website HTTP listener,
-`JOURNEY_STORAGE_H2C` selects the loopback storage listener, and
-`JOURNEY_SITE_MAX_MEDIA_UPLOAD_BYTES` configures the per-file streaming upload
-limit (2 GiB by default).
+imports and read-only database inspection. The site TOML configuration selects
+the SQLite path, HTTP listener, storage transport and address, and per-file
+streaming upload limit (2 GiB by default).
 
 ## Accounts and sessions
 
@@ -245,15 +243,15 @@ accounts and sessions survive imports.
 Passwords use Argon2id version 19 with 19 MiB memory, two iterations, and one
 lane. Session cookies contain 256 bits of random token material, while SQLite
 stores only its SHA-256 digest. Sessions have an absolute seven-day lifetime by
-default, configurable with `JOURNEY_SITE_SESSION_TTL_SECONDS`. Password changes
-and account disabling delete that user's sessions. Login attempts are limited
+default, configurable with `site.session_ttl_seconds` in the TOML file. Password
+changes and account disabling delete that user's sessions. Login attempts are limited
 to five per username and 30 per client IP in a 15-minute window; old rows are
 pruned and the throttle table is capped at 10,000 entries.
 
 `POST /api/auth/login`, `GET /api/auth/current`, and `POST /api/auth/logout`
 are the JSON session endpoints. State-changing auth requests require an
-`Origin` matching `JOURNEY_SITE_PUBLIC_ORIGIN`. Without that setting, only
-loopback HTTP origins are accepted, and the server itself must bind to a
+`Origin` matching `site.public_origin` in the TOML configuration. Without that
+setting, only loopback HTTP origins are accepted, and the server itself must bind to a
 loopback address. Deployments set the public origin explicitly; HTTPS origins
 cause the cookie to include `Secure`. Cookies are host-only, HttpOnly, and
 SameSite=Strict. Authenticated content responses use `Cache-Control: private,

@@ -1,0 +1,12 @@
+[package]
+name = "journey-storage-service"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+journey-storage = { path = "../../crates/journey-storage" }
+journey-websocket = { path = "../../crates/journey-websocket" }
+http = "1"
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
+tokio = { version = "1", features = ["fs", "io-util", "macros", "net", "rt-multi-thread", "sync", "time"] }

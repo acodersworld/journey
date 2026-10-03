@@ -35,6 +35,10 @@ const VIDEO: &[u8] = include_bytes!("assets/video.mp4");
 struct Options {
     #[arg(long, value_name = "PATH")]
     storage_dir: Option<PathBuf>,
+    #[arg(long, default_value = DEFAULT_BIND)]
+    bind: SocketAddr,
+    #[arg(long, default_value = DEFAULT_WEB_BIND)]
+    web_bind: SocketAddr,
     #[arg(long = "connection-window-size", value_name = "SIZE", default_value = "256M", value_parser = parse_window_size)]
     connection_window_size: u32,
 }
@@ -46,7 +50,14 @@ async fn main() -> Result<(), Box<dyn Error>> {
         Some(root) => {
             let store = FilesystemStore::open(FilesystemStoreConfig::new(&root)).await?;
             println!("filesystem storage root: {}", root.display());
-            run_server(store, false, options.connection_window_size).await
+            run_server(
+                store,
+                false,
+                options.connection_window_size,
+                options.bind,
+                options.web_bind,
+            )
+            .await
         }
         None => {
             let store = Store::new([
@@ -54,7 +65,14 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 (Key::new("video.mp4").unwrap(), object("video/mp4", VIDEO)?),
             ])
             .map_err(std::io::Error::other)?;
-            run_server(store, true, options.connection_window_size).await
+            run_server(
+                store,
+                true,
+                options.connection_window_size,
+                options.bind,
+                options.web_bind,
+            )
+            .await
         }
     }
 }
@@ -90,10 +108,10 @@ async fn run_server<S: StoreInterface + Sync + Send>(
     store: S,
     seeded_fixtures: bool,
     initial_connection_window_size: u32,
+    address: SocketAddr,
+    web_address: SocketAddr,
 ) -> Result<(), Box<dyn Error>> {
     let store = Arc::new(store);
-    let bind = std::env::var("JOURNEY_STORAGE_BIND").unwrap_or_else(|_| DEFAULT_BIND.to_owned());
-    let address: SocketAddr = bind.parse()?;
     let listener = TcpListener::bind(address).await.map_err(|error| {
         std::io::Error::new(error.kind(), format!("failed to bind h2c listener at {address}: {error}"))
     })?;
@@ -101,9 +119,6 @@ async fn run_server<S: StoreInterface + Sync + Send>(
     let web_store = Arc::clone(&store);
     let service = Arc::new(Service::new(store));
 
-    let web_bind = std::env::var("JOURNEY_STORAGE_WEB_BIND")
-        .unwrap_or_else(|_| DEFAULT_WEB_BIND.to_owned());
-    let web_address: SocketAddr = web_bind.parse()?;
     let web_listener = TcpListener::bind(web_address).await.map_err(|error| {
         std::io::Error::new(error.kind(), format!("failed to bind web listener at {web_address}: {error}"))
     })?;

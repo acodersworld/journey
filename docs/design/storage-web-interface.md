@@ -52,9 +52,8 @@ the full key as JSON; caller-keyed uploads retain the `204 No Content`
 response.
 
 The example binds its web listener to `0.0.0.0:8082` by default and uses the
-example-only credentials `user` / `pass`. `JOURNEY_STORAGE_WEB_BIND`
-overrides that address; `JOURNEY_STORAGE_BIND` continues to configure only
-the h2c listener. The browser interface uses plain HTTP, so its Basic
+example-only credentials `user` / `pass`. `--web-bind` overrides that address;
+`--bind` configures the h2c listener. The browser interface uses plain HTTP, so its Basic
 credentials and traffic are unencrypted. The separate h2c listener has its
 own access boundary.
 

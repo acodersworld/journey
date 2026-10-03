@@ -1,98 +1,157 @@
-# Disposable AWS/home validation deployment
+# Two host LAN integration
 
-This directory is the disposable AWS/home validation deployment bundle. It
-intentionally contains no certificates, fixtures, uploads, or passwords.
+This bundle runs `journey-site` behind Nginx on one LAN host and the filesystem
+object service on another. Browser traffic uses HTTP. The storage host opens an
+outbound `ws://` connection to the site host; HTTP/2 storage requests travel
+inside that WebSocket session. This is a disposable test for a trusted LAN.
+Do not forward either port from the internet.
 
-## Build and deliver the image
+## Build and copy the image
 
-Run these commands on an x86 development machine from the repository root:
+Build one image from the repository root, then make it available on both hosts:
 
-    git_sha=$(git rev-parse HEAD)
-    docker build --platform linux/amd64 -t "journey-real-test:$git_sha" .
-    docker context create journey-aws --docker "host=ssh://ubuntu@<aws-host>"
-    docker image save "journey-real-test:$git_sha" \
-      | docker --context journey-aws image load
+    docker build -t journey-lan:test .
+    docker image save journey-lan:test -o journey-lan.tar
+    scp journey-lan.tar <site-host>:/tmp/
+    scp journey-lan.tar <storage-host>:/tmp/
 
-Copy aws-compose.yml, nginx.conf, the tls/ directory containing only the leaf
-certificate and key, and a restrictive gateway.env to /opt/journey-test. Set
-JOURNEY_IMAGE=journey-real-test:<git-sha> in the remote shell environment and
-run:
+On each host, load the image and copy the `deploy/` bundle:
 
-    cd /opt/journey-test
-    docker compose -f aws-compose.yml up -d
-    docker compose -f aws-compose.yml ps
+    docker image load -i /tmp/journey-lan.tar
 
-The AWS security group publishes only TCP 443. Port 9000 is private to the
-Compose network and port 8080 is not published.
+The Compose image tag must match `JOURNEY_IMAGE` in that host's environment
+file. For remote hosts, transfer `journey-lan.tar` and the deployment files by
+your usual trusted LAN or SSH method.
 
-## Home agent
+## Configure the shared secret
 
-Copy home-compose.yml, home.env, and the CA certificate (not the CA private
-key) to the home host. Set JOURNEY_IMAGE, JOURNEY_TEST_DOMAIN,
-HOME_FIXTURES_DIR, and HOME_UPLOADS_DIR in the shell environment. The fixture
-directory is mounted read-only and the upload directory is mounted writable.
-The upload directory must be writable by UID/GID 65532.
+Generate a long secret once, for example with `openssl rand -hex 32`. Put the
+same value in `site.toml` and `storage.toml` as `websocket_secret`. The secret
+and all HTTP, WebSocket, browser, and management traffic are unencrypted in
+this test. Keep the hosts on a trusted LAN and do not configure internet port
+forwarding.
 
-The home environment file contains only the home credential:
+## Start the site host
 
-    cp deploy/home.env.example home.env
-    chmod 600 home.env
+Copy `site-compose.yml`, `nginx.conf`, `site.env.example`, and
+`site.toml.example` into a deployment directory on the site host. Copy the
+examples to `.env` and `site.toml`, then set:
 
-Start it with:
+- `SITE_LAN_IP` to the site's LAN address.
+- `JOURNEY_IMAGE` to the image tag loaded above.
+- `JOURNEY_IMPORT_DIR` to a host directory containing manifests and their
+  referenced media files.
+- `site.toml`'s `site.public_origin` to `http://` followed by the site's LAN
+  address, and `storage.websocket_secret` to the shared secret.
 
-    docker compose -f home-compose.yml up -d
-    docker compose -f home-compose.yml logs -f home
+The container runs as UID 65532. Make the config readable only by that service
+account, then start the site:
 
-## Filesystem object-store journal
+    chmod 600 .env
+    sudo chown 65532:65532 site.toml
+    sudo chmod 400 site.toml
+    docker compose -f site-compose.yml up -d
+    docker compose -f site-compose.yml ps
 
-When the filesystem store is configured, its JSON Lines event journal defaults
-to `journal` under the storage root. Set a different journal path with
-`FilesystemStoreConfig::with_journal_path`. Install a host `logrotate` stanza
-for that path and adjust its size and retention values as needed; the defaults
-below rotate at 10 MiB and keep five numbered files:
+Only Nginx is published, bound to `SITE_LAN_IP:80`. Both site listeners stay
+private to the Compose network. The SQLite database is stored in the persistent
+`site-data` volume. The import directory is mounted read-only at `/imports`.
 
-    /var/lib/journey/storage/journal {
-        size 10M
-        rotate 5
-        missingok
-        notifempty
-    }
+The site can start while the storage host is offline. Pages and authentication
+remain available; media operations return an error until the storage host
+reconnects. Nginx keeps the storage WebSocket open for an hour between traffic
+and streams large upload and download bodies without buffering them to disk.
+Inner HTTP/2 stream and connection windows are configured to 32 MiB and 64 MiB
+on both ends of the session.
 
-Use rename based rotation and omit `copytruncate`. The store opens the current
-journal path for every event, so later events append to the newly created
-`journal` after rotation. Logrotate keeps numbered files such as `journal.1`
-and `journal.2`.
+## Start the storage host
 
-## Private test CA
+Copy `storage-compose.yml`, `storage.env.example`, and
+`storage.toml.example` to the storage host. Copy the examples to `.env` and
+`storage.toml`, then set:
 
-Generate the CA and domain certificate on the development machine. Keep the CA
-private key there; only copy test-ca.crt to home and the leaf certificate and
-key to AWS. Replace validation.example.test with the exact test-domain name:
+- `STORAGE_LAN_IP` to the storage host's LAN address.
+- `JOURNEY_IMAGE` to the image tag loaded above.
+- `storage.toml`'s `site_connection.websocket_url` to
+  `ws://<site-LAN-address>/internal/storage`.
+- `storage.toml`'s `site_connection.websocket_secret` to the same secret as the
+  site host, and `management.username` / `management.password` to unique
+  credentials.
 
-    mkdir -p deploy/tls
-    openssl genrsa -out deploy/tls/test-ca.key 4096
-    openssl req -x509 -new -nodes -key deploy/tls/test-ca.key -sha256 -days 7 \
-      -out deploy/tls/test-ca.crt -subj '/CN=Journey validation CA'
-    openssl genrsa -out deploy/tls/server.key 2048
-    openssl req -new -key deploy/tls/server.key -out deploy/tls/server.csr \
-      -subj '/CN=validation.example.test'
-    printf 'subjectAltName=DNS:validation.example.test\nextendedKeyUsage=serverAuth\n' \
-      > deploy/tls/server.ext
-    openssl x509 -req -in deploy/tls/server.csr -CA deploy/tls/test-ca.crt \
-      -CAkey deploy/tls/test-ca.key -CAcreateserial -out deploy/tls/server.crt \
-      -days 7 -sha256 -extfile deploy/tls/server.ext
-    chmod 600 deploy/tls/test-ca.key deploy/tls/server.key
+The container runs as UID 65532. Make the config readable only by that service
+account, then start the object service:
 
-Import test-ca.crt into the browser or operating-system trust store before the
-browser checks. The home process adds the mounted CA to its Rustls root store
-while retaining normal chain and hostname verification.
+    chmod 600 .env
+    sudo chown 65532:65532 storage.toml
+    sudo chmod 400 storage.toml
+    docker compose -f storage-compose.yml up -d
+    docker compose -f storage-compose.yml logs -f storage
 
-## Fixtures and teardown
+Only the object management UI is published, on `STORAGE_LAN_IP:8082`. The
+SQLite-backed site data remains on the site host; filesystem objects persist in
+the storage host's `object-data` volume. The storage WebSocket client retries
+after connection failures and restarts.
 
-Use scripts/create-validation-fixtures.sh to create a valid JPEG and a
-web-optimized MP4 of at least 50 MiB. Keep those files outside Git. After the
-test, stop and remove both Compose projects, terminate the instance, release
-the Elastic IP, remove DNS, revoke both credentials, delete deployment keys
-and bundles, and remove the Docker context:
+## Import and use the site
 
-    docker context rm journey-aws
+Place the manifest and all media paths it references under the configured
+`JOURNEY_IMPORT_DIR`. The site container sees that directory under `/imports`.
+Run imports explicitly through the live storage session:
+
+    docker compose -f site-compose.yml exec site \
+      journey-site import --via-running-site /imports/posts.json
+
+Imports replace the published post set and can add imported users. They never
+run automatically at startup. The direct h2c importer remains available for
+local development without `--via-running-site`.
+
+Open `http://<site-LAN-address>` in a browser to log in and exercise share links,
+media uploads, video seeking, and byte-range requests. To create a LAN share
+link from the running site container, use:
+
+    docker compose -f site-compose.yml exec site \
+      journey-site share-links create <published-post-id> --allow-insecure-lan-http
+
+Open `http://<storage-LAN-address>:8082` for the authenticated object
+management UI.
+
+## LAN checks
+
+Validate the Compose files on each host before starting the services:
+
+    docker compose -f site-compose.yml config --quiet
+    docker compose -f storage-compose.yml config --quiet
+
+On the site host, validate Nginx with the mounted configuration:
+
+    docker compose -f site-compose.yml run --rm --no-deps \
+      nginx nginx -t
+
+Check the site login and share-link flow in a browser over HTTP. In the browser
+developer tools, confirm the `journey_session` cookie has `HttpOnly` and
+`SameSite=Strict` and does not have `Secure` under the LAN opt-in. A generated
+share link should start with `http://<site-LAN-address>/share/`.
+
+Check that the storage endpoint rejects an incorrect secret with HTTP 401:
+
+    curl --include --no-buffer \
+      -H 'Connection: Upgrade' \
+      -H 'Upgrade: websocket' \
+      -H 'Sec-WebSocket-Version: 13' \
+      -H 'Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==' \
+      -H 'Sec-WebSocket-Protocol: h2-over-websocket-v1' \
+      -H 'X-Journey-Storage-Secret: incorrect' \
+      http://<site-LAN-address>/internal/storage
+
+Stop the storage Compose project and confirm the site still serves its login
+page while media requests fail promptly. Start the storage project again and
+confirm its logs show a new storage session. Restart the site project and then
+the storage project to check both reconnect directions. In the browser, upload
+a large media file, play and seek within an imported video, and confirm the
+browser's video range requests return partial content. Check the object UI at
+the storage LAN address and verify a stored object can be listed and
+downloaded.
+
+If the site reports that its database schema is outdated, stop the site,
+recreate the `site-data` volume, restart it, and run the destructive importer
+again. This development deployment has no database migration process.

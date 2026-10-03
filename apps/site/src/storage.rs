@@ -6,17 +6,20 @@ use std::{
     pin::Pin,
     net::SocketAddr,
     sync::Arc,
+    time::Duration,
 };
 
 use bytes::Bytes;
 use futures_util::{stream, Stream, StreamExt};
 use h2::client::{self, SendRequest};
 use http::{header, Method, Request, StatusCode, Version};
+use journey_websocket::{connect_client, ClientSender, Config};
 use tokio::{
     fs::File,
     io::AsyncReadExt,
     net::TcpStream,
     sync::Mutex,
+    time::timeout,
 };
 
 const STORAGE_CHUNK_SIZE: usize = 64 * 1024 * 1024;
@@ -60,6 +63,24 @@ pub struct H2cStorageClient {
     initial_window_size: u32,
     initial_connection_window_size: u32,
     connection: Arc<Mutex<ConnectionState>>,
+}
+
+#[derive(Clone)]
+pub struct WebSocketStorageClient {
+    connection: Arc<Mutex<WebSocketConnectionState>>,
+    initial_window_size: u32,
+    initial_connection_window_size: u32,
+}
+
+#[derive(Clone)]
+pub enum SiteStorageClient {
+    H2c(H2cStorageClient),
+    WebSocket(WebSocketStorageClient),
+}
+
+struct WebSocketConnectionState {
+    generation: u64,
+    sender: Option<ClientSender>,
 }
 
 struct ConnectionState {
@@ -170,148 +191,155 @@ impl H2cStorageClient {
             }
         }
     }
+}
 
-    fn request(
-        method: Method,
-        key: &str,
-        range: Option<&str>,
-        content_type: Option<&str>,
-        content_length: Option<u64>,
-        create_only: bool,
-        generate_key: bool,
-    ) -> Result<Request<()>, String> {
-        let mut builder = Request::builder()
-            .version(Version::HTTP_2)
-            .method(method)
-            .uri(format!("http://storage.internal/objects/{key}"));
-        if let Some(range) = range {
-            builder = builder.header(header::RANGE, range);
+impl WebSocketStorageClient {
+    pub fn new(initial_window_size: u32, initial_connection_window_size: u32) -> Self {
+        Self {
+            connection: Arc::new(Mutex::new(WebSocketConnectionState {
+                generation: 0,
+                sender: None,
+            })),
+            initial_window_size,
+            initial_connection_window_size,
         }
-        if let Some(content_type) = content_type {
-            builder = builder.header(header::CONTENT_TYPE, content_type);
+    }
+
+    pub async fn serve_connection<S>(
+        &self,
+        websocket: tokio_tungstenite::WebSocketStream<S>,
+    ) -> Result<(), String>
+    where
+        S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+    {
+        let config = Config {
+            h2_initial_stream_window_size: self.initial_window_size,
+            h2_initial_connection_window_size: self.initial_connection_window_size,
+            ..Config::default()
+        };
+        let session = connect_client(websocket, config)
+            .await
+            .map_err(|error| error.to_string())?;
+        let generation = {
+            let mut state = self.connection.lock().await;
+            state.generation = state
+                .generation
+                .checked_add(1)
+                .ok_or_else(|| "storage WebSocket generation overflow".to_owned())?;
+            state.sender = Some(session.sender());
+            state.generation
+        };
+        println!("site storage WebSocket session connected");
+        let result = session.wait().await.map_err(|error| error.to_string());
+        let mut state = self.connection.lock().await;
+        if state.generation == generation {
+            state.sender = None;
         }
-        if let Some(content_length) = content_length {
-            builder = builder.header(header::CONTENT_LENGTH, content_length);
-        }
-        if create_only {
-            builder = builder.header(header::IF_NONE_MATCH, "*");
-        }
-        if generate_key {
-            builder = builder.header("Object-Key-Mode", "sha256");
-        }
-        builder.body(()).map_err(|error| error.to_string())
+        println!("site storage WebSocket session ended");
+        result
+    }
+
+    async fn start_request(
+        &self,
+        request: Request<()>,
+        end_of_stream: bool,
+    ) -> Result<(client::ResponseFuture, h2::SendStream<Bytes>), String> {
+        let sender = self
+            .connection
+            .lock()
+            .await
+            .sender
+            .clone()
+            .ok_or_else(|| "storage WebSocket is unavailable".to_owned())?;
+        let mut ready = timeout(Duration::from_secs(3), sender.ready())
+            .await
+            .map_err(|_| "storage WebSocket request readiness timed out".to_owned())?
+            .map_err(|error| error.to_string())?;
+        ready
+            .send_request(request, end_of_stream)
+            .map_err(|error| error.to_string())
     }
 }
 
-impl StorageClient for H2cStorageClient {
-    async fn put_file(
+trait StorageRequestTransport: Clone + Send + Sync + 'static {
+    fn start_request(
         &self,
-        content_type: &str,
-        path: &Path,
-    ) -> Result<String, String> {
-        let mut file = File::open(path).await.map_err(|error| error.to_string())?;
-        let length = file
-            .metadata()
-            .await
-            .map_err(|error| error.to_string())?
-            .len();
-        let request = Self::request(
-            Method::PUT,
-            MEDIA_KEY_PREFIX,
-            None,
-            Some(content_type),
-            Some(length),
-            false,
-            true,
-        )?;
-        let (response, mut send) = self.start_request(request, false).await?;
-        let upload_result = async {
-            let mut sent = 0_u64;
-            let mut buffer = vec![0_u8; STORAGE_CHUNK_SIZE];
-            loop {
-                let count = file.read(&mut buffer).await.map_err(|error| error.to_string())?;
-                if count == 0 {
-                    break;
-                }
-                let next_sent = sent
-                    .checked_add(count as u64)
-                    .ok_or_else(|| "media file size overflow".to_owned())?;
-                if next_sent > length {
-                    return Err(format!("media file changed while uploading: {}", path.display()));
-                }
-                send_data(&mut send, Bytes::copy_from_slice(&buffer[..count])).await?;
-                sent = next_sent;
-            }
-            if sent != length {
-                return Err(format!("media file changed while uploading: {}", path.display()));
-            }
-            send.send_data(Bytes::new(), true)
-                .map_err(|error| error.to_string())?;
-            Ok::<(), String>(())
-        }
-        .await;
+        request: Request<()>,
+        end_of_stream: bool,
+    ) -> impl Future<Output = Result<(client::ResponseFuture, h2::SendStream<Bytes>), String>> + Send;
+}
 
-        if let Err(upload_error) = upload_result {
-            drop(send);
-            if let Ok(response) = response.await {
-                return Err(format!(
-                    "storage upload failed with HTTP {} while sending media",
-                    response.status()
-                ));
-            }
-            return Err(upload_error);
-        }
+impl StorageRequestTransport for H2cStorageClient {
+    async fn start_request(
+        &self,
+        request: Request<()>,
+        end_of_stream: bool,
+    ) -> Result<(client::ResponseFuture, h2::SendStream<Bytes>), String> {
+        H2cStorageClient::start_request(self, request, end_of_stream).await
+    }
+}
 
-        let response = response.await.map_err(|error| error.to_string())?;
-        if response.status() != StatusCode::OK {
-            return Err(format!("storage upload failed with HTTP {}", response.status()));
+impl StorageRequestTransport for WebSocketStorageClient {
+    async fn start_request(
+        &self,
+        request: Request<()>,
+        end_of_stream: bool,
+    ) -> Result<(client::ResponseFuture, h2::SendStream<Bytes>), String> {
+        WebSocketStorageClient::start_request(self, request, end_of_stream).await
+    }
+}
+
+macro_rules! impl_storage_client {
+    ($client:ty) => {
+        impl StorageClient for $client {
+            async fn put_file(&self, content_type: &str, path: &Path) -> Result<String, String> {
+                put_file(self, content_type, path).await
+            }
+
+            async fn put_stream(
+                &self,
+                content_type: &str,
+                content_length: Option<u64>,
+                body: StorageBody,
+                max_bytes: u64,
+            ) -> Result<(String, u64), String> {
+                put_stream(self, content_type, content_length, body, max_bytes).await
+            }
+
+            async fn get(
+                &self,
+                key: &str,
+                range: Option<&str>,
+                head: bool,
+            ) -> Result<StorageResponse, String> {
+                get(self, key, range, head).await
+            }
         }
-        extract_generated_media_key(response.headers())
+    };
+}
+
+impl_storage_client!(H2cStorageClient);
+impl_storage_client!(WebSocketStorageClient);
+
+impl StorageClient for SiteStorageClient {
+    async fn put_file(&self, content_type: &str, path: &Path) -> Result<String, String> {
+        match self {
+            Self::H2c(client) => client.put_file(content_type, path).await,
+            Self::WebSocket(client) => client.put_file(content_type, path).await,
+        }
     }
 
     async fn put_stream(
         &self,
         content_type: &str,
         content_length: Option<u64>,
-        mut body: StorageBody,
+        body: StorageBody,
         max_bytes: u64,
     ) -> Result<(String, u64), String> {
-        let request = Self::request(
-            Method::PUT,
-            MEDIA_KEY_PREFIX,
-            None,
-            Some(content_type),
-            content_length,
-            false,
-            true,
-        )?;
-        let (response, mut send) = self.start_request(request, false).await?;
-        let mut sent = 0_u64;
-        while let Some(chunk) = body.next().await {
-            let chunk = chunk.map_err(|error| {
-                format!("incoming upload request body failed after {sent} bytes: {error}")
-            })?;
-            let next_sent = sent
-                .checked_add(chunk.len() as u64)
-                .ok_or_else(|| UPLOAD_LIMIT_ERROR.to_owned())?;
-            if next_sent > max_bytes {
-                return Err(UPLOAD_LIMIT_ERROR.to_owned());
-            }
-            send_data(&mut send, chunk)
-                .await
-                .map_err(|error| format!("forwarding upload body to storage failed after {sent} bytes: {error}"))?;
-            sent = next_sent;
+        match self {
+            Self::H2c(client) => client.put_stream(content_type, content_length, body, max_bytes).await,
+            Self::WebSocket(client) => client.put_stream(content_type, content_length, body, max_bytes).await,
         }
-        if content_length.is_some_and(|length| length != sent) {
-            return Err("media upload length did not match Content-Length".to_owned());
-        }
-        send.send_data(Bytes::new(), true)
-            .map_err(|error| error.to_string())?;
-        let response = response.await.map_err(|error| error.to_string())?;
-        if response.status() != StatusCode::OK {
-            return Err(format!("storage upload failed with HTTP {}", response.status()));
-        }
-        Ok((extract_generated_media_key(response.headers())?, sent))
     }
 
     async fn get(
@@ -320,33 +348,186 @@ impl StorageClient for H2cStorageClient {
         range: Option<&str>,
         head: bool,
     ) -> Result<StorageResponse, String> {
-        let method = if head { Method::HEAD } else { Method::GET };
-        let request = Self::request(method, key, range, None, None, false, false)?;
-        let (response, _send) = self.start_request(request, true).await?;
-        let response = response.await.map_err(|error| error.to_string())?;
-        let status = response.status();
-        let headers = response.headers().clone();
-        let body = if head {
-            Box::pin(stream::empty()) as StorageBody
-        } else {
-            Box::pin(stream::unfold(response.into_body(), |mut body| async move {
-                match body.data().await {
-                    Some(Ok(chunk)) => {
-                        let length = chunk.len();
-                        let result = body
-                            .flow_control()
-                            .release_capacity(length)
-                            .map_err(|error| std::io::Error::other(error.to_string()))
-                            .map(|()| chunk);
-                        Some((result, body))
-                    }
-                    Some(Err(error)) => Some((Err(std::io::Error::other(error.to_string())), body)),
-                    None => None,
-                }
-            })) as StorageBody
-        };
-        Ok(StorageResponse { status, headers, body })
+        match self {
+            Self::H2c(client) => client.get(key, range, head).await,
+            Self::WebSocket(client) => client.get(key, range, head).await,
+        }
     }
+}
+
+async fn put_file<T: StorageRequestTransport>(
+    transport: &T,
+    content_type: &str,
+    path: &Path,
+) -> Result<String, String> {
+    let mut file = File::open(path).await.map_err(|error| error.to_string())?;
+    let length = file
+        .metadata()
+        .await
+        .map_err(|error| error.to_string())?
+        .len();
+    let request = storage_request(
+        Method::PUT,
+        MEDIA_KEY_PREFIX,
+        None,
+        Some(content_type),
+        Some(length),
+        false,
+        true,
+    )?;
+    let (response, mut send) = transport.start_request(request, false).await?;
+    let upload_result = async {
+        let mut sent = 0_u64;
+        let mut buffer = vec![0_u8; STORAGE_CHUNK_SIZE];
+        loop {
+            let count = file.read(&mut buffer).await.map_err(|error| error.to_string())?;
+            if count == 0 {
+                break;
+            }
+            let next_sent = sent
+                .checked_add(count as u64)
+                .ok_or_else(|| "media file size overflow".to_owned())?;
+            if next_sent > length {
+                return Err(format!("media file changed while uploading: {}", path.display()));
+            }
+            send_data(&mut send, Bytes::copy_from_slice(&buffer[..count])).await?;
+            sent = next_sent;
+        }
+        if sent != length {
+            return Err(format!("media file changed while uploading: {}", path.display()));
+        }
+        send.send_data(Bytes::new(), true)
+            .map_err(|error| error.to_string())?;
+        Ok::<(), String>(())
+    }
+    .await;
+
+    if let Err(upload_error) = upload_result {
+        drop(send);
+        if let Ok(response) = response.await {
+            return Err(format!(
+                "storage upload failed with HTTP {} while sending media",
+                response.status()
+            ));
+        }
+        return Err(upload_error);
+    }
+
+    let response = response.await.map_err(|error| error.to_string())?;
+    if response.status() != StatusCode::OK {
+        return Err(format!("storage upload failed with HTTP {}", response.status()));
+    }
+    extract_generated_media_key(response.headers())
+}
+
+async fn put_stream<T: StorageRequestTransport>(
+    transport: &T,
+    content_type: &str,
+    content_length: Option<u64>,
+    mut body: StorageBody,
+    max_bytes: u64,
+) -> Result<(String, u64), String> {
+    let request = storage_request(
+        Method::PUT,
+        MEDIA_KEY_PREFIX,
+        None,
+        Some(content_type),
+        content_length,
+        false,
+        true,
+    )?;
+    let (response, mut send) = transport.start_request(request, false).await?;
+    let mut sent = 0_u64;
+    while let Some(chunk) = body.next().await {
+        let chunk = chunk.map_err(|error| {
+            format!("incoming upload request body failed after {sent} bytes: {error}")
+        })?;
+        let next_sent = sent
+            .checked_add(chunk.len() as u64)
+            .ok_or_else(|| UPLOAD_LIMIT_ERROR.to_owned())?;
+        if next_sent > max_bytes {
+            return Err(UPLOAD_LIMIT_ERROR.to_owned());
+        }
+        send_data(&mut send, chunk)
+            .await
+            .map_err(|error| format!("forwarding upload body to storage failed after {sent} bytes: {error}"))?;
+        sent = next_sent;
+    }
+    if content_length.is_some_and(|length| length != sent) {
+        return Err("media upload length did not match Content-Length".to_owned());
+    }
+    send.send_data(Bytes::new(), true)
+        .map_err(|error| error.to_string())?;
+    let response = response.await.map_err(|error| error.to_string())?;
+    if response.status() != StatusCode::OK {
+        return Err(format!("storage upload failed with HTTP {}", response.status()));
+    }
+    Ok((extract_generated_media_key(response.headers())?, sent))
+}
+
+async fn get<T: StorageRequestTransport>(
+    transport: &T,
+    key: &str,
+    range: Option<&str>,
+    head: bool,
+) -> Result<StorageResponse, String> {
+    let method = if head { Method::HEAD } else { Method::GET };
+    let request = storage_request(method, key, range, None, None, false, false)?;
+    let (response, _send) = transport.start_request(request, true).await?;
+    let response = response.await.map_err(|error| error.to_string())?;
+    let status = response.status();
+    let headers = response.headers().clone();
+    let body = if head {
+        Box::pin(stream::empty()) as StorageBody
+    } else {
+        Box::pin(stream::unfold(response.into_body(), |mut body| async move {
+            match body.data().await {
+                Some(Ok(chunk)) => {
+                    let length = chunk.len();
+                    let result = body
+                        .flow_control()
+                        .release_capacity(length)
+                        .map_err(|error| std::io::Error::other(error.to_string()))
+                        .map(|()| chunk);
+                    Some((result, body))
+                }
+                Some(Err(error)) => Some((Err(std::io::Error::other(error.to_string())), body)),
+                None => None,
+            }
+        })) as StorageBody
+    };
+    Ok(StorageResponse { status, headers, body })
+}
+
+fn storage_request(
+    method: Method,
+    key: &str,
+    range: Option<&str>,
+    content_type: Option<&str>,
+    content_length: Option<u64>,
+    create_only: bool,
+    generate_key: bool,
+) -> Result<Request<()>, String> {
+    let mut builder = Request::builder()
+        .version(Version::HTTP_2)
+        .method(method)
+        .uri(format!("http://storage.internal/objects/{key}"));
+    if let Some(range) = range {
+        builder = builder.header(header::RANGE, range);
+    }
+    if let Some(content_type) = content_type {
+        builder = builder.header(header::CONTENT_TYPE, content_type);
+    }
+    if let Some(content_length) = content_length {
+        builder = builder.header(header::CONTENT_LENGTH, content_length);
+    }
+    if create_only {
+        builder = builder.header(header::IF_NONE_MATCH, "*");
+    }
+    if generate_key {
+        builder = builder.header("Object-Key-Mode", "sha256");
+    }
+    builder.body(()).map_err(|error| error.to_string())
 }
 
 async fn send_data(send: &mut h2::SendStream<Bytes>, mut chunk: Bytes) -> Result<(), String> {
@@ -396,6 +577,16 @@ mod tests {
         sync::oneshot,
         task::JoinHandle,
     };
+
+    #[tokio::test]
+    async fn websocket_storage_fails_promptly_without_a_connected_peer() {
+        let client = WebSocketStorageClient::new(512 * 1024, 4 * 1024 * 1024);
+        let started = std::time::Instant::now();
+        let error = client.get("media/missing", None, true).await.err().unwrap();
+
+        assert_eq!(error, "storage WebSocket is unavailable");
+        assert!(started.elapsed() < Duration::from_millis(100));
+    }
 
     struct ReconnectingStorageServer {
         client: H2cStorageClient,

@@ -19,7 +19,7 @@ use crate::{
 
 const DEFAULT_FEED_LIMIT: usize = 10;
 const MAX_FEED_LIMIT: usize = 100;
-const DEFAULT_MAX_MEDIA_UPLOAD_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+pub const DEFAULT_MAX_MEDIA_UPLOAD_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 
 #[derive(Clone)]
 pub struct AppState<S: StorageClient> {
@@ -159,40 +159,34 @@ struct PublishPostRequest {
 }
 
 impl SiteSecurity {
-    pub fn from_env(bind_address: SocketAddr, allow_insecure_cookies: bool) -> Result<Self, String> {
-        if allow_insecure_cookies && !bind_address.ip().is_loopback() {
-            return Err("--allow-insecure-cookies is only permitted when binding to loopback".to_owned());
-        }
-        let public_origin = match std::env::var("JOURNEY_SITE_PUBLIC_ORIGIN") {
-            Ok(value) => {
-                let origin = parse_origin(&value)
-                    .ok_or_else(|| "JOURNEY_SITE_PUBLIC_ORIGIN must be an origin URL".to_owned())?;
-                if origin.scheme == "http" && !origin.is_loopback() {
-                    return Err("JOURNEY_SITE_PUBLIC_ORIGIN may use HTTP only for loopback hosts".to_owned());
+    pub fn from_config(
+        bind_address: SocketAddr,
+        public_origin: Option<&str>,
+        session_lifetime_seconds: i64,
+        max_media_upload_bytes: u64,
+        allow_insecure_lan_http: bool,
+    ) -> Result<Self, String> {
+        let public_origin = match public_origin {
+            Some(value) => {
+                let origin = parse_origin(value)
+                    .ok_or_else(|| "site.public_origin must be an origin URL".to_owned())?;
+                if origin.scheme == "http" && !origin.is_loopback() && !allow_insecure_lan_http {
+                    return Err("site.public_origin uses non-loopback HTTP; set site.allow_insecure_lan_http = true to allow it".to_owned());
                 }
                 Some(origin)
             }
-            Err(std::env::VarError::NotPresent) if bind_address.ip().is_loopback() => None,
-            Err(std::env::VarError::NotPresent) => {
-                return Err("JOURNEY_SITE_PUBLIC_ORIGIN is required when binding outside loopback".to_owned());
+            None if bind_address.ip().is_loopback() => None,
+            None => {
+                return Err("site.public_origin is required when binding outside loopback".to_owned());
             }
-            Err(error) => return Err(format!("could not read JOURNEY_SITE_PUBLIC_ORIGIN: {error}")),
         };
-        let session_lifetime_seconds = std::env::var("JOURNEY_SITE_SESSION_TTL_SECONDS")
-            .unwrap_or_else(|_| "604800".to_owned())
-            .parse::<i64>()
-            .map_err(|_| "JOURNEY_SITE_SESSION_TTL_SECONDS must be a positive integer".to_owned())?;
         if session_lifetime_seconds <= 0 {
-            return Err("JOURNEY_SITE_SESSION_TTL_SECONDS must be a positive integer".to_owned());
+            return Err("site.session_ttl_seconds must be a positive integer".to_owned());
         }
-        let max_media_upload_bytes = std::env::var("JOURNEY_SITE_MAX_MEDIA_UPLOAD_BYTES")
-            .unwrap_or_else(|_| DEFAULT_MAX_MEDIA_UPLOAD_BYTES.to_string())
-            .parse::<u64>()
-            .map_err(|_| "JOURNEY_SITE_MAX_MEDIA_UPLOAD_BYTES must be a positive integer".to_owned())?;
         if max_media_upload_bytes == 0 || max_media_upload_bytes > i64::MAX as u64 {
-            return Err("JOURNEY_SITE_MAX_MEDIA_UPLOAD_BYTES must be between 1 and 9223372036854775807".to_owned());
+            return Err("site.max_media_upload_bytes must be between 1 and 9223372036854775807".to_owned());
         }
-        let secure_cookie = !allow_insecure_cookies;
+        let secure_cookie = !allow_insecure_lan_http;
         Ok(Self {
             public_origin,
             secure_cookie,
@@ -202,23 +196,24 @@ impl SiteSecurity {
     }
 }
 
-pub fn share_link_origin(bind_address: SocketAddr) -> Result<String, String> {
-    match std::env::var("JOURNEY_SITE_PUBLIC_ORIGIN") {
-        Ok(value) => {
-            let origin = parse_origin(&value)
-                .ok_or_else(|| "JOURNEY_SITE_PUBLIC_ORIGIN must be an origin URL".to_owned())?;
-            if origin.scheme == "http" && !origin.is_loopback() {
-                return Err("JOURNEY_SITE_PUBLIC_ORIGIN may use HTTP only for loopback hosts".to_owned());
+pub fn share_link_origin_with_insecure_lan_http(
+    bind_address: SocketAddr,
+    public_origin: Option<&str>,
+    allow_insecure_lan_http: bool,
+) -> Result<String, String> {
+    match public_origin {
+        Some(value) => {
+            let origin = parse_origin(value)
+                .ok_or_else(|| "site.public_origin must be an origin URL".to_owned())?;
+            if origin.scheme == "http" && !origin.is_loopback() && !allow_insecure_lan_http {
+                return Err("site.public_origin uses non-loopback HTTP; set site.allow_insecure_lan_http = true to allow it".to_owned());
             }
             Ok(origin.key)
         }
-        Err(std::env::VarError::NotPresent) if bind_address.ip().is_loopback() => {
+        None if bind_address.ip().is_loopback() => {
             Ok(format!("http://{bind_address}"))
         }
-        Err(std::env::VarError::NotPresent) => {
-            Err("JOURNEY_SITE_PUBLIC_ORIGIN is required to create a link when binding outside loopback".to_owned())
-        }
-        Err(error) => Err(format!("could not read JOURNEY_SITE_PUBLIC_ORIGIN: {error}")),
+        None => Err("site.public_origin is required to create a link when binding outside loopback".to_owned()),
     }
 }
 

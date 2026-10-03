@@ -1,7 +1,10 @@
 mod auth;
+mod config;
+mod control;
 mod db;
 mod import;
 mod storage;
+mod storage_websocket;
 mod web;
 
 use std::{
@@ -13,7 +16,7 @@ use std::{
 
 use clap::{Args, CommandFactory, Parser, Subcommand};
 use db::Database;
-use storage::H2cStorageClient;
+use storage::{H2cStorageClient, SiteStorageClient, WebSocketStorageClient};
 use tokio::net::TcpListener;
 
 type AppResult<T> = Result<T, Box<dyn Error + Send + Sync>>;
@@ -23,9 +26,11 @@ type AppResult<T> = Result<T, Box<dyn Error + Send + Sync>>;
     name = "journey-site",
     about = "Post backend and manifest importer",
     version,
-    after_help = "Environment:\n  JOURNEY_SITE_DB                        SQLite file (default: journey-site.sqlite3)\n  JOURNEY_SITE_BIND                      HTTP listen address (default: 127.0.0.1:8080)\n  JOURNEY_STORAGE_H2C                    loopback h2c address (default: 127.0.0.1:8081)\n  JOURNEY_SITE_PUBLIC_ORIGIN             site's public origin (required off loopback)\n  JOURNEY_SITE_SESSION_TTL_SECONDS       absolute session lifetime (default: 604800)\n  JOURNEY_SITE_MAX_MEDIA_UPLOAD_BYTES    per-file media limit (default: 2147483648)\n\nWindow sizes accept bytes, K/KiB, KB, M/MiB, or MB (defaults: 512K and 4M). K/M are binary; KB/MB are decimal."
+    after_help = "Configuration:\n  --config <PATH> or JOURNEY_CONFIG selects a TOML configuration file.\n  See deploy/site.toml.example for the available settings."
 )]
 struct Cli {
+    #[arg(long, global = true, value_name = "PATH")]
+    config: Option<PathBuf>,
     #[command(subcommand)]
     command: Option<Commands>,
 }
@@ -52,6 +57,8 @@ enum Commands {
 #[derive(Args)]
 struct ImportArgs {
     manifest: PathBuf,
+    #[arg(long)]
+    via_running_site: bool,
     #[command(flatten)]
     storage_windows: StorageWindowArgs,
 }
@@ -59,17 +66,17 @@ struct ImportArgs {
 #[derive(Args)]
 struct ServeArgs {
     #[arg(long)]
-    allow_insecure_cookies: bool,
+    allow_insecure_lan_http: bool,
     #[command(flatten)]
     storage_windows: StorageWindowArgs,
 }
 
-#[derive(Args, Clone, Copy)]
+#[derive(Args, Clone, Copy, Default)]
 struct StorageWindowArgs {
-    #[arg(long = "window-size", value_name = "SIZE", default_value = "512K", value_parser = parse_window_size)]
-    initial_window_size: u32,
-    #[arg(long = "connection-window-size", value_name = "SIZE", default_value = "4M", value_parser = parse_window_size)]
-    initial_connection_window_size: u32,
+    #[arg(long = "window-size", value_name = "SIZE", value_parser = parse_window_size)]
+    initial_window_size: Option<u32>,
+    #[arg(long = "connection-window-size", value_name = "SIZE", value_parser = parse_window_size)]
+    initial_connection_window_size: Option<u32>,
 }
 
 #[derive(Subcommand)]
@@ -99,6 +106,8 @@ enum ShareLinkCommands {
     Create {
         #[arg(value_name = "PUBLISHED-POST-ID")]
         published_post_id: i64,
+        #[arg(long)]
+        allow_insecure_lan_http: bool,
     },
     List,
     Revoke { link_id: String },
@@ -107,18 +116,45 @@ enum ShareLinkCommands {
 #[tokio::main]
 async fn main() -> AppResult<()> {
     let cli = Cli::parse();
-    let Some(command) = cli.command else {
+    let Cli { config: config_path, command } = cli;
+    let Some(command) = command else {
         Cli::command().print_help()?;
         println!();
         return Ok(());
     };
 
-    let database = Database::new(database_path());
+    let config = config::AppConfig::load(config_path)?;
+    let database = Database::new(config.site.database_path.clone());
     match command {
         Commands::Import(options) => {
+            if options.via_running_site {
+                let result = control::request_import(&options.manifest, &config.site.control_socket).await?;
+                print_import_result(result);
+                return Ok(());
+            }
+            match config.storage.transport.as_str() {
+                "h2c" => {}
+                "websocket" => {
+                    return Err(
+                        concat!(
+                            "storage.transport is \"websocket\"; run this import with ",
+                            "--via-running-site while journey-site is serving. ",
+                            "The manifest path must be absolute and visible to the site process"
+                        )
+                        .into(),
+                    );
+                }
+                transport => {
+                    return Err(format!("unsupported storage.transport value: {transport}").into());
+                }
+            }
             let prepared = import::prepare_manifest(&options.manifest).await?;
-            let storage = connect_storage(options.storage_windows).await?;
-            import::apply_import(prepared, &database, &storage).await
+            let windows = resolve_storage_windows(options.storage_windows, &config.storage)?;
+            let address = parse_socket_address("storage.h2c_address", &config.storage.h2c_address)?;
+            let storage = connect_storage(windows, address).await?;
+            let result = import::apply_import(prepared, &database, &storage).await?;
+            print_import_result(result);
+            Ok(())
         }
         Commands::Db { command } => {
             database.initialize().await.map_err(std::io::Error::other)?;
@@ -205,14 +241,17 @@ async fn main() -> AppResult<()> {
                     println!("{}", database.share_link_lifetime().await.map_err(std::io::Error::other)?.as_secs());
                     Ok(())
                 }
-                ShareLinkCommands::Create { published_post_id } => {
+                ShareLinkCommands::Create { published_post_id, allow_insecure_lan_http } => {
                     if published_post_id <= 0 {
                         return Err("published post ID must be positive".into());
                     }
-                    let bind = std::env::var("JOURNEY_SITE_BIND")
-                        .unwrap_or_else(|_| "127.0.0.1:8080".to_owned());
-                    let bind_address = bind.parse::<SocketAddr>()?;
-                    let origin = web::share_link_origin(bind_address).map_err(std::io::Error::other)?;
+                    let bind_address = parse_socket_address("site.bind", &config.site.bind)?;
+                    let origin = web::share_link_origin_with_insecure_lan_http(
+                        bind_address,
+                        config.site.public_origin.as_deref(),
+                        allow_insecure_lan_http || config.site.allow_insecure_lan_http,
+                    )
+                    .map_err(std::io::Error::other)?;
                     let link_id = auth::new_share_link_id();
                     let secret = auth::new_share_link_secret();
                     let created_at = unix_time();
@@ -268,17 +307,83 @@ async fn main() -> AppResult<()> {
             }
         }
         Commands::Serve(options) => {
-            let bind = std::env::var("JOURNEY_SITE_BIND")
-                .unwrap_or_else(|_| "127.0.0.1:8080".to_owned());
-            let bind_address = bind.parse::<SocketAddr>()?;
-            if options.allow_insecure_cookies && !bind_address.ip().is_loopback() {
-                return Err("--allow-insecure-cookies is only permitted when binding to loopback".into());
-            }
-            let security = web::SiteSecurity::from_env(bind_address, options.allow_insecure_cookies)
-                .map_err(std::io::Error::other)?;
-            database.initialize().await.map_err(std::io::Error::other)?;
-            let storage = connect_storage(options.storage_windows).await?;
-            let listener = TcpListener::bind(&bind).await?;
+            let bind = config.site.bind.clone();
+            let bind_address = parse_socket_address("site.bind", &bind)?;
+            let allow_insecure_lan_http =
+                options.allow_insecure_lan_http || config.site.allow_insecure_lan_http;
+            let security = web::SiteSecurity::from_config(
+                bind_address,
+                config.site.public_origin.as_deref(),
+                config.site.session_ttl_seconds,
+                config.site.max_media_upload_bytes,
+                allow_insecure_lan_http,
+            )
+            .map_err(std::io::Error::other)?;
+            let windows = resolve_storage_windows(options.storage_windows, &config.storage)?;
+            let storage_transport = match config.storage.transport.as_str() {
+                "h2c" => ConfiguredStorageTransport::H2c(parse_socket_address(
+                    "storage.h2c_address",
+                    &config.storage.h2c_address,
+                )?),
+                "websocket" => {
+                    if config.storage.websocket_secret.is_empty() {
+                        return Err("storage.websocket_secret is required when storage.transport is websocket".into());
+                    }
+                    ConfiguredStorageTransport::WebSocket(
+                        storage_websocket::parse_bind_address(&config.storage.websocket_bind)?,
+                    )
+                }
+                transport => return Err(format!("unsupported storage.transport value: {transport}").into()),
+            };
+            let database_path = &config.site.database_path;
+            database.initialize().await.map_err(|error| {
+                format!("could not initialize site database at {}: {error}", database_path.display())
+            })?;
+            let storage = match storage_transport {
+                ConfiguredStorageTransport::H2c(address) => {
+                    SiteStorageClient::H2c(connect_storage(windows, address).await?)
+                }
+                ConfiguredStorageTransport::WebSocket(websocket_address) => {
+                    let storage = WebSocketStorageClient::new(
+                        windows.initial_window_size,
+                        windows.initial_connection_window_size,
+                    );
+                    let websocket_listener = TcpListener::bind(websocket_address)
+                        .await
+                        .map_err(|error| format!("could not bind storage WebSocket listener at {websocket_address}: {error}"))?;
+                    println!("journey-site storage WebSocket listener on {}", websocket_listener.local_addr()?);
+                    let websocket_storage = storage.clone();
+                    let secret = config.storage.websocket_secret.clone();
+                    tokio::spawn(async move {
+                        if let Err(error) = storage_websocket::serve(
+                            websocket_listener,
+                            secret,
+                            websocket_storage,
+                            windows.initial_window_size,
+                            windows.initial_connection_window_size,
+                        )
+                        .await
+                        {
+                            eprintln!("storage WebSocket listener stopped: {error}");
+                        }
+                    });
+                    SiteStorageClient::WebSocket(storage)
+                }
+            };
+            let control_listener = control::bind(&config.site.control_socket)
+                .await
+                .map_err(|error| format!("could not bind private import control socket: {error}"))?;
+            println!("journey-site import control socket ready");
+            let control_database = database.clone();
+            let control_storage = storage.clone();
+            tokio::spawn(async move {
+                if let Err(error) = control::serve(control_listener, control_database, control_storage).await {
+                    eprintln!("journey-site control listener stopped: {error}");
+                }
+            });
+            let listener = TcpListener::bind(&bind)
+                .await
+                .map_err(|error| format!("could not bind site HTTP listener at {bind}: {error}"))?;
             println!("journey-site HTTP listener on {}", listener.local_addr()?);
             axum::serve(
                 listener,
@@ -336,6 +441,16 @@ fn unix_time() -> Duration {
 
 fn link_url(origin: &str, link_id: &str, secret: &str) -> String {
     format!("{origin}/share/{link_id}/{secret}")
+}
+
+fn print_import_result(result: import::ImportResult) {
+    println!(
+        "import complete: {} post(s) replaced, {} account(s) in manifest, {} unique media file(s), {} new account(s)",
+        result.posts_replaced,
+        result.imported_accounts,
+        result.unique_media_files,
+        result.accounts_added,
+    );
 }
 
 fn read_new_password() -> AppResult<String> {
@@ -404,20 +519,53 @@ fn read_password(_prompt: &str) -> std::io::Result<String> {
     ))
 }
 
-fn database_path() -> PathBuf {
-    std::env::var_os("JOURNEY_SITE_DB")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("journey-site.sqlite3"))
+#[derive(Clone, Copy)]
+struct StorageWindows {
+    initial_window_size: u32,
+    initial_connection_window_size: u32,
 }
 
-async fn connect_storage(windows: StorageWindowArgs) -> AppResult<H2cStorageClient> {
-    let address = std::env::var("JOURNEY_STORAGE_H2C")
-        .unwrap_or_else(|_| "127.0.0.1:8081".to_owned())
-        .parse::<SocketAddr>()?;
+enum ConfiguredStorageTransport {
+    H2c(SocketAddr),
+    WebSocket(SocketAddr),
+}
+
+fn resolve_storage_windows(
+    args: StorageWindowArgs,
+    config: &config::StorageSettings,
+) -> AppResult<StorageWindows> {
+    let windows = StorageWindows {
+        initial_window_size: args.initial_window_size.unwrap_or(config.initial_window_size),
+        initial_connection_window_size: args
+            .initial_connection_window_size
+            .unwrap_or(config.initial_connection_window_size),
+    };
+    for (name, size) in [
+        ("storage.initial_window_size", windows.initial_window_size),
+        (
+            "storage.initial_connection_window_size",
+            windows.initial_connection_window_size,
+        ),
+    ] {
+        if !(1..=0x7fff_ffff).contains(&size) {
+            return Err(format!("{name} must be between 1 and 2147483647 bytes").into());
+        }
+    }
+    Ok(windows)
+}
+
+fn parse_socket_address(name: &str, value: &str) -> AppResult<SocketAddr> {
+    value
+        .parse::<SocketAddr>()
+        .map_err(|error| format!("{name} must be a socket address (got {value:?}): {error}").into())
+}
+
+async fn connect_storage(windows: StorageWindows, address: SocketAddr) -> AppResult<H2cStorageClient> {
     H2cStorageClient::connect(
         address,
         windows.initial_window_size,
         windows.initial_connection_window_size,
     )
     .await
+    .map_err(|error| format!("could not connect to h2c storage service at {address}: {error}").into())
 }

@@ -5,18 +5,17 @@ COPY Cargo.toml Cargo.lock ./
 COPY apps ./apps
 COPY crates ./crates
 COPY src ./src
-RUN cargo build --locked --release -p journey-gateway -p journey-home
+RUN cargo build --locked --release -p journey-site -p journey-storage-service
 
 FROM debian:bookworm-slim
 
-RUN apt-get update \
-    && apt-get install --no-install-recommends --yes ca-certificates \
-    && rm -rf /var/lib/apt/lists/*
+RUN mkdir -p /var/lib/journey/site /var/lib/journey/objects /run/journey-site \
+    && chown -R 65532:65532 /var/lib/journey /run/journey-site
 
-COPY --from=build /src/target/release/journey-gateway /usr/local/bin/gateway
-COPY --from=build /src/target/release/journey-home /usr/local/bin/home
+COPY --from=build /src/target/release/journey-site /usr/local/bin/journey-site
+COPY --from=build /src/target/release/journey-storage-service /usr/local/bin/journey-storage-service
 
 USER 65532:65532
-EXPOSE 8080 9000
+EXPOSE 8080 8081 8082
 
-CMD ["/usr/local/bin/gateway"]
+CMD ["/usr/local/bin/journey-site", "serve"]

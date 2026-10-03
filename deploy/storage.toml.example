@@ -1,0 +1,16 @@
+# Storage runtime configuration. Copy to storage.toml and edit before starting.
+
+[storage]
+object_dir = "/home/ben/src/journey/apps/storage/db"
+initial_stream_window_size = 33554432
+initial_connection_window_size = 67108864
+
+[management]
+bind = "0.0.0.0:8082"
+username = "storage-admin"
+password = "replace-with-a-long-random-password"
+
+[site_connection]
+#websocket_url = "ws://192.168.0.48/internal/storage"
+websocket_url = "ws://127.0.0.1:8081/internal/storage"
+websocket_secret = "replace-with-a-long-random-secret"

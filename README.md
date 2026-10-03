@@ -1,34 +1,19 @@
-# Journey prototypes
+# Journey
 
-This workspace contains the bounded HTTP/2-over-WebSocket transport, the
-disposable gateway/home validation applications, and a separate local
-`journey-site` website and post backend. The validation gateway owns its
-prototype routes, Basic Authentication, and proxy backpressure. The home agent
-owns the read-only media fixtures and digest-named upload storage. Application
-routes and storage behavior remain outside `journey-websocket`.
+This workspace contains the `journey-site` publishing backend, the
+`journey-storage` object store, and the bounded HTTP/2-over-WebSocket
+transport. The gateway and home applications remain available as earlier
+transport validation examples.
 
-The deployment bundle and teardown procedure are in `deploy/README.md`.
-Use `scripts/aws-home-real-world-validation.sh` with the browser and lifecycle
-checklist in `docs/aws-home-real-world-validation-checklist.md` to repeat the
-validation.
+The disposable two-host LAN deployment is documented in
+[`deploy/README.md`](deploy/README.md). It runs the site and filesystem object
+service on separate hosts, with browser HTTP traffic through Nginx and an
+outbound authenticated WebSocket carrying the existing storage protocol.
 
-## Local Compose
-
-Create an uncommitted `.env.validation` with the four credentials, create
-fixtures outside Git, and prepare the upload directory:
-
-```bash
-cp deploy/gateway.env.example .env.validation
-chmod 600 .env.validation
-mkdir -p deploy/fixtures deploy/uploads
-scripts/create-validation-fixtures.sh deploy/fixtures
-docker compose up --build
-```
-
-The local gateway is published on port 8080 and uses plain WebSocket only for
-local development. The AWS bundle uses Nginx, TLS, HTTP/2, and WSS instead.
-Use credentials from the environment file when calling `/health` or the media
-routes.
+For local development, run the storage h2c example on loopback, then start
+`journey-site` with its default `h2c` storage transport. HTTP cookies require
+`serve --allow-insecure-lan-http` when exercising the login flow over local
+HTTP. The flag is also the explicit opt-in for the plaintext LAN deployment.
 
 ## Website post backend and UI
 
@@ -37,9 +22,10 @@ post and media routes to authenticated accounts. Start the storage example
 with both listeners on loopback and persistent storage:
 
 ```bash
-JOURNEY_STORAGE_BIND=127.0.0.1:8081 \
-JOURNEY_STORAGE_WEB_BIND=127.0.0.1:8082 \
-cargo run -p journey-storage --example h2c_get_server -- --storage-dir ./journey-storage-data
+cargo run -p journey-storage --example h2c_get_server -- \
+  --bind 127.0.0.1:8081 \
+  --web-bind 127.0.0.1:8082 \
+  --storage-dir ./journey-storage-data
 ```
 
 Create a manifest next to its local media files, for example:
@@ -73,9 +59,12 @@ Create a manifest next to its local media files, for example:
 }
 ```
 
-Import and run the website backend in another terminal:
+Import and run the website backend in another terminal. Create a local site
+configuration from the example once, then point `JOURNEY_CONFIG` at it:
 
 ```bash
+cp apps/site/config.example.toml journey-site.toml
+export JOURNEY_CONFIG=./journey-site.toml
 cargo run -p journey-site -- import ./posts.json
 cargo run -p journey-site -- db posts
 cargo run -p journey-site -- users list
@@ -105,17 +94,17 @@ existing account's password or role, or revoke its sessions. The sample
 text in that manifest. Each import replaces the entire post set, including
 HTTP-created drafts, while existing accounts and sessions remain.
 
-`JOURNEY_SITE_DB` selects the SQLite file, `JOURNEY_SITE_BIND` selects the
-HTTP listener (default `127.0.0.1:8080`), and `JOURNEY_STORAGE_H2C` selects the
-loopback storage address (default `127.0.0.1:8081`). Set
-`JOURNEY_SITE_PUBLIC_ORIGIN` to the exact public origin when deploying, for
-example `https://journal.example.com`; it is required when binding outside
-loopback. Local loopback HTTP origins are accepted when this variable is unset.
+The site TOML file configures the database path, HTTP listener, storage
+transport and address, public origin, session lifetime, and media upload limit.
+Set `site.public_origin` to the exact public URL when deploying, for example
+`https://journal.example.com`; it is required when binding outside loopback.
+Local loopback HTTP origins are accepted when it is unset.
 The `journey_session` cookie is host-only, HttpOnly, and SameSite=Strict. It is
-marked Secure when the configured public origin uses HTTPS. Sessions expire
-after seven days by default; set `JOURNEY_SITE_SESSION_TTL_SECONDS` to change
-the absolute lifetime. The media upload limit defaults to 2 GiB per file and
-can be changed with `JOURNEY_SITE_MAX_MEDIA_UPLOAD_BYTES`.
+marked Secure by default; the explicit `--allow-insecure-lan-http` option
+removes that attribute for an HTTP test. The equivalent config setting is
+`site.allow_insecure_lan_http`. Sessions expire after seven days by default;
+`site.session_ttl_seconds` changes the absolute lifetime. The media upload
+limit defaults to 2 GiB per file and uses `site.max_media_upload_bytes`.
 
 The JSON authentication endpoints are `POST /api/auth/login`,
 `GET /api/auth/current`, and `POST /api/auth/logout`. Login and logout require
@@ -157,8 +146,8 @@ empty. The response is `201 Created` with the draft JSON and a
 ordered block tree with a revision check, keeping existing block IDs stable.
 `POST /posts/{id}/blocks/{block_id}/media` streams one original file through
 the site to storage and returns its content-derived asset key. The default
-per-file limit is 2 GiB; set `JOURNEY_SITE_MAX_MEDIA_UPLOAD_BYTES` to change
-it. JPEG, PNG, WebP, GIF, HEIC, HEIF, MP4, and MOV are accepted. Each gallery
+per-file limit is 2 GiB; set `site.max_media_upload_bytes` in the TOML config
+to change it. JPEG, PNG, WebP, GIF, HEIC, HEIF, MP4, and MOV are accepted. Each gallery
 placement is a media child row and references shared `media_assets` metadata;
 duplicating a placement never duplicates the stored file. `GET /api/drafts`
 lists a write account's drafts by newest ID first; admins receive all drafts.
@@ -191,9 +180,8 @@ cargo run -p journey-storage --example h2c_get_server
 The example serves the h2c API at `http://127.0.0.1:8081` and starts a
 Basic-authenticated browser object manager at `http://127.0.0.1:8082`.
 The example manager credentials are `user` / `pass`. The web listener
-defaults to `0.0.0.0:8082` and uses plain HTTP; set
-`JOURNEY_STORAGE_WEB_BIND` to change it. The h2c listener keeps its separate
-`JOURNEY_STORAGE_BIND` setting.
+defaults to `0.0.0.0:8082` and uses plain HTTP. Set `--web-bind` to change it;
+the h2c listener is configured separately with `--bind`.
 
 To use persistent filesystem storage instead, specify a directory. The server
 creates it if needed and loads its existing objects on startup; it does not
@@ -309,7 +297,3 @@ cargo check --workspace --locked
 cargo test --workspace --locked
 bash -n scripts/*.sh
 ```
-
-The AWS driver is `scripts/aws-home-real-world-validation.sh`. It requires
-protected environment/configuration supplied by the operator and never uses
-`curl -k` or disables TLS verification.

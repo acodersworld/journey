@@ -4,7 +4,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use crate::{
     auth,
@@ -90,6 +90,14 @@ pub struct PreparedImport {
     assets: BTreeMap<PathBuf, MediaAsset>,
 }
 
+#[derive(Serialize, Deserialize)]
+pub struct ImportResult {
+    pub posts_replaced: usize,
+    pub imported_accounts: usize,
+    pub unique_media_files: usize,
+    pub accounts_added: usize,
+}
+
 pub async fn prepare_manifest(manifest_path: &Path) -> AppResult<PreparedImport> {
     let manifest_path = tokio::fs::canonicalize(manifest_path).await?;
     let manifest_dir = manifest_path
@@ -151,8 +159,11 @@ pub async fn apply_import<S: StorageClient>(
     prepared: PreparedImport,
     database: &Database,
     storage: &S,
-) -> AppResult<()> {
+) -> AppResult<ImportResult> {
     database.initialize().await.map_err(std::io::Error::other)?;
+    let posts_replaced = prepared.posts.len();
+    let imported_accounts = prepared.accounts.len();
+    let unique_media_files = prepared.assets.len();
     println!(
         "validated {} posts, {} imported accounts, and {} unique media files",
         prepared.posts.len(),
@@ -175,7 +186,12 @@ pub async fn apply_import<S: StorageClient>(
         .map_err(std::io::Error::other)?;
     println!("added {added_accounts} new account(s); existing accounts and sessions were kept");
     println!("replaced the published post set");
-    Ok(())
+    Ok(ImportResult {
+        posts_replaced,
+        imported_accounts,
+        unique_media_files,
+        accounts_added: added_accounts,
+    })
 }
 
 fn validate_post(post: &ManifestPost) -> AppResult<i64> {
