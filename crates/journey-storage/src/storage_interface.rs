@@ -223,6 +223,99 @@ impl ObjectMetadata {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ImageReductionSize {
+    MaxEdge(u32),
+    BoundingBox { width: u32, height: u32 },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ImageFit {
+    Contain,
+    Pad,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ImageOutputFormat {
+    Jpeg,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ImageReductionRequest {
+    size: ImageReductionSize,
+    fit: ImageFit,
+    format: Option<ImageOutputFormat>,
+    max_bytes: Option<u64>,
+}
+
+impl ImageReductionRequest {
+    pub fn new(
+        size: ImageReductionSize,
+        fit: ImageFit,
+        format: Option<ImageOutputFormat>,
+        max_bytes: Option<u64>,
+    ) -> Result<Self, String> {
+        let valid_dimension = |value: u32| (1..=2_048).contains(&value);
+        match size {
+            ImageReductionSize::MaxEdge(edge) if !valid_dimension(edge) => {
+                return Err("Image dimensions must be between 1 and 2048 pixels".to_owned());
+            }
+            ImageReductionSize::BoundingBox { width, height }
+                if !valid_dimension(width) || !valid_dimension(height) =>
+            {
+                return Err("Image dimensions must be between 1 and 2048 pixels".to_owned());
+            }
+            _ => {}
+        }
+        if fit == ImageFit::Pad && !matches!(size, ImageReductionSize::BoundingBox { .. }) {
+            return Err("Padded image output requires width and height".to_owned());
+        }
+        if max_bytes == Some(0) {
+            return Err("Image byte limit must be positive".to_owned());
+        }
+        if max_bytes.is_some() && format != Some(ImageOutputFormat::Jpeg) {
+            return Err("Image byte limit requires explicit JPEG output".to_owned());
+        }
+        Ok(Self { size, fit, format, max_bytes })
+    }
+
+    pub fn size(&self) -> ImageReductionSize {
+        self.size
+    }
+
+    pub fn fit(&self) -> ImageFit {
+        self.fit
+    }
+
+    pub fn format(&self) -> Option<ImageOutputFormat> {
+        self.format
+    }
+
+    pub fn max_bytes(&self) -> Option<u64> {
+        self.max_bytes
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ReducedImage {
+    bytes: Bytes,
+    content_type: &'static str,
+}
+
+impl ReducedImage {
+    pub(crate) fn new(bytes: Bytes, content_type: &'static str) -> Self {
+        Self { bytes, content_type }
+    }
+
+    pub fn bytes(&self) -> &Bytes {
+        &self.bytes
+    }
+
+    pub fn content_type(&self) -> &'static str {
+        self.content_type
+    }
+}
+
 #[derive(Debug)]
 pub struct ReadObject<O> {
     metadata: ObjectMetadata,
@@ -411,6 +504,68 @@ pub trait StoreInterface: Send + Sync + Sized + 'static {
         async move {
             let _ = key;
             Err(StoreError::new(StoreErrorKind::Internal, "Video thumbnails are unavailable"))
+        }
+    }
+
+    /// Produces a still-image representation from the payload stored at `key`.
+    fn get_reduced_image(
+        &self,
+        key: &Key,
+        request: ImageReductionRequest,
+    ) -> impl Future<Output = Result<ReducedImage, StoreError>> + Send {
+        async move {
+            use crate::storage_image_reduction::{
+                MAX_IMAGE_SOURCE_BYTES, acquire_image_reduction_slot, reduce_image_with_slot,
+            };
+
+            let read = self.get(key, None).await?;
+            let mut object = match read {
+                GetResult::Found(object) => object,
+                GetResult::Unsatisfiable { .. } => {
+                    return Err(StoreError::new(StoreErrorKind::Internal, "Complete image read was unsatisfiable"));
+                }
+            };
+            let metadata = object.metadata().clone();
+            let content_type = metadata
+                .content_type()
+                .as_header_value()
+                .to_str()
+                .map_err(|error| StoreError::new(StoreErrorKind::Corrupt, format!("Invalid stored content type: {error}")))?;
+            let media_type = content_type.split(';').next().unwrap_or("").trim();
+            if !media_type.get(..6).is_some_and(|prefix| prefix.eq_ignore_ascii_case("image/")) {
+                return Err(StoreError::new(
+                    StoreErrorKind::UnsupportedMediaType,
+                    format!("Object {key} is not an image"),
+                ));
+            }
+            if metadata.payload_length() > MAX_IMAGE_SOURCE_BYTES {
+                return Err(StoreError::new(
+                    StoreErrorKind::Capacity,
+                    format!("Source image exceeds the {MAX_IMAGE_SOURCE_BYTES}-byte decoding limit"),
+                ));
+            }
+            let payload_length = usize::try_from(metadata.payload_length()).map_err(|error| {
+                StoreError::new(StoreErrorKind::Capacity, format!("Source image is too large: {error}"))
+            })?;
+            let permit = acquire_image_reduction_slot().await?;
+            let mut bytes = Vec::with_capacity(payload_length);
+            let mut buffer = BytesMut::from(vec![0_u8; 1024 * 1024].as_slice());
+            loop {
+                let count = object.object_mut().read(&mut buffer).await?;
+                if count == 0 {
+                    break;
+                }
+                if count > buffer.len()
+                    || bytes.len().checked_add(count).is_none_or(|length| length > payload_length)
+                {
+                    return Err(StoreError::new(StoreErrorKind::Corrupt, "Image payload exceeded its stored length"));
+                }
+                bytes.extend_from_slice(&buffer[..count]);
+            }
+            if bytes.len() != payload_length {
+                return Err(StoreError::new(StoreErrorKind::Corrupt, "Image payload ended before its stored length"));
+            }
+            reduce_image_with_slot(Bytes::from(bytes), media_type.to_owned(), request, permit).await
         }
     }
 

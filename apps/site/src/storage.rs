@@ -34,6 +34,63 @@ pub struct StorageResponse {
     pub body: StorageBody,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ImageReductionDimensions {
+    MaxEdge(u32),
+    BoundingBox { width: u32, height: u32 },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ImageReductionFit {
+    Contain,
+    Pad,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ImageReductionFormat {
+    Preserve,
+    Jpeg,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ImageReductionOptions {
+    dimensions: ImageReductionDimensions,
+    fit: ImageReductionFit,
+    format: ImageReductionFormat,
+    max_bytes: Option<u64>,
+}
+
+impl ImageReductionOptions {
+    pub fn new(
+        dimensions: ImageReductionDimensions,
+        fit: ImageReductionFit,
+        format: ImageReductionFormat,
+        max_bytes: Option<u64>,
+    ) -> Result<Self, String> {
+        let valid_dimension = |value: u32| (1..=2_048).contains(&value);
+        match dimensions {
+            ImageReductionDimensions::MaxEdge(edge) if !valid_dimension(edge) => {
+                return Err("Image dimensions must be between 1 and 2048 pixels".to_owned());
+            }
+            ImageReductionDimensions::BoundingBox { width, height }
+                if !valid_dimension(width) || !valid_dimension(height) =>
+            {
+                return Err("Image dimensions must be between 1 and 2048 pixels".to_owned());
+            }
+            _ => {}
+        }
+        if fit == ImageReductionFit::Pad
+            && !matches!(dimensions, ImageReductionDimensions::BoundingBox { .. })
+        {
+            return Err("Padded image output requires width and height".to_owned());
+        }
+        if max_bytes == Some(0) || (max_bytes.is_some() && format != ImageReductionFormat::Jpeg) {
+            return Err("Image byte limit requires explicit JPEG output and a positive limit".to_owned());
+        }
+        Ok(Self { dimensions, fit, format, max_bytes })
+    }
+}
+
 pub trait StorageClient: Clone + Send + Sync + 'static {
     fn put_file(
         &self,
@@ -56,6 +113,19 @@ pub trait StorageClient: Clone + Send + Sync + 'static {
         head: bool,
         thumbnail: bool,
     ) -> impl Future<Output = Result<StorageResponse, String>> + Send;
+
+    fn get_reduced_image(
+        &self,
+        key: &str,
+        options: ImageReductionOptions,
+        video_thumbnail: bool,
+        head: bool,
+    ) -> impl Future<Output = Result<StorageResponse, String>> + Send {
+        async move {
+            let _ = (key, options, video_thumbnail, head);
+            Err("Reduced image requests are unavailable for this storage client".to_owned())
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -362,6 +432,16 @@ macro_rules! impl_storage_client {
             ) -> Result<StorageResponse, String> {
                 get(self, key, range, head, thumbnail).await
             }
+
+            async fn get_reduced_image(
+                &self,
+                key: &str,
+                options: ImageReductionOptions,
+                video_thumbnail: bool,
+                head: bool,
+            ) -> Result<StorageResponse, String> {
+                get_reduced_image(self, key, options, video_thumbnail, head).await
+            }
         }
     };
 }
@@ -400,6 +480,19 @@ impl StorageClient for SiteStorageClient {
         match self {
             Self::H2c(client) => client.get(key, range, head, thumbnail).await,
             Self::WebSocket(client) => client.get(key, range, head, thumbnail).await,
+        }
+    }
+
+    async fn get_reduced_image(
+        &self,
+        key: &str,
+        options: ImageReductionOptions,
+        video_thumbnail: bool,
+        head: bool,
+    ) -> Result<StorageResponse, String> {
+        match self {
+            Self::H2c(client) => get_reduced_image(client, key, options, video_thumbnail, head).await,
+            Self::WebSocket(client) => get_reduced_image(client, key, options, video_thumbnail, head).await,
         }
     }
 }
@@ -526,6 +619,66 @@ async fn get<T: StorageRequestTransport>(
     let method = if head { Method::HEAD } else { Method::GET };
     let representation = thumbnail.then_some("thumbnail");
     let request = storage_request(method, key, range, None, None, false, false, representation)?;
+    get_response(transport, request, head).await
+}
+
+async fn get_reduced_image<T: StorageRequestTransport>(
+    transport: &T,
+    key: &str,
+    options: ImageReductionOptions,
+    video_thumbnail: bool,
+    head: bool,
+) -> Result<StorageResponse, String> {
+    let method = if head { Method::HEAD } else { Method::GET };
+    let representation = if video_thumbnail { "thumbnail" } else { "reduced-image" };
+    let mut request = storage_request(method, key, None, None, None, false, false, Some(representation))?;
+    let headers = request.headers_mut();
+    match options.dimensions {
+        ImageReductionDimensions::MaxEdge(edge) => {
+            let value = edge.to_string().parse().map_err(|error| format!("invalid image edge header: {error}"))?;
+            headers.insert("Object-Image-Max-Edge", value);
+        }
+        ImageReductionDimensions::BoundingBox { width, height } => {
+            let width = width.to_string().parse().map_err(|error| format!("invalid image width header: {error}"))?;
+            let height = height.to_string().parse().map_err(|error| format!("invalid image height header: {error}"))?;
+            headers.insert("Object-Image-Width", width);
+            headers.insert("Object-Image-Height", height);
+        }
+    }
+    let fit = match options.fit {
+        ImageReductionFit::Contain => "contain",
+        ImageReductionFit::Pad => "pad",
+    };
+    headers.insert(
+        "Object-Image-Fit",
+        fit.parse().map_err(|error| format!("invalid image fit header: {error}"))?,
+    );
+    if options.format == ImageReductionFormat::Jpeg {
+        headers.insert(
+            "Object-Image-Format",
+            "jpeg"
+                .parse()
+                .map_err(|error| format!("invalid image format header: {error}"))?,
+        );
+    }
+    if let Some(max_bytes) = options.max_bytes {
+        let value = max_bytes
+            .to_string()
+            .parse()
+            .map_err(|error| format!("invalid image byte limit header: {error}"))?;
+        headers.insert(
+            "Object-Image-Max-Bytes",
+            value,
+        );
+    }
+    get_response(transport, request, head).await
+}
+
+async fn get_response<T: StorageRequestTransport>(
+    transport: &T,
+    request: Request<()>,
+    head: bool,
+) -> Result<StorageResponse, String> {
     let (response, _send) = transport.start_request(request, true).await?;
     let response = response.await.map_err(|error| error.to_string())?;
     let status = response.status();

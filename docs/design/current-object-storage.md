@@ -11,8 +11,9 @@ to the h2c example; the separate home application has not adopted it yet.
 
 ## Interface and HTTP routes
 
-`StoreInterface` provides GET, STAT, prefix LIST, idempotent DELETE, and
-streaming PUT. The HTTP/2 adapter exposes `GET`, `HEAD`, `PUT`, and `DELETE` at
+`StoreInterface` provides GET, STAT, prefix LIST, idempotent DELETE, streaming
+PUT, on-demand image reduction, and video thumbnail generation. The HTTP/2
+adapter exposes `GET`, `HEAD`, `PUT`, and `DELETE` at
 `/objects/<key>` and LIST at `/objects?prefix=<prefix>&limit=<n>&cursor=<token>`.
 `PUT /objects` also accepts a streamed upload when it has exactly one
 `Object-Key-Mode: sha256` header and no query string. Its logical key is the
@@ -64,9 +65,9 @@ returned. The thumbnail uses the same logical key and is available only when
 the stored content type is exactly `video/mp4` or `video/quicktime` (case
 insensitive). Thumbnail requests reject `Range`; unknown or duplicate
 representation headers return `400`, and unsupported object types return
-`415`. Original and thumbnail responses include
-`Vary: Object-Representation`. Thumbnail `HEAD` requests generate or read the
-same cached image as `GET` to return its exact content length.
+`415`. Original and thumbnail responses vary on the representation and all
+image-option headers. Thumbnail `HEAD` requests generate or read the same
+cached image as `GET` to return its exact content length.
 
 `storage.thumbnail_time_ms` selects the first decodable video frame at or after
 the configured time, and defaults to zero. If that time exceeds the video
@@ -88,6 +89,43 @@ The cache is persistent across service restarts and can be deleted without
 affecting stored objects. The storage service itself adds no public thumbnail
 URL. The website can proxy this representation through its access-controlled
 media routes.
+
+## On-demand image reduction
+
+Authenticated `GET` and `HEAD /objects/<key>` accept
+`Object-Representation: reduced-image` for image objects. The request must
+include either `Object-Image-Max-Edge` or both `Object-Image-Width` and
+`Object-Image-Height`; every dimension is limited to 1 through 2,048 pixels.
+The default `Object-Image-Fit: contain` preserves aspect ratio, does not crop,
+and does not upscale. `pad` requires a width and height bounding box and adds a
+white background to produce the exact requested canvas dimensions. It also
+keeps the image content inside the box without cropping or upscaling.
+
+By default, reduced JPEG, PNG, and WebP sources keep their format when the
+installed FFmpeg build has a matching encoder. Other decodable image formats,
+including HEIC/HEIF, and animated GIFs produce JPEG from the first frame.
+`Object-Image-Format: jpeg` explicitly selects JPEG. Transparency is retained
+by PNG and WebP output; JPEG composites it over white. An optional
+`Object-Image-Max-Bytes` is valid only with explicit JPEG output. JPEG encoding
+tries a bounded set of quality levels at the requested dimensions and returns
+`413` if the body cannot fit the byte cap.
+
+Image options are invalid on the original representation. `Range` is invalid
+for reduced images and thumbnails. The thumbnail representation can take the
+same fit, dimensions, JPEG, and byte-cap options after its existing cached base
+frame is generated; requests without those options retain the existing JPEG
+thumbnail behavior. All representation and image-option headers appear in
+`Vary`, and generated responses return their actual content type and length.
+`HEAD` generates the same representation as `GET` but sends no body.
+
+The storage client exposes a typed `get_reduced_image` method so callers do not
+need to construct protocol headers. The website can use the same options for
+stored photos and video thumbnails. The filesystem and in-memory stores share
+the implementation over their existing payload readers; they create no image
+variant object or image-reduction cache. Native decode and encode work runs in
+blocking tasks under a shared two-job semaphore. Source images are limited to
+64 MiB and decoded images to 16 million pixels. The original payload and
+metadata are never modified.
 
 Logical keys are nonempty UTF-8 of at most 1,024 bytes and cannot end in `/`.
 Content types contain 1 through 128 header bytes. The filesystem backend maps

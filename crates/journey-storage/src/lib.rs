@@ -7,13 +7,15 @@ mod storage_interface;
 mod storage_in_memory;
 mod storage_filesystem;
 mod storage_thumbnail;
+mod storage_image_reduction;
 mod http2_storage_service;
 mod storage_web_interface;
 
 pub use storage_interface::{
-    ContentType, ContentTypeError, GetResult, Key, ListCursor, ListPage, ListRequest,
-    ObjectInterface, ObjectMetadata, ObjectName, PutCondition, PutContextInterface, ReadObject,
-    ReadRange, ReadSpan, StoreError, StoreErrorKind, StoreInterface,
+    ContentType, ContentTypeError, GetResult, ImageFit, ImageOutputFormat, ImageReductionRequest,
+    ImageReductionSize, Key, ListCursor, ListPage, ListRequest, ObjectInterface, ObjectMetadata,
+    ObjectName, PutCondition, PutContextInterface, ReadObject, ReadRange, ReadSpan, ReducedImage,
+    StoreError, StoreErrorKind, StoreInterface,
 };
 pub use storage_in_memory::{
     Object, ObjectReader, PutContextWithGeneratedName, PutContextWithKey, Store, StoreConfig,

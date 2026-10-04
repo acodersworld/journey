@@ -5,7 +5,7 @@ use std::{
     os::unix::fs::{FileExt, OpenOptionsExt},
     path::{Path, PathBuf},
     sync::{
-        Arc, Mutex, OnceLock, Weak,
+        Arc, Mutex, Weak,
         atomic::{AtomicU64, Ordering},
     },
 };
@@ -15,21 +15,21 @@ use std::sync::atomic::AtomicUsize;
 use bytes::Bytes;
 use ffmpeg_next as ffmpeg;
 use sha2::{Digest, Sha256};
-use tokio::sync::{Mutex as AsyncMutex, Semaphore};
+use tokio::sync::Mutex as AsyncMutex;
 
 use crate::storage_interface::{StoreError, StoreErrorKind};
+use crate::storage_image_reduction::{
+    MAX_DECODED_IMAGE_PIXELS, acquire_image_reduction_slot, initialize_ffmpeg,
+};
 
 const MAX_THUMBNAIL_EDGE: u32 = 640;
 const MAX_THUMBNAIL_BYTES: u64 = 16 * 1024 * 1024;
-const MAX_CONCURRENT_DECODES: usize = 2;
 static NEXT_TEMPORARY_FILE: AtomicU64 = AtomicU64::new(1);
-static FFMPEG_INITIALIZED: OnceLock<Result<(), String>> = OnceLock::new();
 
 #[derive(Clone, Debug)]
 pub(crate) struct ThumbnailCache {
     directory: Arc<PathBuf>,
     time_ms: u64,
-    decode_slots: Arc<Semaphore>,
     jobs: Arc<Mutex<HashMap<String, Weak<AsyncMutex<()>>>>>,
     #[cfg(test)]
     generation_count: Arc<AtomicUsize>,
@@ -55,7 +55,6 @@ impl ThumbnailCache {
         Ok(Self {
             directory: Arc::new(directory),
             time_ms,
-            decode_slots: Arc::new(Semaphore::new(MAX_CONCURRENT_DECODES)),
             jobs: Arc::new(Mutex::new(HashMap::new())),
             #[cfg(test)]
             generation_count: Arc::new(AtomicUsize::new(0)),
@@ -81,10 +80,7 @@ impl ThumbnailCache {
             return Ok(Bytes::from(cached));
         }
 
-        let permit = Arc::clone(&self.decode_slots)
-            .acquire_owned()
-            .await
-            .map_err(|error| unavailable(format!("Thumbnail decoder limit is unavailable: {error}")))?;
+        let permit = acquire_image_reduction_slot().await?;
         let directory = Arc::clone(&self.directory);
         let time_ms = self.time_ms;
         #[cfg(test)]
@@ -253,10 +249,7 @@ fn generate_thumbnail(
     payload_len: u64,
     time_ms: u64,
 ) -> Result<Vec<u8>, StoreError> {
-    FFMPEG_INITIALIZED
-        .get_or_init(|| ffmpeg::init().map_err(|error| error.to_string()))
-        .as_ref()
-        .map_err(|error| internal(format!("Could not initialize FFmpeg: {error}")))?;
+    initialize_ffmpeg()?;
 
     let payload_reader = PayloadReader::new(file, metadata_len, payload_len);
     let stream_io = ffmpeg::format::context::StreamIo::from_read_seek(payload_reader)
@@ -280,6 +273,14 @@ fn generate_thumbnail(
             .decoder()
             .video()
             .map_err(|error| ffmpeg_error("open video decoder", error))?;
+        let decoded_pixels = u64::from(decoder.width())
+            .checked_mul(u64::from(decoder.height()))
+            .ok_or_else(|| internal("Video dimensions overflow"))?;
+        if decoder.width() == 0 || decoder.height() == 0 || decoded_pixels > MAX_DECODED_IMAGE_PIXELS {
+            return Err(internal(format!(
+                "Video frame exceeds the {MAX_DECODED_IMAGE_PIXELS}-pixel decoding limit"
+            )));
+        }
         (stream.index(), stream.time_base(), stream.start_time().max(0), decoder)
     };
 

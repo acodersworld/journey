@@ -16,10 +16,12 @@ use serde::Serialize;
 use std::sync::Arc;
 
 use crate::storage_interface::{
-    ContentType, GetResult, Key, ListCursor, ListRequest, ObjectInterface, ObjectMetadata,
-    validate_generated_prefix, PutCondition, PutContextInterface, ReadRange,
-    StoreError, StoreErrorKind, StoreInterface,
+    ContentType, GetResult, ImageFit, ImageOutputFormat, ImageReductionRequest, ImageReductionSize,
+    Key, ListCursor, ListRequest, ObjectInterface, ObjectMetadata, ReducedImage,
+    validate_generated_prefix, PutCondition, PutContextInterface, ReadRange, StoreError,
+    StoreErrorKind, StoreInterface,
 };
+use crate::storage_image_reduction::reduce_image;
 
 const MAX_DATA_SEGMENT_SIZE: usize = 64 * 1024;
 const NOT_FOUND_BODY: &[u8] = b"not found\n";
@@ -30,10 +32,15 @@ const RANGE_NOT_SATISFIABLE_BODY: &[u8] = b"range not satisfiable\n";
 const INVALID_CONTENT_TYPE: &[u8] = b"invalid content type\n";
 const UNSUPPORTED_MEDIA_TYPE_BODY: &[u8] = b"unsupported media type\n";
 const STORAGE_ERROR_BODY: &[u8] = b"storage error\n";
+const IMAGE_LIMIT_BODY: &[u8] = b"reduced image cannot fit within the requested limits\n";
 const METHOD_NOT_ALLOWED_BODY: &[u8] = b"method not allowed\n";
 const DEFAULT_LIST_LIMIT: usize = 1_000;
 const COLLECTION_ALLOW: &str = "GET, PUT";
 const OBJECT_ALLOW: &str = "GET, HEAD, PUT, DELETE";
+const OBJECT_VARY: &str = concat!(
+    "Object-Representation, Object-Image-Max-Edge, Object-Image-Width, ",
+    "Object-Image-Height, Object-Image-Fit, Object-Image-Format, Object-Image-Max-Bytes",
+);
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum Route {
@@ -47,6 +54,7 @@ enum Route {
 enum ObjectRepresentation {
     Original,
     Thumbnail,
+    ReducedImage,
 }
 
 enum PutTarget {
@@ -290,11 +298,88 @@ fn parse_object_representation(headers: &http::HeaderMap) -> Result<ObjectRepres
         return Err(());
     }
     let value = value.to_str().map_err(|_| ())?.trim_matches([' ', '\t']);
-    if value == "thumbnail" {
-        Ok(ObjectRepresentation::Thumbnail)
-    } else {
-        Err(())
+    match value {
+        "thumbnail" => Ok(ObjectRepresentation::Thumbnail),
+        "reduced-image" => Ok(ObjectRepresentation::ReducedImage),
+        _ => Err(()),
     }
+}
+
+fn parse_image_reduction_options(
+    headers: &http::HeaderMap,
+) -> Result<Option<ImageReductionRequest>, ()> {
+    let max_edge = parse_optional_image_number(headers, "object-image-max-edge")?;
+    let width = parse_optional_image_number(headers, "object-image-width")?;
+    let height = parse_optional_image_number(headers, "object-image-height")?;
+    let fit = parse_optional_image_value(headers, "object-image-fit")?;
+    let format = parse_optional_image_value(headers, "object-image-format")?;
+    let max_bytes = parse_optional_image_value(headers, "object-image-max-bytes")?;
+    if max_edge.is_none()
+        && width.is_none()
+        && height.is_none()
+        && fit.is_none()
+        && format.is_none()
+        && max_bytes.is_none()
+    {
+        return Ok(None);
+    }
+    let size = match (max_edge, width, height) {
+        (Some(edge), None, None) => ImageReductionSize::MaxEdge(edge),
+        (None, Some(width), Some(height)) => ImageReductionSize::BoundingBox { width, height },
+        _ => return Err(()),
+    };
+    let fit = match fit.as_deref().unwrap_or("contain") {
+        "contain" => ImageFit::Contain,
+        "pad" => ImageFit::Pad,
+        _ => return Err(()),
+    };
+    let output_format = match format.as_deref() {
+        Some("jpeg") => Some(ImageOutputFormat::Jpeg),
+        Some(_) => return Err(()),
+        None => None,
+    };
+    let max_bytes = match max_bytes.as_deref() {
+        Some(value) => Some(parse_positive_u64(value)?),
+        None => None,
+    };
+    ImageReductionRequest::new(size, fit, output_format, max_bytes)
+        .map(Some)
+        .map_err(|_| ())
+}
+
+fn parse_optional_image_number(headers: &http::HeaderMap, name: &str) -> Result<Option<u32>, ()> {
+    let Some(value) = parse_optional_image_value(headers, name)? else {
+        return Ok(None);
+    };
+    if value.is_empty() || !value.bytes().all(|byte| byte.is_ascii_digit()) {
+        return Err(());
+    }
+    let number = value.parse::<u32>().map_err(|_| ())?;
+    if !(1..=2_048).contains(&number) {
+        return Err(());
+    }
+    Ok(Some(number))
+}
+
+fn parse_optional_image_value(
+    headers: &http::HeaderMap,
+    name: &str,
+) -> Result<Option<String>, ()> {
+    let mut values = headers.get_all(name).iter();
+    let Some(value) = values.next() else {
+        return Ok(None);
+    };
+    if values.next().is_some() {
+        return Err(());
+    }
+    Ok(Some(value.to_str().map_err(|_| ())?.trim_matches([' ', '\t']).to_owned()))
+}
+
+fn parse_positive_u64(value: &str) -> Result<u64, ()> {
+    if value.is_empty() || !value.bytes().all(|byte| byte.is_ascii_digit()) {
+        return Err(());
+    }
+    value.parse::<u64>().ok().filter(|value| *value > 0).ok_or(())
 }
 
 /// Handles one already accepted HTTP/2 request against a shared catalogue.
@@ -379,9 +464,27 @@ impl<S: StoreInterface> Service<S> {
                         );
                     }
                 };
-                if representation == ObjectRepresentation::Thumbnail
-                    && method != Method::GET
-                    && method != Method::HEAD
+                let image_options = match parse_image_reduction_options(request.headers()) {
+                    Ok(options) => options,
+                    Err(()) => {
+                        return send_object_error_response(
+                            respond,
+                            StatusCode::BAD_REQUEST,
+                            method == Method::HEAD,
+                            None,
+                            BAD_REQUEST_BODY,
+                        );
+                    }
+                };
+                let invalid_representation_options = match representation {
+                    ObjectRepresentation::Original => image_options.is_some(),
+                    ObjectRepresentation::Thumbnail => false,
+                    ObjectRepresentation::ReducedImage => image_options.is_none(),
+                };
+                if invalid_representation_options
+                    || (representation != ObjectRepresentation::Original
+                        && method != Method::GET
+                        && method != Method::HEAD)
                 {
                     return send_object_error_response(
                         respond,
@@ -438,7 +541,7 @@ impl<S: StoreInterface> Service<S> {
                 };
                 match method {
                     Method::GET => {
-                        if representation == ObjectRepresentation::Thumbnail {
+                        if representation != ObjectRepresentation::Original {
                             if request.headers().contains_key(header::RANGE) {
                                 return send_object_error_response(
                                     respond,
@@ -448,13 +551,21 @@ impl<S: StoreInterface> Service<S> {
                                     BAD_REQUEST_BODY,
                                 );
                             }
-                            self.handle_thumbnail(&key, false, respond).await
+                            match representation {
+                                ObjectRepresentation::Thumbnail => {
+                                    self.handle_thumbnail(&key, image_options, false, respond).await
+                                }
+                                ObjectRepresentation::ReducedImage => {
+                                    self.handle_reduced_image(&key, image_options.unwrap(), false, respond).await
+                                }
+                                ObjectRepresentation::Original => unreachable!(),
+                            }
                         } else {
                             self.handle_get(&key, request.headers(), respond).await
                         }
                     }
                     Method::HEAD => {
-                        if representation == ObjectRepresentation::Thumbnail {
+                        if representation != ObjectRepresentation::Original {
                             if request.headers().contains_key(header::RANGE) {
                                 return send_object_error_response(
                                     respond,
@@ -464,7 +575,15 @@ impl<S: StoreInterface> Service<S> {
                                     BAD_REQUEST_BODY,
                                 );
                             }
-                            self.handle_thumbnail(&key, true, respond).await
+                            match representation {
+                                ObjectRepresentation::Thumbnail => {
+                                    self.handle_thumbnail(&key, image_options, true, respond).await
+                                }
+                                ObjectRepresentation::ReducedImage => {
+                                    self.handle_reduced_image(&key, image_options.unwrap(), true, respond).await
+                                }
+                                ObjectRepresentation::Original => unreachable!(),
+                            }
                         } else {
                             self.handle_head(&key, respond).await
                         }
@@ -699,7 +818,7 @@ impl<S: StoreInterface> Service<S> {
             .version(Version::HTTP_2)
             .status(StatusCode::OK)
             .header(header::CONTENT_LENGTH, 0)
-            .header(header::VARY, "Object-Representation")
+            .header(header::VARY, OBJECT_VARY)
             .header("object-key", key_header);
         if let Some(object_name_header) = object_name_header {
             response_builder = response_builder.header("object-name", object_name_header);
@@ -772,7 +891,7 @@ impl<S: StoreInterface> Service<S> {
             .header(header::CONTENT_TYPE, metadata.content_type().as_header_value())
             .header(header::CONTENT_LENGTH, content_length)
             .header(header::ACCEPT_RANGES, "bytes")
-            .header(header::VARY, "Object-Representation");
+            .header(header::VARY, OBJECT_VARY);
         if let Some(span) = selected_span {
             let Some(end) = span
                 .offset()
@@ -844,7 +963,7 @@ impl<S: StoreInterface> Service<S> {
             .header(header::CONTENT_TYPE, metadata.content_type().as_header_value())
             .header(header::CONTENT_LENGTH, metadata.payload_length())
             .header(header::ACCEPT_RANGES, "bytes")
-            .header(header::VARY, "Object-Representation")
+            .header(header::VARY, OBJECT_VARY)
             .body(())?;
         let mut respond = respond;
         respond.send_response(response, true)?;
@@ -854,58 +973,36 @@ impl<S: StoreInterface> Service<S> {
     async fn handle_thumbnail(
         &self,
         key: &Key,
+        options: Option<ImageReductionRequest>,
         is_head: bool,
-        mut respond: h2::server::SendResponse<Bytes>,
+        respond: h2::server::SendResponse<Bytes>,
     ) -> Result<(), ServiceError> {
         let thumbnail = match self.store.get_thumbnail(key).await {
             Ok(thumbnail) => thumbnail,
-            Err(error) if error.kind() == StoreErrorKind::NotFound => {
-                return send_object_error_response(
-                    respond,
-                    StatusCode::NOT_FOUND,
-                    is_head,
-                    None,
-                    NOT_FOUND_BODY,
-                );
-            }
-            Err(error) if error.kind() == StoreErrorKind::UnsupportedMediaType => {
-                return send_object_error_response(
-                    respond,
-                    StatusCode::UNSUPPORTED_MEDIA_TYPE,
-                    is_head,
-                    None,
-                    UNSUPPORTED_MEDIA_TYPE_BODY,
-                );
-            }
-            Err(error) => {
-                eprintln!("storage thumbnail lookup failed for key {key:?}: {error}");
-                return send_object_error_response(
-                    respond,
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    is_head,
-                    None,
-                    STORAGE_ERROR_BODY,
-                );
-            }
+            Err(error) => return send_image_storage_error(error, key, "thumbnail lookup", is_head, respond),
         };
+        let image = match options {
+            Some(options) => match reduce_image(thumbnail, "image/jpeg".to_owned(), options).await {
+                Ok(image) => image,
+                Err(error) => return send_image_storage_error(error, key, "thumbnail reduction", is_head, respond),
+            },
+            None => ReducedImage::new(thumbnail, "image/jpeg"),
+        };
+        send_reduced_image_response(image, is_head, respond).await
+    }
 
-        let response = Response::builder()
-            .version(Version::HTTP_2)
-            .status(StatusCode::OK)
-            .header(header::CONTENT_TYPE, "image/jpeg")
-            .header(header::CONTENT_LENGTH, thumbnail.len())
-            .header(header::VARY, "Object-Representation")
-            .body(())?;
-        if is_head {
-            respond.send_response(response, true)?;
-            return Ok(());
-        }
-        if thumbnail.is_empty() {
-            respond.send_response(response, true)?;
-            return Ok(());
-        }
-        let mut stream = respond.send_response(response, false)?;
-        send_payload(&mut stream, &thumbnail).await
+    async fn handle_reduced_image(
+        &self,
+        key: &Key,
+        options: ImageReductionRequest,
+        is_head: bool,
+        respond: h2::server::SendResponse<Bytes>,
+    ) -> Result<(), ServiceError> {
+        let image = match self.store.get_reduced_image(key, options).await {
+            Ok(image) => image,
+            Err(error) => return send_image_storage_error(error, key, "image reduction", is_head, respond),
+        };
+        send_reduced_image_response(image, is_head, respond).await
     }
 
     async fn handle_delete(
@@ -925,7 +1022,7 @@ impl<S: StoreInterface> Service<S> {
         let response = Response::builder()
             .version(Version::HTTP_2)
             .status(StatusCode::NO_CONTENT)
-            .header(header::VARY, "Object-Representation")
+            .header(header::VARY, OBJECT_VARY)
             .body(())?;
         let mut respond = respond;
         respond.send_response(response, true)?;
@@ -1093,7 +1190,7 @@ fn send_object_error_response(
     let mut builder = Response::builder()
         .version(Version::HTTP_2)
         .status(status)
-        .header(header::VARY, "Object-Representation");
+        .header(header::VARY, OBJECT_VARY);
     if let Some(allow) = allow {
         builder = builder.header(header::ALLOW, allow);
     }
@@ -1110,6 +1207,45 @@ fn send_object_error_response(
     let mut stream = respond.send_response(response, false)?;
     stream.send_data(Bytes::copy_from_slice(body), true)?;
     Ok(())
+}
+
+fn send_image_storage_error(
+    error: StoreError,
+    key: &Key,
+    operation: &str,
+    is_head: bool,
+    respond: h2::server::SendResponse<Bytes>,
+) -> Result<(), ServiceError> {
+    let (status, body) = match error.kind() {
+        StoreErrorKind::NotFound => (StatusCode::NOT_FOUND, NOT_FOUND_BODY),
+        StoreErrorKind::UnsupportedMediaType => (StatusCode::UNSUPPORTED_MEDIA_TYPE, UNSUPPORTED_MEDIA_TYPE_BODY),
+        StoreErrorKind::Capacity => (StatusCode::PAYLOAD_TOO_LARGE, IMAGE_LIMIT_BODY),
+        _ => (StatusCode::INTERNAL_SERVER_ERROR, STORAGE_ERROR_BODY),
+    };
+    if error.kind() != StoreErrorKind::NotFound {
+        eprintln!("storage {operation} failed for key {key:?}: {error}");
+    }
+    send_object_error_response(respond, status, is_head, None, body)
+}
+
+async fn send_reduced_image_response(
+    image: ReducedImage,
+    is_head: bool,
+    mut respond: h2::server::SendResponse<Bytes>,
+) -> Result<(), ServiceError> {
+    let response = Response::builder()
+        .version(Version::HTTP_2)
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, image.content_type())
+        .header(header::CONTENT_LENGTH, image.bytes().len())
+        .header(header::VARY, OBJECT_VARY)
+        .body(())?;
+    if is_head || image.bytes().is_empty() {
+        respond.send_response(response, true)?;
+        return Ok(());
+    }
+    let mut stream = respond.send_response(response, false)?;
+    send_payload(&mut stream, image.bytes()).await
 }
 
 async fn send_json_response(
@@ -1154,7 +1290,7 @@ fn send_range_unsatisfiable(
         .version(Version::HTTP_2)
         .status(StatusCode::RANGE_NOT_SATISFIABLE)
         .header(header::ACCEPT_RANGES, "bytes")
-        .header(header::VARY, "Object-Representation")
+        .header(header::VARY, OBJECT_VARY)
         .header(
             header::CONTENT_RANGE,
             format!("bytes */{complete_length}"),
@@ -2589,14 +2725,14 @@ mod tests {
         let mut second = new_connection(Arc::clone(&store)).await;
         let ordinary = get(&mut first.sender, &video_uri).await.unwrap();
         assert_success_headers(&ordinary, "video/mp4", video_bytes.len());
-        assert_eq!(ordinary.headers()[header::VARY], "Object-Representation");
+        assert_eq!(ordinary.headers()[header::VARY], OBJECT_VARY);
         assert_eq!(collect(ordinary.into_body()).await.unwrap(), video_bytes);
 
         let original_head = request(&mut first.sender, Method::HEAD, &video_uri).await.unwrap();
         assert_eq!(original_head.status(), StatusCode::OK);
         assert_eq!(original_head.headers()[header::CONTENT_TYPE], "video/mp4");
         assert_eq!(original_head.headers()[header::CONTENT_LENGTH], video_bytes.len().to_string());
-        assert_eq!(original_head.headers()[header::VARY], "Object-Representation");
+        assert_eq!(original_head.headers()[header::VARY], OBJECT_VARY);
         assert!(collect(original_head.into_body()).await.unwrap().is_empty());
 
         let range = request_with_headers(
@@ -2608,7 +2744,7 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(range.status(), StatusCode::PARTIAL_CONTENT);
-        assert_eq!(range.headers()[header::VARY], "Object-Representation");
+        assert_eq!(range.headers()[header::VARY], OBJECT_VARY);
         assert_eq!(collect(range.into_body()).await.unwrap(), &video_bytes[..16]);
 
         let thumbnail_headers = [("Object-Representation", "thumbnail")];
@@ -2630,7 +2766,7 @@ mod tests {
         let concurrent_thumbnail = concurrent_thumbnail.unwrap();
         assert_eq!(first_thumbnail.status(), StatusCode::OK);
         assert_eq!(first_thumbnail.headers()[header::CONTENT_TYPE], "image/jpeg");
-        assert_eq!(first_thumbnail.headers()[header::VARY], "Object-Representation");
+        assert_eq!(first_thumbnail.headers()[header::VARY], OBJECT_VARY);
         let thumbnail_length = first_thumbnail.headers()[header::CONTENT_LENGTH].clone();
         let jpeg = collect(first_thumbnail.into_body()).await.unwrap();
         assert_eq!(thumbnail_length, jpeg.len().to_string());
@@ -2655,7 +2791,7 @@ mod tests {
         assert_eq!(thumbnail_head.status(), StatusCode::OK);
         assert_eq!(thumbnail_head.headers()[header::CONTENT_TYPE], "image/jpeg");
         assert_eq!(thumbnail_head.headers()[header::CONTENT_LENGTH], jpeg.len().to_string());
-        assert_eq!(thumbnail_head.headers()[header::VARY], "Object-Representation");
+        assert_eq!(thumbnail_head.headers()[header::VARY], OBJECT_VARY);
         assert!(collect(thumbnail_head.into_body()).await.unwrap().is_empty());
         assert_eq!(store.thumbnail_generation_count(), 1);
 
@@ -2675,7 +2811,7 @@ mod tests {
                 .await
                 .unwrap();
             assert_eq!(response.status(), StatusCode::BAD_REQUEST);
-            assert_eq!(response.headers()[header::VARY], "Object-Representation");
+            assert_eq!(response.headers()[header::VARY], OBJECT_VARY);
             let _ = collect(response.into_body()).await.unwrap();
         }
 
@@ -2693,7 +2829,7 @@ mod tests {
         let (duplicate_response, _) = first.sender.send_request(duplicate, true).unwrap();
         let duplicate_response = duplicate_response.await.unwrap();
         assert_eq!(duplicate_response.status(), StatusCode::BAD_REQUEST);
-        assert_eq!(duplicate_response.headers()[header::VARY], "Object-Representation");
+        assert_eq!(duplicate_response.headers()[header::VARY], OBJECT_VARY);
         let _ = collect(duplicate_response.into_body()).await.unwrap();
 
         for (key, expected_status) in [
@@ -2709,7 +2845,7 @@ mod tests {
             .await
             .unwrap();
             assert_eq!(response.status(), expected_status);
-            assert_eq!(response.headers()[header::VARY], "Object-Representation");
+            assert_eq!(response.headers()[header::VARY], OBJECT_VARY);
             let _ = collect(response.into_body()).await.unwrap();
         }
 
