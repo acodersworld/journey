@@ -6,6 +6,7 @@
 mod storage_interface;
 mod storage_in_memory;
 mod storage_filesystem;
+mod storage_thumbnail;
 mod http2_storage_service;
 mod storage_web_interface;
 

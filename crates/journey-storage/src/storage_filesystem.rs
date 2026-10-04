@@ -13,6 +13,7 @@ use crate::storage_interface::{
     ListPage, ListRequest, ObjectInterface, ObjectMetadata, ObjectName, PutCondition, PutKey,
     PutContextInterface, ReadObject, ReadRange, ReadSpan, StoreError, StoreErrorKind, StoreInterface,
 };
+use crate::storage_thumbnail::ThumbnailCache;
 
 const FIXED_METADATA_LEN: usize = 84;
 const MIN_METADATA_LEN: usize = 86;
@@ -27,6 +28,7 @@ pub struct FilesystemStoreConfig {
     root: PathBuf,
     journal_path: PathBuf,
     max_list_page_size: NonZeroUsize,
+    thumbnail_time_ms: u64,
 }
 
 impl FilesystemStoreConfig {
@@ -36,6 +38,7 @@ impl FilesystemStoreConfig {
             journal_path: root.join("journal"),
             root,
             max_list_page_size: NonZeroUsize::new(1_000).unwrap(),
+            thumbnail_time_ms: 0,
         }
     }
 
@@ -46,6 +49,11 @@ impl FilesystemStoreConfig {
 
     pub fn with_max_list_page_size(mut self, max_list_page_size: NonZeroUsize) -> Self {
         self.max_list_page_size = max_list_page_size;
+        self
+    }
+
+    pub fn with_thumbnail_time_ms(mut self, thumbnail_time_ms: u64) -> Self {
+        self.thumbnail_time_ms = thumbnail_time_ms;
         self
     }
 
@@ -67,6 +75,7 @@ pub struct FilesystemStore {
     config: FilesystemStoreConfig,
     objects_dir: PathBuf,
     part_dir: PathBuf,
+    thumbnail_cache: ThumbnailCache,
     index: Arc<RwLock<BTreeMap<Key, IndexEntry>>>,
     // Keep the flock descriptor alive so this process retains exclusive root ownership.
     _root_lock_file: Arc<File>,
@@ -100,9 +109,15 @@ impl FilesystemStore {
             config,
             objects_dir: output.objects_dir,
             part_dir: output.part_dir,
+            thumbnail_cache: output.thumbnail_cache,
             index: Arc::new(RwLock::new(output.index)),
             _root_lock_file: output.root_lock_file,
         })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn thumbnail_generation_count(&self) -> usize {
+        self.thumbnail_cache.generation_count()
     }
 
     fn object_path(&self, key: &Key) -> PathBuf {
@@ -213,6 +228,35 @@ impl StoreInterface for FilesystemStore {
                 object_id.as_deref(),
             )),
         }
+    }
+
+    async fn get_thumbnail(&self, key: &Key) -> Result<Bytes, StoreError> {
+        let entry = self.index.read().await.get(key).cloned().ok_or_else(|| {
+            StoreError::new(StoreErrorKind::NotFound, format!("Object not found: {key}"))
+        })?;
+        let (metadata, metadata_len, file, object_id) = match entry {
+            IndexEntry::Healthy { metadata, metadata_len, file, object_id } => {
+                (metadata, metadata_len, file, object_id)
+            }
+            IndexEntry::Corrupt { physical_name, reason, object_id } => {
+                return Err(self.corrupt_error(key, &physical_name, &reason, object_id.as_deref()));
+            }
+        };
+        let physical_name = format!("{}.obj", key_digest(key.as_str()));
+        self.verify_file_length(key, &metadata, metadata_len, Arc::clone(&file), &physical_name, &object_id)
+            .await?;
+        let content_type = metadata.content_type().as_header_value().as_bytes();
+        if !content_type.eq_ignore_ascii_case(b"video/mp4")
+            && !content_type.eq_ignore_ascii_case(b"video/quicktime")
+        {
+            return Err(StoreError::new(
+                StoreErrorKind::UnsupportedMediaType,
+                format!("Object {key} is not a supported video content type"),
+            ));
+        }
+        self.thumbnail_cache
+            .get_or_generate(file, metadata_len, metadata.payload_length(), object_id)
+            .await
     }
 
     async fn list(&self, request: ListRequest) -> Result<ListPage, StoreError> {
@@ -646,6 +690,7 @@ struct InitOutput {
     root: PathBuf,
     objects_dir: PathBuf,
     part_dir: PathBuf,
+    thumbnail_cache: ThumbnailCache,
     index: BTreeMap<Key, IndexEntry>,
     root_lock_file: Arc<File>,
 }
@@ -689,6 +734,7 @@ fn initialize_store(
     }
     let root_lock = Arc::new(lock_file);
 
+    let thumbnail_cache = ThumbnailCache::open(root.join("thumbnail-cache"), config.thumbnail_time_ms)?;
     clear_part_directory(&part_dir, &config.journal_path)?;
     let (index, skipped) = scan_objects(&objects_dir, &config.journal_path)?;
     eprintln!("filesystem object store ready: indexed {} objects, skipped {skipped} files", index.len());
@@ -696,6 +742,7 @@ fn initialize_store(
         root,
         objects_dir,
         part_dir,
+        thumbnail_cache,
         index,
         root_lock_file: root_lock,
     })

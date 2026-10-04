@@ -704,6 +704,7 @@ fn store_error_response(operation: &str, error: StoreError) -> Response {
     let (status, body) = match error.kind() {
         StoreErrorKind::NotFound => (StatusCode::NOT_FOUND, NOT_FOUND_BODY),
         StoreErrorKind::InvalidRequest => (StatusCode::BAD_REQUEST, BAD_REQUEST_BODY),
+        StoreErrorKind::UnsupportedMediaType => (StatusCode::UNSUPPORTED_MEDIA_TYPE, STORAGE_ERROR_BODY),
         StoreErrorKind::PreconditionFailed => (StatusCode::PRECONDITION_FAILED, PRECONDITION_FAILED_BODY),
         StoreErrorKind::Conflict => (StatusCode::CONFLICT, STORAGE_ERROR_BODY),
         StoreErrorKind::Capacity | StoreErrorKind::Corrupt | StoreErrorKind::Unavailable | StoreErrorKind::Internal => {

@@ -71,7 +71,10 @@ async fn main() -> AppResult<()> {
 
     let object_dir_display = config.storage.object_dir.display().to_string();
     let store = Arc::new(
-        FilesystemStore::open(FilesystemStoreConfig::new(config.storage.object_dir))
+        FilesystemStore::open(
+            FilesystemStoreConfig::new(config.storage.object_dir)
+                .with_thumbnail_time_ms(config.storage.thumbnail_time_ms),
+        )
             .await
             .map_err(|error| format!("could not open object store at {object_dir_display}: {error}"))?,
     );

@@ -10,6 +10,8 @@ bytes = "1"
 futures-util = "0.3"
 h2 = "0.4"
 http = "1"
+ffmpeg-next = { version = "9", default-features = false, features = ["codec", "format", "software-scaling"] }
+jpeg-decoder = "0.3"
 libc = "0.2"
 percent-encoding = "2"
 serde = { version = "1", features = ["derive"] }

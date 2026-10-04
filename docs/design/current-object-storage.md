@@ -56,6 +56,38 @@ The separate browser object manager and its authenticated HTTP routes are
 described in [Storage Web Interface](storage-web-interface.md); its JSON upload
 response continues to return the full generated key.
 
+## On-demand video thumbnails
+
+`GET` and `HEAD /objects/<key>` accept one optional
+`Object-Representation: thumbnail` header. Without it, the original object is
+returned. The thumbnail uses the same logical key and is available only when
+the stored content type is exactly `video/mp4` or `video/quicktime` (case
+insensitive). Thumbnail requests reject `Range`; unknown or duplicate
+representation headers return `400`, and unsupported object types return
+`415`. Original and thumbnail responses include
+`Vary: Object-Representation`. Thumbnail `HEAD` requests generate or read the
+same cached image as `GET` to return its exact content length.
+
+`storage.thumbnail_time_ms` selects the first decodable video frame at or after
+the configured time, and defaults to zero. If that time exceeds the video
+duration, the first decodable frame is used. Requests cannot select another
+time. The filesystem store gives FFmpeg a seekable payload-only reader over
+the immutable object's `Arc<File>`; positional reads start after the object
+metadata and stop at the declared payload length. Decoding and JPEG encoding
+run in blocking tasks, with at most two decodes at once. The output preserves
+the frame's aspect ratio and has a longest edge no larger than 640 pixels.
+
+Generated JPEGs are stored under `<object_dir>/thumbnail-cache`, beside
+`objects/` and `part/`. This directory is outside the indexed object namespace;
+logical keys still map to hashed `.obj` files under `objects/`. Cache filenames
+hash the source object's UUID and thumbnail settings, so replacing a logical
+key cannot reuse an older object's image. Cache writes use a synced temporary
+file and atomic rename. Requests for one cache entry share an in-process
+generation lock; missing, malformed, or undecodable cache files are rebuilt.
+The cache is persistent across service restarts and can be deleted without
+affecting stored objects. This representation is private to the storage object
+service; it adds no public thumbnail URL or website behavior.
+
 Logical keys are nonempty UTF-8 of at most 1,024 bytes and cannot end in `/`.
 Content types contain 1 through 128 header bytes. The filesystem backend maps
 a key to the lowercase SHA-256 digest of its UTF-8 bytes followed by `.obj`;

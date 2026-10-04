@@ -83,6 +83,7 @@ pub enum StoreErrorKind {
     PreconditionFailed,
     Capacity,
     Corrupt,
+    UnsupportedMediaType,
     Unavailable,
     Internal,
 }
@@ -404,6 +405,14 @@ pub trait StoreInterface: Send + Sync + Sized + 'static {
     ) -> impl Future<Output = Result<GetResult<Self::Object>, StoreError>> + Send;
 
     fn stat(&self, key: &Key) -> impl Future<Output = Result<ObjectMetadata, StoreError>> + Send;
+
+    /// Returns a generated JPEG thumbnail for a supported stored video.
+    fn get_thumbnail(&self, key: &Key) -> impl Future<Output = Result<Bytes, StoreError>> + Send {
+        async move {
+            let _ = key;
+            Err(StoreError::new(StoreErrorKind::Internal, "Video thumbnails are unavailable"))
+        }
+    }
 
     fn list(&self, request: ListRequest) -> impl Future<Output = Result<ListPage, StoreError>> + Send;
 

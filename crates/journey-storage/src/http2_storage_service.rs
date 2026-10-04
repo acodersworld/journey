@@ -28,6 +28,7 @@ const BAD_REQUEST_BODY: &[u8] = b"bad request\n";
 const PRECONDITION_FAILED_BODY: &[u8] = b"precondition failed\n";
 const RANGE_NOT_SATISFIABLE_BODY: &[u8] = b"range not satisfiable\n";
 const INVALID_CONTENT_TYPE: &[u8] = b"invalid content type\n";
+const UNSUPPORTED_MEDIA_TYPE_BODY: &[u8] = b"unsupported media type\n";
 const STORAGE_ERROR_BODY: &[u8] = b"storage error\n";
 const METHOD_NOT_ALLOWED_BODY: &[u8] = b"method not allowed\n";
 const DEFAULT_LIST_LIMIT: usize = 1_000;
@@ -40,6 +41,12 @@ enum Route {
     Object(String),
     EmptyKey,
     Unknown,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ObjectRepresentation {
+    Original,
+    Thumbnail,
 }
 
 enum PutTarget {
@@ -274,6 +281,22 @@ fn parse_generated_key_mode(headers: &http::HeaderMap) -> Result<bool, ()> {
     }
 }
 
+fn parse_object_representation(headers: &http::HeaderMap) -> Result<ObjectRepresentation, ()> {
+    let mut values = headers.get_all("object-representation").iter();
+    let Some(value) = values.next() else {
+        return Ok(ObjectRepresentation::Original);
+    };
+    if values.next().is_some() {
+        return Err(());
+    }
+    let value = value.to_str().map_err(|_| ())?.trim_matches([' ', '\t']);
+    if value == "thumbnail" {
+        Ok(ObjectRepresentation::Thumbnail)
+    } else {
+        Err(())
+    }
+}
+
 /// Handles one already accepted HTTP/2 request against a shared catalogue.
 #[derive(Debug)]
 pub struct Service<S: StoreInterface> {
@@ -344,19 +367,40 @@ impl<S: StoreInterface> Service<S> {
                 ),
             },
             Route::Object(raw_key) => {
+                let representation = match parse_object_representation(request.headers()) {
+                    Ok(representation) => representation,
+                    Err(()) => {
+                        return send_object_error_response(
+                            respond,
+                            StatusCode::BAD_REQUEST,
+                            method == Method::HEAD,
+                            None,
+                            BAD_REQUEST_BODY,
+                        );
+                    }
+                };
+                if representation == ObjectRepresentation::Thumbnail
+                    && method != Method::GET
+                    && method != Method::HEAD
+                {
+                    return send_object_error_response(
+                        respond,
+                        StatusCode::BAD_REQUEST,
+                        method == Method::HEAD,
+                        None,
+                        BAD_REQUEST_BODY,
+                    );
+                }
                 let decoded_key = match decode_object_path(&raw_key) {
                     Ok(key) => key,
                     Err(()) => {
-                        return if method == Method::HEAD {
-                            send_empty_response(respond, StatusCode::BAD_REQUEST, None, None, None)
-                        } else {
-                            send_text_response(
-                                respond,
-                                StatusCode::BAD_REQUEST,
-                                None,
-                                BAD_REQUEST_BODY,
-                            )
-                        };
+                        return send_object_error_response(
+                            respond,
+                            StatusCode::BAD_REQUEST,
+                            method == Method::HEAD,
+                            None,
+                            BAD_REQUEST_BODY,
+                        );
                     }
                 };
                 if method == Method::PUT && decoded_key.ends_with('/') {
@@ -383,16 +427,48 @@ impl<S: StoreInterface> Service<S> {
                 let key = match Key::new(&decoded_key) {
                     Ok(key) => key,
                     Err(_) => {
-                        return if method == Method::HEAD {
-                            send_empty_response(respond, StatusCode::BAD_REQUEST, None, None, None)
-                        } else {
-                            send_text_response(respond, StatusCode::BAD_REQUEST, None, INVALID_KEY_BODY)
-                        };
+                        return send_object_error_response(
+                            respond,
+                            StatusCode::BAD_REQUEST,
+                            method == Method::HEAD,
+                            None,
+                            INVALID_KEY_BODY,
+                        );
                     }
                 };
                 match method {
-                    Method::GET => self.handle_get(&key, request.headers(), respond).await,
-                    Method::HEAD => self.handle_head(&key, respond).await,
+                    Method::GET => {
+                        if representation == ObjectRepresentation::Thumbnail {
+                            if request.headers().contains_key(header::RANGE) {
+                                return send_object_error_response(
+                                    respond,
+                                    StatusCode::BAD_REQUEST,
+                                    false,
+                                    None,
+                                    BAD_REQUEST_BODY,
+                                );
+                            }
+                            self.handle_thumbnail(&key, false, respond).await
+                        } else {
+                            self.handle_get(&key, request.headers(), respond).await
+                        }
+                    }
+                    Method::HEAD => {
+                        if representation == ObjectRepresentation::Thumbnail {
+                            if request.headers().contains_key(header::RANGE) {
+                                return send_object_error_response(
+                                    respond,
+                                    StatusCode::BAD_REQUEST,
+                                    true,
+                                    None,
+                                    BAD_REQUEST_BODY,
+                                );
+                            }
+                            self.handle_thumbnail(&key, true, respond).await
+                        } else {
+                            self.handle_head(&key, respond).await
+                        }
+                    }
                     Method::PUT => match parse_generated_key_mode(request.headers()) {
                         Ok(false) => self.handle_put(request, PutTarget::WithKey(key), respond).await,
                         _ => send_text_response(
@@ -403,10 +479,10 @@ impl<S: StoreInterface> Service<S> {
                         ),
                     },
                     Method::DELETE => self.handle_delete(&key, respond).await,
-                    _ => request_error(
+                    _ => send_object_error_response(
                         respond,
-                        false,
                         StatusCode::METHOD_NOT_ALLOWED,
+                        false,
                         Some(OBJECT_ALLOW),
                         METHOD_NOT_ALLOWED_BODY,
                     ),
@@ -414,10 +490,10 @@ impl<S: StoreInterface> Service<S> {
             }
             Route::EmptyKey => match method {
                 Method::GET => {
-                    send_text_response(respond, StatusCode::BAD_REQUEST, None, INVALID_KEY_BODY)
+                    send_object_error_response(respond, StatusCode::BAD_REQUEST, false, None, INVALID_KEY_BODY)
                 }
                 Method::HEAD => {
-                    send_empty_response(respond, StatusCode::BAD_REQUEST, None, None, None)
+                    send_object_error_response(respond, StatusCode::BAD_REQUEST, true, None, INVALID_KEY_BODY)
                 }
                 Method::PUT => {
                     send_text_response(respond, StatusCode::BAD_REQUEST, None, BAD_REQUEST_BODY)
@@ -623,6 +699,7 @@ impl<S: StoreInterface> Service<S> {
             .version(Version::HTTP_2)
             .status(StatusCode::OK)
             .header(header::CONTENT_LENGTH, 0)
+            .header(header::VARY, "Object-Representation")
             .header("object-key", key_header);
         if let Some(object_name_header) = object_name_header {
             response_builder = response_builder.header("object-name", object_name_header);
@@ -641,9 +718,10 @@ impl<S: StoreInterface> Service<S> {
         let range = match parse_range_header(headers) {
             Ok(range) => range,
             Err(()) => {
-                return send_text_response(
+                return send_object_error_response(
                     respond,
                     StatusCode::BAD_REQUEST,
+                    false,
                     None,
                     BAD_REQUEST_BODY,
                 );
@@ -653,12 +731,19 @@ impl<S: StoreInterface> Service<S> {
             Ok(get_result) => get_result,
             Err(error) => {
                 if error.kind() == StoreErrorKind::NotFound {
-                    return send_text_response(respond, StatusCode::NOT_FOUND, None, NOT_FOUND_BODY);
+                    return send_object_error_response(
+                        respond,
+                        StatusCode::NOT_FOUND,
+                        false,
+                        None,
+                        NOT_FOUND_BODY,
+                    );
                 }
                 eprintln!("storage GET lookup failed for key {key:?}: {error}");
-                return send_text_response(
+                return send_object_error_response(
                     respond,
                     StatusCode::INTERNAL_SERVER_ERROR,
+                    false,
                     None,
                     STORAGE_ERROR_BODY,
                 );
@@ -686,7 +771,8 @@ impl<S: StoreInterface> Service<S> {
             })
             .header(header::CONTENT_TYPE, metadata.content_type().as_header_value())
             .header(header::CONTENT_LENGTH, content_length)
-            .header(header::ACCEPT_RANGES, "bytes");
+            .header(header::ACCEPT_RANGES, "bytes")
+            .header(header::VARY, "Object-Representation");
         if let Some(span) = selected_span {
             let Some(end) = span
                 .offset()
@@ -695,9 +781,10 @@ impl<S: StoreInterface> Service<S> {
                 .filter(|end| span.size() > 0 && *end < metadata.payload_length())
             else {
                 eprintln!("storage GET returned invalid selected span for key {key:?}");
-                return send_text_response(
+                return send_object_error_response(
                     respond,
                     StatusCode::INTERNAL_SERVER_ERROR,
+                    false,
                     None,
                     STORAGE_ERROR_BODY,
                 );
@@ -731,16 +818,22 @@ impl<S: StoreInterface> Service<S> {
         let metadata = match self.store.stat(key).await {
             Ok(metadata) => metadata,
             Err(error) if error.kind() == StoreErrorKind::NotFound => {
-                return send_empty_response(respond, StatusCode::NOT_FOUND, None, None, None);
+                return send_object_error_response(
+                    respond,
+                    StatusCode::NOT_FOUND,
+                    true,
+                    None,
+                    NOT_FOUND_BODY,
+                );
             }
             Err(error) => {
                 eprintln!("storage HEAD lookup failed for key {key:?}: {error}");
-                return send_empty_response(
+                return send_object_error_response(
                     respond,
                     StatusCode::INTERNAL_SERVER_ERROR,
+                    true,
                     None,
-                    None,
-                    None,
+                    STORAGE_ERROR_BODY,
                 );
             }
         };
@@ -751,10 +844,68 @@ impl<S: StoreInterface> Service<S> {
             .header(header::CONTENT_TYPE, metadata.content_type().as_header_value())
             .header(header::CONTENT_LENGTH, metadata.payload_length())
             .header(header::ACCEPT_RANGES, "bytes")
+            .header(header::VARY, "Object-Representation")
             .body(())?;
         let mut respond = respond;
         respond.send_response(response, true)?;
         Ok(())
+    }
+
+    async fn handle_thumbnail(
+        &self,
+        key: &Key,
+        is_head: bool,
+        mut respond: h2::server::SendResponse<Bytes>,
+    ) -> Result<(), ServiceError> {
+        let thumbnail = match self.store.get_thumbnail(key).await {
+            Ok(thumbnail) => thumbnail,
+            Err(error) if error.kind() == StoreErrorKind::NotFound => {
+                return send_object_error_response(
+                    respond,
+                    StatusCode::NOT_FOUND,
+                    is_head,
+                    None,
+                    NOT_FOUND_BODY,
+                );
+            }
+            Err(error) if error.kind() == StoreErrorKind::UnsupportedMediaType => {
+                return send_object_error_response(
+                    respond,
+                    StatusCode::UNSUPPORTED_MEDIA_TYPE,
+                    is_head,
+                    None,
+                    UNSUPPORTED_MEDIA_TYPE_BODY,
+                );
+            }
+            Err(error) => {
+                eprintln!("storage thumbnail lookup failed for key {key:?}: {error}");
+                return send_object_error_response(
+                    respond,
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    is_head,
+                    None,
+                    STORAGE_ERROR_BODY,
+                );
+            }
+        };
+
+        let response = Response::builder()
+            .version(Version::HTTP_2)
+            .status(StatusCode::OK)
+            .header(header::CONTENT_TYPE, "image/jpeg")
+            .header(header::CONTENT_LENGTH, thumbnail.len())
+            .header(header::VARY, "Object-Representation")
+            .body(())?;
+        if is_head {
+            respond.send_response(response, true)?;
+            return Ok(());
+        }
+        if thumbnail.is_empty() {
+            respond.send_response(response, true)?;
+            return Ok(());
+        }
+        let mut stream = respond.send_response(response, false)?;
+        send_payload(&mut stream, &thumbnail).await
     }
 
     async fn handle_delete(
@@ -771,7 +922,14 @@ impl<S: StoreInterface> Service<S> {
                 STORAGE_ERROR_BODY,
             );
         }
-        send_empty_response(respond, StatusCode::NO_CONTENT, None, None, None)
+        let response = Response::builder()
+            .version(Version::HTTP_2)
+            .status(StatusCode::NO_CONTENT)
+            .header(header::VARY, "Object-Representation")
+            .body(())?;
+        let mut respond = respond;
+        respond.send_response(response, true)?;
+        Ok(())
     }
 
     async fn handle_list(
@@ -925,6 +1083,35 @@ fn send_empty_response(
     Ok(())
 }
 
+fn send_object_error_response(
+    mut respond: h2::server::SendResponse<Bytes>,
+    status: StatusCode,
+    is_head: bool,
+    allow: Option<&'static str>,
+    body: &'static [u8],
+) -> Result<(), ServiceError> {
+    let mut builder = Response::builder()
+        .version(Version::HTTP_2)
+        .status(status)
+        .header(header::VARY, "Object-Representation");
+    if let Some(allow) = allow {
+        builder = builder.header(header::ALLOW, allow);
+    }
+    if !is_head {
+        builder = builder
+            .header(header::CONTENT_TYPE, "text/plain; charset=utf-8")
+            .header(header::CONTENT_LENGTH, body.len());
+    }
+    let response = builder.body(())?;
+    if is_head {
+        respond.send_response(response, true)?;
+        return Ok(());
+    }
+    let mut stream = respond.send_response(response, false)?;
+    stream.send_data(Bytes::copy_from_slice(body), true)?;
+    Ok(())
+}
+
 async fn send_json_response(
     mut respond: h2::server::SendResponse<Bytes>,
     payload: Bytes,
@@ -967,6 +1154,7 @@ fn send_range_unsatisfiable(
         .version(Version::HTTP_2)
         .status(StatusCode::RANGE_NOT_SATISFIABLE)
         .header(header::ACCEPT_RANGES, "bytes")
+        .header(header::VARY, "Object-Representation")
         .header(
             header::CONTENT_RANGE,
             format!("bytes */{complete_length}"),
@@ -2340,6 +2528,33 @@ mod tests {
         );
     }
 
+    async fn put_filesystem_object(
+        store: &FilesystemStore,
+        key: &str,
+        content_type: &str,
+        payload: &[u8],
+    ) {
+        let key = Key::new(key).unwrap();
+        let mut context = store
+            .put_context_with_key(
+                key,
+                validated_content_type(content_type),
+                PutCondition::Unconditional,
+            )
+            .await
+            .unwrap();
+        context.append(&Bytes::copy_from_slice(payload)).await.unwrap();
+        store.put_with_key(context).await.unwrap();
+    }
+
+    fn thumbnail_cache_files(root: &TestFilesystemRoot) -> Vec<PathBuf> {
+        fs::read_dir(root.0.join("thumbnail-cache"))
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .filter(|path| path.extension().is_some_and(|extension| extension == "jpg"))
+            .collect()
+    }
+
     #[tokio::test]
     async fn known_objects_return_exact_headers_and_payloads() {
         let mut connection = connection(sample_store(), None).await;
@@ -2354,6 +2569,217 @@ mod tests {
             .unwrap();
         assert_success_headers(&video, "video/mp4", VIDEO.len());
         assert_eq!(collect(video.into_body()).await.unwrap(), VIDEO);
+    }
+
+    #[tokio::test]
+    async fn filesystem_video_thumbnails_share_cache_and_preserve_original_objects() {
+        let root = TestFilesystemRoot::new();
+        let config = root.config().with_thumbnail_time_ms(60_000);
+        let store = Arc::new(FilesystemStore::open(config.clone()).await.unwrap());
+        let video_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("examples/assets/video.mp4");
+        let video_bytes = fs::read(video_path).unwrap();
+        let video_key = "media/clip.mp4";
+        let video_uri = format!("/objects/{video_key}");
+        put_filesystem_object(&store, video_key, "video/mp4", &video_bytes).await;
+        put_filesystem_object(&store, "notes/readme.txt", "text/plain", b"not a video").await;
+        put_filesystem_object(&store, "thumbnail-cache", "text/plain", b"logical object").await;
+
+        let mut first = new_connection(Arc::clone(&store)).await;
+        let mut second = new_connection(Arc::clone(&store)).await;
+        let ordinary = get(&mut first.sender, &video_uri).await.unwrap();
+        assert_success_headers(&ordinary, "video/mp4", video_bytes.len());
+        assert_eq!(ordinary.headers()[header::VARY], "Object-Representation");
+        assert_eq!(collect(ordinary.into_body()).await.unwrap(), video_bytes);
+
+        let original_head = request(&mut first.sender, Method::HEAD, &video_uri).await.unwrap();
+        assert_eq!(original_head.status(), StatusCode::OK);
+        assert_eq!(original_head.headers()[header::CONTENT_TYPE], "video/mp4");
+        assert_eq!(original_head.headers()[header::CONTENT_LENGTH], video_bytes.len().to_string());
+        assert_eq!(original_head.headers()[header::VARY], "Object-Representation");
+        assert!(collect(original_head.into_body()).await.unwrap().is_empty());
+
+        let range = request_with_headers(
+            &mut first.sender,
+            Method::GET,
+            &video_uri,
+            &[("range", "bytes=0-15")],
+        )
+        .await
+        .unwrap();
+        assert_eq!(range.status(), StatusCode::PARTIAL_CONTENT);
+        assert_eq!(range.headers()[header::VARY], "Object-Representation");
+        assert_eq!(collect(range.into_body()).await.unwrap(), &video_bytes[..16]);
+
+        let thumbnail_headers = [("Object-Representation", "thumbnail")];
+        let first_thumbnail = request_with_headers(
+            &mut first.sender,
+            Method::GET,
+            &video_uri,
+            &thumbnail_headers,
+        );
+        let concurrent_thumbnail = request_with_headers(
+            &mut second.sender,
+            Method::GET,
+            &video_uri,
+            &thumbnail_headers,
+        );
+        let (first_thumbnail, concurrent_thumbnail) =
+            tokio::join!(first_thumbnail, concurrent_thumbnail);
+        let first_thumbnail = first_thumbnail.unwrap();
+        let concurrent_thumbnail = concurrent_thumbnail.unwrap();
+        assert_eq!(first_thumbnail.status(), StatusCode::OK);
+        assert_eq!(first_thumbnail.headers()[header::CONTENT_TYPE], "image/jpeg");
+        assert_eq!(first_thumbnail.headers()[header::VARY], "Object-Representation");
+        let thumbnail_length = first_thumbnail.headers()[header::CONTENT_LENGTH].clone();
+        let jpeg = collect(first_thumbnail.into_body()).await.unwrap();
+        assert_eq!(thumbnail_length, jpeg.len().to_string());
+        assert_eq!(concurrent_thumbnail.status(), StatusCode::OK);
+        assert_eq!(collect(concurrent_thumbnail.into_body()).await.unwrap(), jpeg);
+        assert_eq!(store.thumbnail_generation_count(), 1);
+
+        let mut jpeg_decoder = jpeg_decoder::Decoder::new(std::io::Cursor::new(jpeg.as_slice()));
+        jpeg_decoder.read_info().unwrap();
+        let jpeg_info = jpeg_decoder.info().unwrap();
+        assert!(u32::from(jpeg_info.width).max(u32::from(jpeg_info.height)) <= 640);
+        assert!(jpeg_decoder.decode().is_ok());
+
+        let thumbnail_head = request_with_headers(
+            &mut first.sender,
+            Method::HEAD,
+            &video_uri,
+            &thumbnail_headers,
+        )
+        .await
+        .unwrap();
+        assert_eq!(thumbnail_head.status(), StatusCode::OK);
+        assert_eq!(thumbnail_head.headers()[header::CONTENT_TYPE], "image/jpeg");
+        assert_eq!(thumbnail_head.headers()[header::CONTENT_LENGTH], jpeg.len().to_string());
+        assert_eq!(thumbnail_head.headers()[header::VARY], "Object-Representation");
+        assert!(collect(thumbnail_head.into_body()).await.unwrap().is_empty());
+        assert_eq!(store.thumbnail_generation_count(), 1);
+
+        for (method, headers) in [
+            (Method::GET, vec![("Object-Representation", "original")]),
+            (Method::GET, vec![("Object-Representation", "unknown")]),
+            (
+                Method::GET,
+                vec![("Object-Representation", "thumbnail"), ("range", "bytes=0-1")],
+            ),
+            (
+                Method::HEAD,
+                vec![("Object-Representation", "thumbnail"), ("range", "bytes=0-1")],
+            ),
+        ] {
+            let response = request_with_headers(&mut first.sender, method, &video_uri, &headers)
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+            assert_eq!(response.headers()[header::VARY], "Object-Representation");
+            let _ = collect(response.into_body()).await.unwrap();
+        }
+
+        let mut duplicate = Request::builder()
+            .method(Method::GET)
+            .uri(&video_uri)
+            .body(())
+            .unwrap();
+        duplicate
+            .headers_mut()
+            .append("Object-Representation", "thumbnail".parse().unwrap());
+        duplicate
+            .headers_mut()
+            .append("Object-Representation", "thumbnail".parse().unwrap());
+        let (duplicate_response, _) = first.sender.send_request(duplicate, true).unwrap();
+        let duplicate_response = duplicate_response.await.unwrap();
+        assert_eq!(duplicate_response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(duplicate_response.headers()[header::VARY], "Object-Representation");
+        let _ = collect(duplicate_response.into_body()).await.unwrap();
+
+        for (key, expected_status) in [
+            ("notes/readme.txt", StatusCode::UNSUPPORTED_MEDIA_TYPE),
+            ("missing.mp4", StatusCode::NOT_FOUND),
+        ] {
+            let response = request_with_headers(
+                &mut first.sender,
+                Method::GET,
+                &format!("/objects/{key}"),
+                &thumbnail_headers,
+            )
+            .await
+            .unwrap();
+            assert_eq!(response.status(), expected_status);
+            assert_eq!(response.headers()[header::VARY], "Object-Representation");
+            let _ = collect(response.into_body()).await.unwrap();
+        }
+
+        let logical_cache_key = get(&mut first.sender, "/objects/thumbnail-cache").await.unwrap();
+        assert_eq!(collect(logical_cache_key.into_body()).await.unwrap(), b"logical object");
+        assert!(root.0.join("thumbnail-cache").is_dir());
+        assert_eq!(fs::read_dir(root.0.join("part")).unwrap().count(), 0);
+
+        let first_cache_entry = thumbnail_cache_files(&root).pop().unwrap();
+        fs::remove_file(&first_cache_entry).unwrap();
+        let regenerated = request_with_headers(
+            &mut first.sender,
+            Method::GET,
+            &video_uri,
+            &thumbnail_headers,
+        )
+        .await
+        .unwrap();
+        assert_eq!(regenerated.status(), StatusCode::OK);
+        let _ = collect(regenerated.into_body()).await.unwrap();
+        assert_eq!(store.thumbnail_generation_count(), 2);
+
+        put_filesystem_object(&store, video_key, "video/mp4", &video_bytes).await;
+        let replacement = request_with_headers(
+            &mut first.sender,
+            Method::GET,
+            &video_uri,
+            &thumbnail_headers,
+        )
+        .await
+        .unwrap();
+        assert_eq!(replacement.status(), StatusCode::OK);
+        let _ = collect(replacement.into_body()).await.unwrap();
+        assert_eq!(store.thumbnail_generation_count(), 3);
+        assert_eq!(thumbnail_cache_files(&root).len(), 2);
+        assert!(thumbnail_cache_files(&root).iter().any(|path| path != &first_cache_entry));
+
+        put_filesystem_object(&store, "broken.mp4", "video/mp4", b"not a video container").await;
+        let broken = request_with_headers(
+            &mut first.sender,
+            Method::GET,
+            "/objects/broken.mp4",
+            &thumbnail_headers,
+        )
+        .await
+        .unwrap();
+        assert_eq!(broken.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(collect(broken.into_body()).await.unwrap(), STORAGE_ERROR_BODY);
+        assert_eq!(thumbnail_cache_files(&root).len(), 2);
+
+        close_connection(first).await;
+        close_connection(second).await;
+        drop(store);
+
+        let reopened = Arc::new(FilesystemStore::open(config).await.unwrap());
+        let mut restarted = new_connection(Arc::clone(&reopened)).await;
+        let cached_after_restart = request_with_headers(
+            &mut restarted.sender,
+            Method::GET,
+            &video_uri,
+            &thumbnail_headers,
+        )
+        .await
+        .unwrap();
+        assert_eq!(cached_after_restart.status(), StatusCode::OK);
+        let _ = collect(cached_after_restart.into_body()).await.unwrap();
+        assert_eq!(reopened.thumbnail_generation_count(), 0);
+        assert_eq!(thumbnail_cache_files(&root).len(), 2);
+        close_connection(restarted).await;
+        drop(reopened);
     }
 
     #[tokio::test]

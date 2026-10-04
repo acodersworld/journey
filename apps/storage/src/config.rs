@@ -22,6 +22,7 @@ pub struct StorageSettings {
     pub object_dir: PathBuf,
     pub initial_stream_window_size: u32,
     pub initial_connection_window_size: u32,
+    pub thumbnail_time_ms: u64,
 }
 
 #[derive(Debug, Deserialize)]
@@ -55,6 +56,7 @@ impl Default for StorageSettings {
             object_dir: default_object_dir(),
             initial_stream_window_size: 32 * 1024 * 1024,
             initial_connection_window_size: 64 * 1024 * 1024,
+            thumbnail_time_ms: 0,
         }
     }
 }
