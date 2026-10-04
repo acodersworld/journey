@@ -3,6 +3,7 @@ mod config;
 mod control;
 mod db;
 mod import;
+mod shutdown;
 mod storage;
 mod storage_websocket;
 mod web;
@@ -17,7 +18,10 @@ use std::{
 use clap::{Args, CommandFactory, Parser, Subcommand};
 use db::Database;
 use storage::{H2cStorageClient, SiteStorageClient, WebSocketStorageClient};
-use tokio::net::TcpListener;
+use tokio::{
+    net::TcpListener,
+    task::JoinSet,
+};
 
 type AppResult<T> = Result<T, Box<dyn Error + Send + Sync>>;
 
@@ -307,6 +311,7 @@ async fn main() -> AppResult<()> {
             }
         }
         Commands::Serve(options) => {
+            let mut shutdown = shutdown::listen();
             let bind = config.site.bind.clone();
             let bind_address = parse_socket_address("site.bind", &bind)?;
             let allow_insecure_lan_http =
@@ -339,9 +344,18 @@ async fn main() -> AppResult<()> {
             database.initialize().await.map_err(|error| {
                 format!("could not initialize site database at {}: {error}", database_path.display())
             })?;
-            let storage = match storage_transport {
+            let (storage, websocket_listener) = match storage_transport {
                 ConfiguredStorageTransport::H2c(address) => {
-                    SiteStorageClient::H2c(connect_storage(windows, address).await?)
+                    let storage = tokio::select! {
+                        result = connect_storage(windows, address) => {
+                            SiteStorageClient::H2c(result?)
+                        }
+                        result = shutdown::requested(&mut shutdown) => {
+                            result.map_err(std::io::Error::other)?;
+                            return Ok(());
+                        }
+                    };
+                    (storage, None)
                 }
                 ConfiguredStorageTransport::WebSocket(websocket_address) => {
                     let storage = WebSocketStorageClient::new(
@@ -351,48 +365,109 @@ async fn main() -> AppResult<()> {
                     let websocket_listener = TcpListener::bind(websocket_address)
                         .await
                         .map_err(|error| format!("could not bind storage WebSocket listener at {websocket_address}: {error}"))?;
-                    println!("journey-site storage WebSocket listener on {}", websocket_listener.local_addr()?);
-                    let websocket_storage = storage.clone();
-                    let secret = config.storage.websocket_secret.clone();
-                    tokio::spawn(async move {
-                        if let Err(error) = storage_websocket::serve(
-                            websocket_listener,
-                            secret,
-                            websocket_storage,
-                            windows.initial_window_size,
-                            windows.initial_connection_window_size,
-                        )
-                        .await
-                        {
-                            eprintln!("storage WebSocket listener stopped: {error}");
-                        }
-                    });
-                    SiteStorageClient::WebSocket(storage)
+                    (SiteStorageClient::WebSocket(storage), Some(websocket_listener))
                 }
             };
-            let control_listener = control::bind(&config.site.control_socket)
-                .await
-                .map_err(|error| format!("could not bind private import control socket: {error}"))?;
-            println!("journey-site import control socket ready");
-            let control_database = database.clone();
-            let control_storage = storage.clone();
-            tokio::spawn(async move {
-                if let Err(error) = control::serve(control_listener, control_database, control_storage).await {
-                    eprintln!("journey-site control listener stopped: {error}");
-                }
-            });
+            if let Some(listener) = &websocket_listener {
+                println!("journey-site storage WebSocket listener on {}", listener.local_addr()?);
+            }
             let listener = TcpListener::bind(&bind)
                 .await
                 .map_err(|error| format!("could not bind site HTTP listener at {bind}: {error}"))?;
-            println!("journey-site HTTP listener on {}", listener.local_addr()?);
-            axum::serve(
-                listener,
-                web::router(web::state_with_security(database, storage, security))
-                    .into_make_service_with_connect_info::<SocketAddr>(),
-            )
-            .await?;
-            Ok(())
+            let listener_address = listener.local_addr()?;
+            let control_listener = control::bind(&config.site.control_socket)
+                .await
+                .map_err(|error| format!("could not bind private import control socket: {error}"))?;
+            let mut control_socket = control::BoundSocketPath::new(config.site.control_socket.clone());
+            println!("journey-site import control socket ready");
+            println!("journey-site HTTP listener on {listener_address}");
+
+            let mut listener_tasks = JoinSet::new();
+            if let Some(websocket_listener) = websocket_listener {
+                let websocket_storage = match &storage {
+                    SiteStorageClient::WebSocket(storage) => storage.clone(),
+                    SiteStorageClient::H2c(_) => unreachable!(),
+                };
+                let secret = config.storage.websocket_secret.clone();
+                let websocket_shutdown = shutdown.clone();
+                listener_tasks.spawn(async move {
+                    storage_websocket::serve(
+                        websocket_listener,
+                        secret,
+                        websocket_storage,
+                        windows.initial_window_size,
+                        windows.initial_connection_window_size,
+                        websocket_shutdown,
+                    )
+                    .await
+                });
+            }
+            let control_database = database.clone();
+            let control_storage = storage.clone();
+            let control_shutdown = shutdown.clone();
+            listener_tasks.spawn(async move {
+                control::serve(control_listener, control_database, control_storage, control_shutdown).await
+            });
+
+            let shutdown_storage = storage.clone();
+            let mut http_server = Box::pin(async move {
+                axum::serve(
+                    listener,
+                    web::router(web::state_with_security(database, storage, security))
+                        .into_make_service_with_connect_info::<SocketAddr>(),
+                )
+                .await
+            });
+            let mut result: AppResult<()> = loop {
+                tokio::select! {
+                    biased;
+                    signal = shutdown::requested(&mut shutdown) => {
+                        break shutdown_result(signal);
+                    }
+                    result = &mut http_server => {
+                        break Err(format!("journey-site HTTP listener stopped unexpectedly: {result:?}").into());
+                    }
+                    Some(task_result) = listener_tasks.join_next(), if !listener_tasks.is_empty() => {
+                        break match task_result {
+                            Ok(Ok(())) => Err("journey-site background listener stopped unexpectedly".into()),
+                            Ok(Err(error)) => Err(format!("journey-site background listener failed: {error}").into()),
+                            Err(error) => Err(format!("journey-site background listener task failed: {error}").into()),
+                        };
+                    }
+                }
+            };
+            drop(http_server);
+            if result.is_err() {
+                listener_tasks.abort_all();
+            }
+            while let Some(task_result) = listener_tasks.join_next().await {
+                match task_result {
+                    Ok(Ok(())) => {}
+                    Ok(Err(error)) if result.is_ok() => {
+                        result = Err(format!("journey-site background listener failed: {error}").into());
+                    }
+                    Err(error) if error.is_cancelled() => {}
+                    Err(error) if result.is_ok() => {
+                        result = Err(format!("journey-site background listener task failed: {error}").into());
+                    }
+                    _ => {}
+                }
+            }
+            shutdown_storage.close().await;
+            if let Err(error) = control_socket.remove().await {
+                if result.is_ok() {
+                    result = Err(format!("could not remove site control socket: {error}").into());
+                }
+            }
+            result
         }
+    }
+}
+
+fn shutdown_result(signal: Result<(), String>) -> AppResult<()> {
+    match signal {
+        Ok(()) => Ok(()),
+        Err(error) => Err(std::io::Error::other(error).into()),
     }
 }
 

@@ -1,7 +1,9 @@
 mod config;
+mod shutdown;
 
 use std::{
     error::Error,
+    io,
     net::SocketAddr,
     path::PathBuf,
     sync::Arc,
@@ -29,6 +31,7 @@ async fn main() -> AppResult<()> {
         return Ok(());
     };
     let config = AppConfig::load(Some(config_path))?;
+    let mut shutdown = shutdown::listen();
 
     let management_bind = &config.management.bind;
     let management_address = management_bind.parse::<SocketAddr>().map_err(|error| {
@@ -81,31 +84,106 @@ async fn main() -> AppResult<()> {
     let management_listener = TcpListener::bind(management_address)
         .await
         .map_err(|error| format!("could not bind storage management UI to {management_bind}: {error}"))?;
+    let mut management_tasks = JoinSet::new();
     let management_store = Arc::clone(&store);
-    tokio::spawn(async move {
-        if let Err(error) = serve_web_interface(management_listener, management_store, credentials).await {
-            eprintln!("object management UI stopped: {error}");
-        }
+    management_tasks.spawn(async move {
+        serve_web_interface(management_listener, management_store, credentials).await
     });
     let service = Service::new(store);
     println!("journey-storage management UI on {management_bind}");
 
-    loop {
+    let mut result: AppResult<()> = loop {
         let request = ClientRequestBuilder::new(websocket_uri.clone())
             .with_header("X-Journey-Storage-Secret", secret.clone());
-        match timeout(Duration::from_secs(10), connect_websocket(request, websocket_config)).await {
+        let connection = tokio::select! {
+            biased;
+            signal = shutdown::requested(&mut shutdown) => {
+                break shutdown_result(signal);
+            }
+            Some(task_result) = management_tasks.join_next(), if !management_tasks.is_empty() => {
+                break Err(management_ui_task_failure(task_result));
+            }
+            connection = timeout(Duration::from_secs(10), connect_websocket(request, websocket_config)) => connection,
+        };
+        match connection {
             Ok(Ok((websocket, _))) => {
                 println!("connected to journey-site storage listener");
-                match server_session(websocket, websocket_config).await {
-                    Ok(session) => run_storage_session(session, service.clone()).await,
+                let session = tokio::select! {
+                    biased;
+                    signal = shutdown::requested(&mut shutdown) => {
+                        break shutdown_result(signal);
+                    }
+                    Some(task_result) = management_tasks.join_next(), if !management_tasks.is_empty() => {
+                        break Err(management_ui_task_failure(task_result));
+                    }
+                    result = server_session(websocket, websocket_config) => result,
+                };
+                match session {
+                    Ok(session) => {
+                        tokio::select! {
+                            biased;
+                            signal = shutdown::requested(&mut shutdown) => {
+                                break shutdown_result(signal);
+                            }
+                            Some(task_result) = management_tasks.join_next(), if !management_tasks.is_empty() => {
+                                break Err(management_ui_task_failure(task_result));
+                            }
+                            _ = run_storage_session(session, service.clone()) => {}
+                        }
+                    }
                     Err(error) => eprintln!("storage HTTP/2 session failed: {error}"),
                 }
             }
             Ok(Err(error)) => eprintln!("storage WebSocket connection to {websocket_url} failed: {error}"),
             Err(_) => eprintln!("storage WebSocket connection timed out"),
         }
-        sleep(Duration::from_secs(1)).await;
+        tokio::select! {
+            biased;
+            signal = shutdown::requested(&mut shutdown) => {
+                break shutdown_result(signal);
+            }
+            Some(task_result) = management_tasks.join_next(), if !management_tasks.is_empty() => {
+                break Err(management_ui_task_failure(task_result));
+            }
+            _ = sleep(Duration::from_secs(1)) => {}
+        }
+    };
+
+    management_tasks.abort_all();
+    while let Some(task_result) = management_tasks.join_next().await {
+        match task_result {
+            Err(error) if error.is_cancelled() => {}
+            Ok(Ok(())) if result.is_ok() => {
+                result = Err("storage management UI stopped unexpectedly".into());
+            }
+            Ok(Err(error)) if result.is_ok() => {
+                result = Err(format!("storage management UI failed: {error}").into());
+            }
+            Err(error) if result.is_ok() => {
+                result = Err(management_ui_task_failure(Err(error)));
+            }
+            _ => {}
+        }
     }
+    result
+}
+
+fn shutdown_result(signal: Result<(), String>) -> AppResult<()> {
+    match signal {
+        Ok(()) => Ok(()),
+        Err(error) => Err(io::Error::other(error).into()),
+    }
+}
+
+fn management_ui_task_failure(
+    task_result: Result<io::Result<()>, tokio::task::JoinError>,
+) -> Box<dyn Error + Send + Sync> {
+    let message = match task_result {
+        Ok(Ok(())) => "storage management UI stopped unexpectedly".to_owned(),
+        Ok(Err(error)) => format!("storage management UI failed: {error}"),
+        Err(error) => format!("storage management UI task failed: {error}"),
+    };
+    io::Error::other(message).into()
 }
 
 fn config_path_from_arguments() -> AppResult<Option<PathBuf>> {

@@ -11,8 +11,8 @@ use futures_util::{SinkExt, StreamExt};
 use h2::{client, server};
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, DuplexStream},
-    sync::{mpsc, Mutex, Notify},
-    task::JoinSet,
+    sync::{mpsc, watch, Mutex, Notify},
+    task::{JoinHandle, JoinSet},
 };
 use tokio_tungstenite::{
     accept_hdr_async_with_config, connect_async_tls_with_config,
@@ -42,6 +42,26 @@ const DEFAULT_H2_MAX_HEADER_LIST_SIZE: u32 = 16 * 1024;
 const DEFAULT_H2_MAX_CONCURRENT_REQUESTS: u32 = 8;
 const DEFAULT_REQUEST_QUEUE_CAPACITY: usize = 8;
 const WRITER_CHANNEL_CAPACITY: usize = 8;
+
+struct AbortOnDrop<T>(Option<JoinHandle<T>>);
+
+impl<T> AbortOnDrop<T> {
+    fn new(task: JoinHandle<T>) -> Self {
+        Self(Some(task))
+    }
+
+    fn take(&mut self) -> JoinHandle<T> {
+        self.0.take().expect("task handle already taken")
+    }
+}
+
+impl<T> Drop for AbortOnDrop<T> {
+    fn drop(&mut self) {
+        if let Some(task) = &self.0 {
+            task.abort();
+        }
+    }
+}
 
 /// WebSocket subprotocol negotiated by this crate.
 pub const SUBPROTOCOL: &str = "h2-over-websocket-v1";
@@ -648,6 +668,7 @@ impl ReadyClientSender {
 pub struct ClientSession {
     sender: ClientSender,
     state: Arc<SessionState>,
+    shutdown: watch::Sender<bool>,
 }
 
 impl ClientSession {
@@ -659,6 +680,11 @@ impl ClientSession {
     /// Waits for the terminal HTTP/2 or WebSocket result.
     pub async fn wait(&self) -> Result<(), Arc<Error>> {
         self.state.wait().await
+    }
+
+    /// Closes the HTTP/2 and WebSocket transports for this session.
+    pub fn close(&self) {
+        self.shutdown.send_replace(true);
     }
 }
 
@@ -689,35 +715,51 @@ where
 {
     config.validate()?;
     let (client_io, bridge_io) = tokio::io::duplex(config.duplex_capacity);
-    let mut bridge_task = tokio::spawn(bridge(
+    let mut bridge_task = AbortOnDrop::new(tokio::spawn(bridge(
         websocket,
         bridge_io,
         config.bridge_buffer_size,
         config.close_timeout,
-    ));
+    )));
     let (client, connection) = match connect_h2(client_io, config).await {
         Ok(connection) => connection,
-        Err(error) => {
-            bridge_task.abort();
-            return Err(error);
-        }
+        Err(error) => return Err(error),
     };
 
     let state = Arc::new(SessionState::new());
     let driver_state = Arc::clone(&state);
+    let (shutdown, mut shutdown_signal) = watch::channel(false);
+    let mut bridge_task = bridge_task.take();
     tokio::spawn(async move {
         let result = tokio::select! {
             result = connection => {
                 bridge_task.abort();
-                let _ = bridge_task.await;
-                result.map_err(Error::from)
+                let _ = (&mut bridge_task).await;
+                Some(result.map_err(Error::from))
             },
-            result = &mut bridge_task => match result {
+            result = &mut bridge_task => Some(match result {
                 Ok(result) => result,
                 Err(error) => Err(Error::Io(std::io::Error::other(
                     format!("WebSocket bridge task failed: {error}"),
                 ))),
-            },
+            }),
+            _ = shutdown_signal.changed() => None,
+        };
+        let result = match result {
+            Some(result) => result,
+            None => {
+                if tokio::time::timeout(
+                    config.close_timeout.saturating_add(Duration::from_secs(1)),
+                    &mut bridge_task,
+                )
+                    .await
+                    .is_err()
+                {
+                    bridge_task.abort();
+                    let _ = bridge_task.await;
+                }
+                Ok(())
+            }
         };
         driver_state.finish(result).await;
     });
@@ -727,6 +769,7 @@ where
             client: Arc::new(Mutex::new(client)),
         },
         state,
+        shutdown,
     })
 }
 
@@ -827,12 +870,12 @@ where
 {
     config.validate()?;
     let (server_io, bridge_io) = tokio::io::duplex(config.duplex_capacity);
-    let bridge_task = tokio::spawn(bridge(
+    let mut bridge_task = AbortOnDrop::new(tokio::spawn(bridge(
         websocket,
         bridge_io,
         config.bridge_buffer_size,
         config.close_timeout,
-    ));
+    )));
     let mut builder = server::Builder::new();
     builder
         .initial_window_size(config.h2_initial_stream_window_size)
@@ -841,11 +884,9 @@ where
         .max_concurrent_streams(config.h2_max_concurrent_requests);
     let connection = match builder.handshake(server_io).await {
         Ok(connection) => connection,
-        Err(error) => {
-            bridge_task.abort();
-            return Err(error.into());
-        }
+        Err(error) => return Err(error.into()),
     };
+    let bridge_task = bridge_task.take();
     let (requests, request_queue) = mpsc::channel(config.request_queue_capacity);
     let (shutdown, shutdown_signal) = tokio::sync::oneshot::channel();
     let state = Arc::new(SessionState::new());

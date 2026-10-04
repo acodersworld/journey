@@ -87,6 +87,7 @@ struct WebSocketConnectionState {
 struct ConnectionState {
     generation: u64,
     sender: Option<SendRequest<Bytes>>,
+    driver: Option<tokio::task::JoinHandle<()>>,
 }
 
 impl H2cStorageClient {
@@ -105,6 +106,7 @@ impl H2cStorageClient {
             connection: Arc::new(Mutex::new(ConnectionState {
                 generation: 0,
                 sender: None,
+                driver: None,
             })),
         };
         let mut state = client.connection.lock().await;
@@ -117,6 +119,9 @@ impl H2cStorageClient {
     }
 
     async fn connect_sender(&self, state: &mut ConnectionState) -> Result<(), String> {
+        if let Some(driver) = state.driver.take() {
+            driver.abort();
+        }
         let mut builder = client::Builder::new();
         builder
             .initial_window_size(self.initial_window_size)
@@ -135,7 +140,7 @@ impl H2cStorageClient {
         state.generation = generation;
         state.sender = Some(sender);
         let shared_connection = Arc::clone(&self.connection);
-        tokio::spawn(async move {
+        let driver = tokio::spawn(async move {
             if let Err(error) = connection.await {
                 eprintln!("storage h2c connection ended: {error}");
             }
@@ -144,7 +149,20 @@ impl H2cStorageClient {
                 state.sender = None;
             }
         });
+        state.driver = Some(driver);
         Ok(())
+    }
+
+    pub async fn close(&self) {
+        let driver = {
+            let mut state = self.connection.lock().await;
+            state.sender = None;
+            state.driver.take()
+        };
+        if let Some(driver) = driver {
+            driver.abort();
+            let _ = driver.await;
+        }
     }
 
     async fn start_request(
@@ -209,6 +227,7 @@ impl WebSocketStorageClient {
     pub async fn serve_connection<S>(
         &self,
         websocket: tokio_tungstenite::WebSocketStream<S>,
+        mut shutdown: crate::shutdown::Receiver,
     ) -> Result<(), String>
     where
         S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
@@ -218,9 +237,11 @@ impl WebSocketStorageClient {
             h2_initial_connection_window_size: self.initial_connection_window_size,
             ..Config::default()
         };
-        let session = connect_client(websocket, config)
-            .await
-            .map_err(|error| error.to_string())?;
+        let session = tokio::select! {
+            result = connect_client(websocket, config) => result.map_err(|error| error.to_string())?,
+            signal = crate::shutdown::requested(&mut shutdown) => return signal,
+        };
+        let _close_guard = ClientSessionCloseGuard(session.clone());
         let generation = {
             let mut state = self.connection.lock().await;
             state.generation = state
@@ -231,7 +252,16 @@ impl WebSocketStorageClient {
             state.generation
         };
         println!("site storage WebSocket session connected");
-        let result = session.wait().await.map_err(|error| error.to_string());
+        let result = tokio::select! {
+            result = session.wait() => result.map_err(|error| error.to_string()),
+            signal = crate::shutdown::requested(&mut shutdown) => {
+                session.close();
+                match session.wait().await {
+                    Ok(()) => signal,
+                    Err(error) => Err(error.to_string()),
+                }
+            }
+        };
         let mut state = self.connection.lock().await;
         if state.generation == generation {
             state.sender = None;
@@ -259,6 +289,22 @@ impl WebSocketStorageClient {
         ready
             .send_request(request, end_of_stream)
             .map_err(|error| error.to_string())
+    }
+}
+
+impl SiteStorageClient {
+    pub async fn close(&self) {
+        if let Self::H2c(client) = self {
+            client.close().await;
+        }
+    }
+}
+
+struct ClientSessionCloseGuard(journey_websocket::ClientSession);
+
+impl Drop for ClientSessionCloseGuard {
+    fn drop(&mut self) {
+        self.0.close();
     }
 }
 

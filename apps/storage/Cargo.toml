@@ -9,4 +9,4 @@ journey-websocket = { path = "../../crates/journey-websocket" }
 http = "1"
 serde = { version = "1", features = ["derive"] }
 toml = "0.8"
-tokio = { version = "1", features = ["fs", "io-util", "macros", "net", "rt-multi-thread", "sync", "time"] }
+tokio = { version = "1", features = ["fs", "io-util", "macros", "net", "rt-multi-thread", "signal", "sync", "time"] }

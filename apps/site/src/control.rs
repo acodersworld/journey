@@ -12,6 +12,7 @@ use tokio::{
 use crate::{
     db::Database,
     import::{self, ImportResult},
+    shutdown,
     storage::StorageClient,
 };
 
@@ -58,20 +59,69 @@ pub async fn bind(socket_path: &Path) -> AppResult<UnixListener> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        tokio::fs::set_permissions(&socket_path, std::fs::Permissions::from_mode(0o600)).await?;
+        if let Err(error) = tokio::fs::set_permissions(&socket_path, std::fs::Permissions::from_mode(0o600)).await {
+            drop(listener);
+            let _ = tokio::fs::remove_file(socket_path).await;
+            return Err(error.into());
+        }
     }
     Ok(listener)
+}
+
+pub struct BoundSocketPath {
+    path: PathBuf,
+    bound: bool,
+}
+
+impl BoundSocketPath {
+    pub fn new(path: PathBuf) -> Self {
+        Self { path, bound: true }
+    }
+
+    pub async fn remove(&mut self) -> std::io::Result<()> {
+        if !self.bound {
+            return Ok(());
+        }
+        match tokio::fs::remove_file(&self.path).await {
+            Ok(()) => self.bound = false,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => self.bound = false,
+            Err(error) => return Err(error),
+        }
+        Ok(())
+    }
+}
+
+impl Drop for BoundSocketPath {
+    fn drop(&mut self) {
+        if self.bound {
+            let _ = std::fs::remove_file(&self.path);
+        }
+    }
 }
 
 pub async fn serve<S: StorageClient>(
     listener: UnixListener,
     database: Database,
     storage: S,
+    mut shutdown: shutdown::Receiver,
 ) -> std::io::Result<()> {
     loop {
-        let (stream, _) = listener.accept().await?;
-        if let Err(error) = handle(stream, &database, &storage).await {
-            eprintln!("site control request failed: {error}");
+        let (stream, _) = tokio::select! {
+            result = listener.accept() => result?,
+            result = shutdown::requested(&mut shutdown) => {
+                return result.map_err(std::io::Error::other);
+            }
+        };
+        tokio::select! {
+            biased;
+            result = handle(stream, &database, &storage) => {
+                if let Err(error) = result {
+                    eprintln!("site control request failed: {error}");
+                }
+            }
+            result = shutdown::requested(&mut shutdown) => {
+                return result.map_err(std::io::Error::other);
+            }
         }
     }
 }

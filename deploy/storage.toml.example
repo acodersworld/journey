@@ -1,7 +1,7 @@
 # Storage runtime configuration. Copy to storage.toml and edit before starting.
 
 [storage]
-object_dir = "/home/ben/src/journey/apps/storage/db"
+object_dir = "/tmp"
 initial_stream_window_size = 33554432
 initial_connection_window_size = 67108864
 thumbnail_time_ms = 0
