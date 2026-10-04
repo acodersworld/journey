@@ -35,6 +35,8 @@ const DEFAULT_MAX_FRAME_SIZE: usize = 256 * 1024;
 const DEFAULT_WRITE_BUFFER_SIZE: usize = 16 * 1024;
 const DEFAULT_MAX_WRITE_BUFFER_SIZE: usize = 512 * 1024;
 const DEFAULT_CLOSE_TIMEOUT: Duration = Duration::from_secs(5);
+const DEFAULT_PING_INTERVAL: Duration = Duration::from_secs(30);
+const DEFAULT_PONG_TIMEOUT: Duration = Duration::from_secs(10);
 const DEFAULT_H2_INITIAL_STREAM_WINDOW_SIZE: u32 = 64 * 1024;
 const DEFAULT_H2_INITIAL_CONNECTION_WINDOW_SIZE: u32 = 512 * 1024;
 const MAX_H2_WINDOW_SIZE: u32 = (1 << 31) - 1;
@@ -86,6 +88,10 @@ pub struct Config {
     /// Maximum time to wait for a queued WebSocket close command and local
     /// write-half shutdown. Expiration tears down the bridge cleanly.
     pub close_timeout: Duration,
+    /// Maximum idle time before an outbound WebSocket sends a Ping control frame.
+    pub ping_interval: Duration,
+    /// Maximum time to wait for a matching Pong after an outbound Ping.
+    pub pong_timeout: Duration,
     /// Initial per-stream HTTP/2 receive window in bytes.
     ///
     /// Increase this to let one stream make more progress before flow control
@@ -132,6 +138,8 @@ impl Default for Config {
             write_buffer_size: DEFAULT_WRITE_BUFFER_SIZE,
             max_write_buffer_size: DEFAULT_MAX_WRITE_BUFFER_SIZE,
             close_timeout: DEFAULT_CLOSE_TIMEOUT,
+            ping_interval: DEFAULT_PING_INTERVAL,
+            pong_timeout: DEFAULT_PONG_TIMEOUT,
             h2_initial_stream_window_size: DEFAULT_H2_INITIAL_STREAM_WINDOW_SIZE,
             h2_initial_connection_window_size: DEFAULT_H2_INITIAL_CONNECTION_WINDOW_SIZE,
             h2_max_header_list_size: DEFAULT_H2_MAX_HEADER_LIST_SIZE,
@@ -175,6 +183,12 @@ impl Config {
         }
         if self.close_timeout.is_zero() {
             return Err(Error::Configuration("close timeout must be greater than zero"));
+        }
+        if self.ping_interval.is_zero() {
+            return Err(Error::Configuration("ping interval must be greater than zero"));
+        }
+        if self.pong_timeout.is_zero() {
+            return Err(Error::Configuration("pong timeout must be greater than zero"));
         }
         if !(1..=MAX_H2_WINDOW_SIZE).contains(&self.h2_initial_stream_window_size) {
             return Err(Error::Configuration(
@@ -272,6 +286,10 @@ impl From<tokio_tungstenite::tungstenite::Error> for Error {
 
 enum WriterCommand {
     Binary(Bytes),
+    Ping {
+        payload: Bytes,
+        sent: tokio::sync::oneshot::Sender<()>,
+    },
     Pong(Bytes),
     Close {
         frame: Option<CloseFrame>,
@@ -282,13 +300,21 @@ enum WriterCommand {
 async fn websocket_writer<S>(
     mut websocket_write: futures_util::stream::SplitSink<WebSocketStream<S>, Message>,
     mut commands: mpsc::Receiver<WriterCommand>,
+    activity: watch::Sender<tokio::time::Instant>,
 ) -> Result<(), Error>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
     while let Some(command) = commands.recv().await {
         match command {
-            WriterCommand::Binary(data) => websocket_write.send(Message::Binary(data)).await?,
+            WriterCommand::Binary(data) => {
+                websocket_write.send(Message::Binary(data)).await?;
+                activity.send_replace(tokio::time::Instant::now());
+            }
+            WriterCommand::Ping { payload, sent } => {
+                websocket_write.send(Message::Ping(payload)).await?;
+                let _ = sent.send(());
+            }
             WriterCommand::Pong(data) => websocket_write.send(Message::Pong(data)).await?,
             WriterCommand::Close { frame, completed } => {
                 let result = websocket_write.send(Message::Close(frame)).await;
@@ -379,6 +405,8 @@ async fn websocket_to_local<S, T>(
     mut websocket_read: futures_util::stream::SplitStream<WebSocketStream<S>>,
     mut io_write: tokio::io::WriteHalf<T>,
     commands: mpsc::Sender<WriterCommand>,
+    activity: watch::Sender<tokio::time::Instant>,
+    pongs: mpsc::Sender<Bytes>,
     close_timeout: Duration,
 ) -> Result<(), Error>
 where
@@ -387,7 +415,12 @@ where
 {
     while let Some(message) = websocket_read.next().await {
         match message? {
-            Message::Binary(data) => io_write.write_all(&data).await?,
+            Message::Binary(data) => {
+                io_write.write_all(&data).await?;
+                if !data.is_empty() {
+                    activity.send_replace(tokio::time::Instant::now());
+                }
+            }
             Message::Ping(data) => {
                 commands
                     .send(WriterCommand::Pong(data))
@@ -399,7 +432,9 @@ where
                         ))
                     })?;
             }
-            Message::Pong(_) => {}
+            Message::Pong(data) => {
+                let _ = pongs.send(data).await;
+            }
             Message::Close(frame) => {
                 close_websocket(&commands, frame, close_timeout).await;
                 return shutdown_local(io_write, close_timeout).await;
@@ -414,7 +449,121 @@ where
     shutdown_local(io_write, close_timeout).await
 }
 
+fn heartbeat_timeout(message: &'static str) -> Error {
+    Error::Io(std::io::Error::new(std::io::ErrorKind::TimedOut, message))
+}
+
+async fn outbound_heartbeat(
+    commands: mpsc::Sender<WriterCommand>,
+    mut activity: watch::Receiver<tokio::time::Instant>,
+    mut pongs: mpsc::Receiver<Bytes>,
+    ping_interval: Duration,
+    pong_timeout: Duration,
+) -> Result<(), Error> {
+    let mut next_ping = tokio::time::Instant::now() + ping_interval;
+    let mut sequence = 0_u64;
+
+    loop {
+        tokio::select! {
+            _ = tokio::time::sleep_until(next_ping) => {
+                let activity_deadline = *activity.borrow_and_update() + ping_interval;
+                if activity_deadline > tokio::time::Instant::now() {
+                    next_ping = activity_deadline;
+                    continue;
+                }
+                sequence = sequence.checked_add(1).ok_or_else(|| {
+                    Error::Protocol("WebSocket heartbeat Ping sequence exhausted")
+                })?;
+                let payload = Bytes::copy_from_slice(&sequence.to_be_bytes());
+                let (sent, sent_result) = tokio::sync::oneshot::channel();
+                let send = async {
+                    commands.send(WriterCommand::Ping { payload: payload.clone(), sent })
+                        .await
+                        .map_err(|_| Error::Io(std::io::Error::new(
+                            std::io::ErrorKind::BrokenPipe,
+                            "WebSocket writer stopped before heartbeat Ping",
+                        )))?;
+                    sent_result.await.map_err(|_| Error::Io(std::io::Error::new(
+                        std::io::ErrorKind::BrokenPipe,
+                        "WebSocket writer failed to send heartbeat Ping",
+                    )))
+                };
+                tokio::time::timeout(pong_timeout, send)
+                    .await
+                    .map_err(|_| heartbeat_timeout("WebSocket heartbeat Ping send timed out"))??;
+
+                let wait_for_pong = async {
+                    loop {
+                        match pongs.recv().await {
+                            Some(received) if received == payload => break,
+                            Some(_) => {}
+                            None => return std::future::pending::<Result<(), Error>>().await,
+                        }
+                    }
+                    Ok(())
+                };
+                tokio::time::timeout(pong_timeout, wait_for_pong)
+                    .await
+                    .map_err(|_| heartbeat_timeout("WebSocket heartbeat Pong timed out"))??;
+                let _ = activity.borrow_and_update();
+                next_ping = tokio::time::Instant::now() + ping_interval;
+            }
+            changed = activity.changed() => {
+                if changed.is_err() {
+                    return std::future::pending::<Result<(), Error>>().await;
+                }
+                next_ping = *activity.borrow_and_update() + ping_interval;
+            }
+            pong = pongs.recv() => {
+                if pong.is_none() {
+                    return std::future::pending::<Result<(), Error>>().await;
+                }
+            }
+        }
+    }
+}
+
+/// A WebSocket connection that retains whether this crate opened it, so its
+/// HTTP/2 session can apply outbound-only heartbeat rules. Pass the value
+/// returned by [`connect_websocket`] directly to [`connect_client`] or
+/// [`server_session`] to preserve its outbound role.
+pub struct WebSocketConnection<S> {
+    websocket: WebSocketStream<S>,
+    outbound: bool,
+}
+
+impl<S> WebSocketConnection<S> {
+    fn outbound(websocket: WebSocketStream<S>) -> Self {
+        Self { websocket, outbound: true }
+    }
+
+    fn into_parts(self) -> (WebSocketStream<S>, bool) {
+        (self.websocket, self.outbound)
+    }
+}
+
+impl<S> From<WebSocketStream<S>> for WebSocketConnection<S> {
+    fn from(websocket: WebSocketStream<S>) -> Self {
+        Self { websocket, outbound: false }
+    }
+}
+
+impl<S> std::ops::Deref for WebSocketConnection<S> {
+    type Target = WebSocketStream<S>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.websocket
+    }
+}
+
+impl<S> std::ops::DerefMut for WebSocketConnection<S> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.websocket
+    }
+}
+
 /// Pumps a WebSocket and byte stream in both directions.
+#[cfg(test)]
 async fn bridge<S, T>(
     websocket: WebSocketStream<S>,
     io: T,
@@ -425,24 +574,64 @@ where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     T: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
+    bridge_with_role(
+        websocket,
+        io,
+        Config {
+            bridge_buffer_size: buffer_size,
+            close_timeout,
+            ..Config::default()
+        },
+        false,
+    )
+    .await
+}
+
+async fn bridge_with_role<S, T>(
+    websocket: WebSocketStream<S>,
+    io: T,
+    config: Config,
+    outbound: bool,
+) -> Result<(), Error>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+    T: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
     let (websocket_write, websocket_read) = websocket.split();
     let (io_read, io_write) = tokio::io::split(io);
     let (commands, command_queue) = mpsc::channel(WRITER_CHANNEL_CAPACITY);
+    let (activity, activity_state) = watch::channel(tokio::time::Instant::now());
+    let (pong_sender, pongs) = mpsc::channel(WRITER_CHANNEL_CAPACITY);
     let mut tasks = JoinSet::new();
 
-    tasks.spawn(websocket_writer(websocket_write, command_queue));
+    tasks.spawn(websocket_writer(
+        websocket_write,
+        command_queue,
+        activity.clone(),
+    ));
     tasks.spawn(local_to_websocket(
         io_read,
         commands.clone(),
-        buffer_size,
-        close_timeout,
+        config.bridge_buffer_size,
+        config.close_timeout,
     ));
     tasks.spawn(websocket_to_local(
         websocket_read,
         io_write,
-        commands,
-        close_timeout,
+        commands.clone(),
+        activity.clone(),
+        pong_sender,
+        config.close_timeout,
     ));
+    if outbound {
+        tasks.spawn(outbound_heartbeat(
+            commands,
+            activity_state,
+            pongs,
+            config.ping_interval,
+            config.pong_timeout,
+        ));
+    }
 
     let result = match tasks.join_next().await {
         Some(Ok(result)) => result,
@@ -527,12 +716,15 @@ where
 }
 
 /// Connects a WebSocket with the transport's limits and subprotocol.
+///
+/// The returned [`WebSocketConnection`] retains its outbound role when passed
+/// to either HTTP/2 session constructor.
 pub async fn connect_websocket<R>(
     request: R,
     config: Config,
 ) -> Result<
     (
-        WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>,
+        WebSocketConnection<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>,
         tokio_tungstenite::tungstenite::handshake::client::Response,
     ),
     Error,
@@ -554,7 +746,7 @@ pub async fn connect_websocket_with_connector<R>(
     connector: Option<Connector>,
 ) -> Result<
     (
-        WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>,
+        WebSocketConnection<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>,
         tokio_tungstenite::tungstenite::handshake::client::Response,
     ),
     Error,
@@ -585,7 +777,7 @@ where
         return Err(Error::Protocol("WebSocket subprotocol negotiation failed"));
     }
 
-    Ok((websocket, response))
+    Ok((WebSocketConnection::outbound(websocket), response))
 }
 
 struct SessionState {
@@ -706,20 +898,22 @@ async fn connect_h2(
 /// during the WebSocket handshake. This function cannot retroactively constrain
 /// allocations made during that handshake. Prefer [`connect`] or
 /// [`connect_websocket`] when this crate should own those defaults.
-pub async fn connect_client<S>(
-    websocket: WebSocketStream<S>,
+pub async fn connect_client<S, W>(
+    websocket: W,
     config: Config,
 ) -> Result<ClientSession, Error>
 where
+    W: Into<WebSocketConnection<S>>,
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
     config.validate()?;
+    let (websocket, outbound) = websocket.into().into_parts();
     let (client_io, bridge_io) = tokio::io::duplex(config.duplex_capacity);
-    let mut bridge_task = AbortOnDrop::new(tokio::spawn(bridge(
+    let mut bridge_task = AbortOnDrop::new(tokio::spawn(bridge_with_role(
         websocket,
         bridge_io,
-        config.bridge_buffer_size,
-        config.close_timeout,
+        config,
+        outbound,
     )));
     let (client, connection) = match connect_h2(client_io, config).await {
         Ok(connection) => connection,
@@ -861,20 +1055,22 @@ async fn run_server_connection(
 /// during the WebSocket handshake. This function cannot retroactively constrain
 /// allocations made during that handshake. Prefer [`accept_server`] or
 /// [`accept_websocket`] when this crate should own those defaults.
-pub async fn server_session<S>(
-    websocket: WebSocketStream<S>,
+pub async fn server_session<S, W>(
+    websocket: W,
     config: Config,
 ) -> Result<ServerSession, Error>
 where
+    W: Into<WebSocketConnection<S>>,
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
     config.validate()?;
+    let (websocket, outbound) = websocket.into().into_parts();
     let (server_io, bridge_io) = tokio::io::duplex(config.duplex_capacity);
-    let mut bridge_task = AbortOnDrop::new(tokio::spawn(bridge(
+    let mut bridge_task = AbortOnDrop::new(tokio::spawn(bridge_with_role(
         websocket,
         bridge_io,
-        config.bridge_buffer_size,
-        config.close_timeout,
+        config,
+        outbound,
     )));
     let mut builder = server::Builder::new();
     builder
@@ -960,6 +1156,50 @@ mod tests {
                 self.pending.notify_waiters();
             }
             result
+        }
+
+        fn poll_flush(
+            mut self: Pin<&mut Self>,
+            context: &mut Context<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            Pin::new(&mut self.inner).poll_flush(context)
+        }
+
+        fn poll_shutdown(
+            mut self: Pin<&mut Self>,
+            context: &mut Context<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            Pin::new(&mut self.inner).poll_shutdown(context)
+        }
+    }
+
+    struct SwitchableStalledWrite {
+        inner: DuplexStream,
+        stalled: Arc<AtomicBool>,
+        pending: Arc<Notify>,
+    }
+
+    impl AsyncRead for SwitchableStalledWrite {
+        fn poll_read(
+            mut self: Pin<&mut Self>,
+            context: &mut Context<'_>,
+            buffer: &mut tokio::io::ReadBuf<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            Pin::new(&mut self.inner).poll_read(context, buffer)
+        }
+    }
+
+    impl AsyncWrite for SwitchableStalledWrite {
+        fn poll_write(
+            mut self: Pin<&mut Self>,
+            context: &mut Context<'_>,
+            buffer: &[u8],
+        ) -> Poll<std::io::Result<usize>> {
+            if self.stalled.load(Ordering::SeqCst) {
+                self.pending.notify_waiters();
+                return Poll::Pending;
+            }
+            Pin::new(&mut self.inner).poll_write(context, buffer)
         }
 
         fn poll_flush(
@@ -1162,6 +1402,50 @@ mod tests {
         )
     }
 
+    async fn websocket_pair_with_switchable_stalled_write(
+        config: Config,
+    ) -> (
+        WebSocketStream<DuplexStream>,
+        WebSocketStream<SwitchableStalledWrite>,
+        Arc<AtomicBool>,
+        Arc<Notify>,
+    ) {
+        let (client_io, server_io) = duplex(1024 * 1024);
+        let stalled = Arc::new(AtomicBool::new(false));
+        let pending = Arc::new(Notify::new());
+        let server_stalled = Arc::clone(&stalled);
+        let server_pending = Arc::clone(&pending);
+        let client = tokio::spawn(async move {
+            let mut request = "ws://localhost".into_client_request().expect("request");
+            request.headers_mut().insert(
+                "Sec-WebSocket-Protocol",
+                HeaderValue::from_static(SUBPROTOCOL),
+            );
+            client_async_with_config(request, client_io, Some(config.websocket_config()))
+                .await
+                .expect("client websocket handshake")
+                .0
+        });
+        let server = tokio::spawn(async move {
+            accept_websocket(
+                SwitchableStalledWrite {
+                    inner: server_io,
+                    stalled: server_stalled,
+                    pending: server_pending,
+                },
+                config,
+            )
+            .await
+            .expect("server websocket handshake")
+        });
+        (
+            client.await.expect("client task"),
+            server.await.expect("server task"),
+            stalled,
+            pending,
+        )
+    }
+
     async fn read_body(mut body: h2::RecvStream) -> Bytes {
         let mut result = Vec::new();
         while let Some(chunk) = body.data().await {
@@ -1257,6 +1541,202 @@ mod tests {
             .expect("bridge task timed out")
             .expect("bridge task")
             .is_ok());
+    }
+
+    #[tokio::test]
+    async fn outbound_heartbeat_sends_pings_after_idle_and_restarts_after_matching_pongs() {
+        let config = Config {
+            ping_interval: Duration::from_millis(120),
+            pong_timeout: Duration::from_millis(200),
+            ..Config::default()
+        };
+        let (mut remote, websocket) = websocket_pair(config).await;
+        let (mut application, bridge_io) = duplex(64);
+        let bridge = tokio::spawn(bridge_with_role(websocket, bridge_io, config, true));
+
+        tokio::time::sleep(Duration::from_millis(60)).await;
+        remote
+            .send(Message::Binary(Bytes::from_static(b"inbound activity")))
+            .await
+            .expect("send inbound HTTP/2 bytes");
+        let mut received = vec![0; b"inbound activity".len()];
+        application
+            .read_exact(&mut received)
+            .await
+            .expect("read inbound HTTP/2 bytes");
+        assert_eq!(received, b"inbound activity");
+        assert!(timeout(Duration::from_millis(70), remote.next()).await.is_err());
+
+        let first_ping = timeout(Duration::from_millis(100), remote.next())
+            .await
+            .expect("idle Ping timed out")
+            .expect("WebSocket ended")
+            .expect("WebSocket read");
+        let first_payload = match first_ping {
+            Message::Ping(payload) => payload,
+            message => panic!("expected heartbeat Ping, got {message:?}"),
+        };
+        remote
+            .send(Message::Pong(first_payload.clone()))
+            .await
+            .expect("send matching Pong");
+
+        application
+            .write_all(b"outbound activity")
+            .await
+            .expect("write outbound HTTP/2 bytes");
+        let mut sent = Vec::new();
+        while sent.len() < b"outbound activity".len() {
+            match timeout(Duration::from_millis(100), remote.next())
+                .await
+                .expect("outbound data timed out")
+                .expect("WebSocket ended")
+                .expect("WebSocket read")
+            {
+                Message::Binary(data) => sent.extend_from_slice(&data),
+                message => panic!("unexpected WebSocket message: {message:?}"),
+            }
+        }
+        assert_eq!(sent, b"outbound activity");
+        assert!(timeout(Duration::from_millis(70), remote.next()).await.is_err());
+
+        let second_ping = timeout(Duration::from_millis(100), remote.next())
+            .await
+            .expect("next idle Ping timed out")
+            .expect("WebSocket ended")
+            .expect("WebSocket read");
+        match second_ping {
+            Message::Ping(payload) => assert_ne!(payload, first_payload),
+            message => panic!("expected heartbeat Ping, got {message:?}"),
+        }
+        bridge.abort();
+        let _ = bridge.await;
+    }
+
+    #[tokio::test]
+    async fn accepted_websockets_do_not_send_periodic_pings() {
+        let config = Config {
+            ping_interval: Duration::from_millis(20),
+            pong_timeout: Duration::from_millis(50),
+            ..Config::default()
+        };
+        let (mut remote, websocket) = websocket_pair(config).await;
+        let (_application, bridge_io) = duplex(64);
+        let bridge = tokio::spawn(bridge_with_role(websocket, bridge_io, config, false));
+
+        assert!(timeout(Duration::from_millis(60), remote.next()).await.is_err());
+        bridge.abort();
+        let _ = bridge.await;
+    }
+
+    #[tokio::test]
+    async fn incoming_websocket_pings_are_answered_for_both_connection_roles() {
+        let config = Config {
+            ping_interval: Duration::from_secs(1),
+            ..Config::default()
+        };
+        for outbound in [false, true] {
+            let (mut remote, websocket) = websocket_pair(config).await;
+            let (_application, bridge_io) = duplex(64);
+            let bridge = tokio::spawn(bridge_with_role(websocket, bridge_io, config, outbound));
+            remote
+                .send(Message::Ping(Bytes::from_static(b"peer ping")))
+                .await
+                .expect("send WebSocket Ping");
+            match timeout(Duration::from_millis(100), remote.next())
+                .await
+                .expect("Pong response timed out")
+                .expect("WebSocket ended")
+                .expect("WebSocket read")
+            {
+                Message::Pong(payload) => assert_eq!(payload, Bytes::from_static(b"peer ping")),
+                message => panic!("expected Pong, got {message:?}"),
+            }
+            bridge.abort();
+            let _ = bridge.await;
+        }
+    }
+
+    #[tokio::test]
+    async fn mismatched_pong_does_not_clear_the_heartbeat_deadline() {
+        let config = Config {
+            ping_interval: Duration::from_millis(10),
+            pong_timeout: Duration::from_millis(50),
+            ..Config::default()
+        };
+        let (mut remote, websocket) = websocket_pair(config).await;
+        let (_application, bridge_io) = duplex(64);
+        let bridge = tokio::spawn(bridge_with_role(websocket, bridge_io, config, true));
+        let ping = timeout(Duration::from_millis(100), remote.next())
+            .await
+            .expect("heartbeat Ping timed out")
+            .expect("WebSocket ended")
+            .expect("WebSocket read");
+        let payload = match ping {
+            Message::Ping(payload) => payload,
+            message => panic!("expected heartbeat Ping, got {message:?}"),
+        };
+        remote
+            .send(Message::Pong(Bytes::from_static(b"wrong payload")))
+            .await
+            .expect("send mismatched Pong");
+
+        let result = timeout(Duration::from_millis(100), bridge)
+            .await
+            .expect("mismatched Pong did not reach deadline")
+            .expect("bridge task");
+        assert!(matches!(result, Err(Error::Io(error)) if error.kind() == std::io::ErrorKind::TimedOut));
+        assert_ne!(payload, Bytes::from_static(b"wrong payload"));
+    }
+
+    #[tokio::test]
+    async fn missing_pong_ends_the_outbound_bridge() {
+        let config = Config {
+            ping_interval: Duration::from_millis(10),
+            pong_timeout: Duration::from_millis(40),
+            ..Config::default()
+        };
+        let (mut remote, websocket) = websocket_pair(config).await;
+        let (_application, bridge_io) = duplex(64);
+        let bridge = tokio::spawn(bridge_with_role(websocket, bridge_io, config, true));
+        assert!(matches!(
+            timeout(Duration::from_millis(100), remote.next())
+                .await
+                .expect("heartbeat Ping timed out")
+                .expect("WebSocket ended")
+                .expect("WebSocket read"),
+            Message::Ping(_)
+        ));
+
+        let result = timeout(Duration::from_millis(100), bridge)
+            .await
+            .expect("missing Pong did not reach deadline")
+            .expect("bridge task");
+        assert!(matches!(result, Err(Error::Io(error)) if error.kind() == std::io::ErrorKind::TimedOut));
+    }
+
+    #[tokio::test]
+    async fn stalled_ping_send_is_bounded_by_the_pong_timeout() {
+        let config = Config {
+            ping_interval: Duration::from_millis(10),
+            pong_timeout: Duration::from_millis(40),
+            ..Config::default()
+        };
+        let (_remote, websocket, stalled, pending) =
+            websocket_pair_with_switchable_stalled_write(config).await;
+        let (_application, bridge_io) = duplex(64);
+        let pending_write = pending.notified();
+        let bridge = tokio::spawn(bridge_with_role(websocket, bridge_io, config, true));
+        stalled.store(true, Ordering::SeqCst);
+        timeout(Duration::from_millis(100), pending_write)
+            .await
+            .expect("heartbeat Ping send did not stall");
+
+        let result = timeout(Duration::from_millis(100), bridge)
+            .await
+            .expect("stalled Ping send did not reach deadline")
+            .expect("bridge task");
+        assert!(matches!(result, Err(Error::Io(error)) if error.kind() == std::io::ErrorKind::TimedOut));
     }
 
     #[tokio::test]
@@ -1980,6 +2460,41 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn heartbeat_timings_have_documented_defaults_and_accept_custom_values() {
+        let default_config = Config::default();
+        assert_eq!(default_config.ping_interval, Duration::from_secs(30));
+        assert_eq!(default_config.pong_timeout, Duration::from_secs(10));
+
+        let custom_config = Config {
+            ping_interval: Duration::from_millis(250),
+            pong_timeout: Duration::from_millis(75),
+            ..Config::default()
+        };
+        assert!(custom_config.validate().is_ok());
+    }
+
+    #[tokio::test]
+    async fn zero_heartbeat_timings_are_rejected() {
+        let zero_ping_interval = Config {
+            ping_interval: Duration::ZERO,
+            ..Config::default()
+        };
+        assert!(matches!(
+            zero_ping_interval.validate(),
+            Err(Error::Configuration("ping interval must be greater than zero"))
+        ));
+
+        let zero_pong_timeout = Config {
+            pong_timeout: Duration::ZERO,
+            ..Config::default()
+        };
+        assert!(matches!(
+            zero_pong_timeout.validate(),
+            Err(Error::Configuration("pong timeout must be greater than zero"))
+        ));
+    }
+
+    #[tokio::test]
     async fn invalid_http2_and_request_queue_limits_are_rejected() {
         for config in [
             Config {
@@ -2359,10 +2874,8 @@ mod tests {
             drop(websocket);
         });
 
-        let error = connect_websocket(&format!("ws://{address}"), config)
-            .await
-            .expect_err("missing selected subprotocol must fail");
-        assert!(matches!(error, Error::WebSocket(_)), "error: {error:?}");
+        let result = connect_websocket(&format!("ws://{address}"), config).await;
+        assert!(matches!(result, Err(Error::WebSocket(_))));
         server.await.expect("server task");
     }
 
