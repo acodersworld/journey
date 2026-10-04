@@ -2099,7 +2099,7 @@ fn render_standalone_block(
             let media_url = media_url(media_prefix, post_id, block.id);
             let thumbnail_url = video_thumbnail_url(&media_url);
             html.push_str(&format!(
-                "<figure class=\"single-media\">{}<video controls preload=\"none\" poster=\"{}\" aria-label=\"{}\"><source src=\"{}\" type=\"{}\"></video><a class=\"media-download\" href=\"{}?download=1\">Download original</a>{}</figure>",
+                "<figure class=\"single-media\">{}<div class=\"video-player single-media-player\"><video data-video-controls controls preload=\"none\" poster=\"{}\" aria-label=\"{}\"><source src=\"{}\" type=\"{}\"></video></div><a class=\"media-download\" href=\"{}?download=1\">Download original</a>{}</figure>",
                 render_media_label(block.header.as_deref()),
                 escape_html(&thumbnail_url),
                 escape_html(&media_accessible_label(block.header.as_deref(), block.body.as_deref(), "video")),

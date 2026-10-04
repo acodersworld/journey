@@ -586,6 +586,10 @@ body.sidebar-modal-open {
   object-fit: contain;
 }
 
+.draft-media-preview .draft-video-player {
+  width: 100%;
+}
+
 .draft-media-preview .draft-video-placeholder {
   min-height: 6rem;
   aspect-ratio: 4 / 3;
@@ -1141,7 +1145,67 @@ video {
   height: auto;
 }
 
-.single-media > video {
+.video-player {
+  position: relative;
+  width: fit-content;
+  max-width: 100%;
+  background: #070807;
+}
+
+.video-play-toggle {
+  position: absolute;
+  z-index: 1;
+  inset: 0 0 3.5rem;
+  display: grid;
+  width: 100%;
+  place-items: center;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  color: #f0efe9;
+  cursor: pointer;
+  appearance: none;
+  font: inherit;
+  touch-action: manipulation;
+}
+
+.video-play-toggle-icon {
+  display: grid;
+  width: 3.25rem;
+  aspect-ratio: 1;
+  place-items: center;
+  border: 1px solid #d0d1ca;
+  border-radius: 50%;
+  background: rgb(17 19 17 / 78%);
+  font-size: 1.45rem;
+  line-height: 1;
+}
+
+.video-play-toggle:hover .video-play-toggle-icon {
+  border-color: #d2b17b;
+  background: #2a2c26;
+}
+
+.video-play-toggle[data-playing="true"] .video-play-toggle-icon {
+  opacity: 0;
+}
+
+.video-play-toggle:focus-visible {
+  outline: none;
+}
+
+.video-play-toggle:focus-visible .video-play-toggle-icon {
+  opacity: 1;
+  outline: 3px solid #d2b17b;
+  outline-offset: 3px;
+}
+
+.single-media > .video-player {
+  width: 100%;
+  max-height: 78vh;
+}
+
+.single-media > .video-player > video {
   width: 100%;
   max-height: 78vh;
   background: #070807;
@@ -1468,14 +1532,10 @@ figcaption {
   object-fit: contain;
 }
 
-.gallery-panel-video-frame > .gallery-panel-player {
-  position: relative;
-  inset: auto;
-  width: auto;
-  height: auto;
+.gallery-panel-video-frame > .gallery-panel-player-frame {
   place-self: center;
-  visibility: visible;
-  object-fit: contain;
+  max-width: 100%;
+  max-height: 100%;
 }
 
 .gallery-panel-copy {

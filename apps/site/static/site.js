@@ -46,6 +46,57 @@ function initializeVideoThumbnails(root = document) {
   });
 }
 
+function initializeVideoControls(video, container = video?.parentElement) {
+  if (!(video instanceof HTMLVideoElement) || video.dataset.videoControlsReady !== undefined || !container) return;
+
+  video.playsInline = true;
+  const button = document.createElement('button');
+  button.className = 'video-play-toggle';
+  button.type = 'button';
+  const icon = document.createElement('span');
+  icon.className = 'video-play-toggle-icon';
+  icon.setAttribute('aria-hidden', 'true');
+  button.append(icon);
+
+  const label = video.getAttribute('aria-label') || 'video';
+  const update = () => {
+    const playing = !video.paused && !video.ended;
+    icon.textContent = playing ? 'Ⅱ' : '▶';
+    button.setAttribute('aria-label', `${playing ? 'Pause' : 'Play'} ${label}`);
+    button.dataset.playing = String(playing);
+  };
+
+  button.addEventListener('click', () => {
+    if (video.paused || video.ended) {
+      try {
+        video.play().catch(update);
+      } catch (_) {
+        update();
+      }
+    } else {
+      video.pause();
+      update();
+    }
+  });
+  video.addEventListener('play', update);
+  video.addEventListener('pause', update);
+  video.addEventListener('ended', update);
+  container.classList.add('video-player');
+  container.append(button);
+  video.dataset.videoControlsReady = '';
+  update();
+}
+
+function createVideoPlayerFrame(video, className = '') {
+  const frame = document.createElement('div');
+  frame.className = `video-player ${className}`.trim();
+  frame.append(video);
+  initializeVideoControls(video, frame);
+  return frame;
+}
+
+document.querySelectorAll('video[data-video-controls]').forEach(video => initializeVideoControls(video));
+
 document.addEventListener('load', event => {
   const image = event.target;
   if (!(image instanceof HTMLImageElement) || !image.hasAttribute('data-video-thumbnail')) return;
@@ -473,7 +524,7 @@ if (draftForm) {
         video.poster = `${source}?thumbnail=1`;
         video.setAttribute('aria-label', media.header || media.body || 'video');
         video.src = source;
-        preview.append(video);
+        preview.append(createVideoPlayerFrame(video, 'draft-video-player'));
       } else {
         const frame = document.createElement('div');
         frame.className = 'video-preview-frame draft-video-placeholder';
@@ -644,7 +695,7 @@ if (draftForm) {
           savedVideo.poster = `${mediaUrl}?thumbnail=1`;
           savedVideo.setAttribute('aria-label', child.header || child.body || 'video');
           savedVideo.src = mediaUrl;
-          preview.replaceChildren(savedVideo);
+          preview.replaceChildren(createVideoPlayerFrame(savedVideo, 'draft-video-player'));
         }
       });
     });
@@ -1446,7 +1497,8 @@ if (galleryPanel) {
         player.preload = 'none';
         player.poster = item.dataset.thumbnailSrc || '';
         player.setAttribute('aria-label', itemLabel || `Video ${index + 1}`);
-        frame.replaceChildren(player);
+        const playerFrame = createVideoPlayerFrame(player, 'gallery-panel-player-frame');
+        frame.replaceChildren(playerFrame);
         player.src = mediaUrl;
         player.play().catch(() => {});
       });
