@@ -372,7 +372,15 @@ async fn shared_media<S: StorageClient>(
             return no_store(StatusCode::INTERNAL_SERVER_ERROR.into_response());
         }
     };
-    no_store(proxy_media(&state.storage, media, method, headers, uri.query().is_some_and(|query| query.split('&').any(|item| item == "download=1")), block_id).await)
+    no_store(proxy_media(
+        &state.storage,
+        media,
+        method,
+        headers,
+        has_query_flag(uri.query(), "download"),
+        has_query_flag(uri.query(), "thumbnail"),
+        block_id,
+    ).await)
 }
 
 async fn share_preview<S: StorageClient>(
@@ -2089,9 +2097,11 @@ fn render_standalone_block(
         }
         Some(content_type) if content_type.starts_with("video/") => {
             let media_url = media_url(media_prefix, post_id, block.id);
+            let thumbnail_url = video_thumbnail_url(&media_url);
             html.push_str(&format!(
-                "<figure class=\"single-media\">{}<video controls preload=\"metadata\" data-video-preview aria-label=\"{}\"><source src=\"{}\" type=\"{}\"></video><a class=\"media-download\" href=\"{}?download=1\">Download original</a>{}</figure>",
+                "<figure class=\"single-media\">{}<video controls preload=\"none\" poster=\"{}\" aria-label=\"{}\"><source src=\"{}\" type=\"{}\"></video><a class=\"media-download\" href=\"{}?download=1\">Download original</a>{}</figure>",
                 render_media_label(block.header.as_deref()),
+                escape_html(&thumbnail_url),
                 escape_html(&media_accessible_label(block.header.as_deref(), block.body.as_deref(), "video")),
                 media_url,
                 escape_html(content_type),
@@ -2174,13 +2184,18 @@ fn render_gallery(
         let label = media_accessible_label(block.header.as_deref(), block.body.as_deref(), alt);
         html.push_str("<div class=\"gallery-entry\">");
         html.push_str(&format!(
-            "<button class=\"gallery-item\" type=\"button\" data-gallery=\"{gallery_id}\" data-media-type=\"{}\" data-media-src=\"{}\" data-alt=\"{}\" data-label=\"{}\" data-caption=\"{}\" aria-label=\"Open media: {}\">",
+            "<button class=\"gallery-item\" type=\"button\" data-gallery=\"{gallery_id}\" data-media-type=\"{}\" data-media-src=\"{}\" data-alt=\"{}\" data-label=\"{}\" data-caption=\"{}\" aria-label=\"Open media: {}\"{}>",
             escape_html(content_type),
             media_url,
             escape_html(alt),
             escape_html(header),
             escape_html(caption),
             escape_html(&label),
+            if content_type.starts_with("video/") {
+                format!(" data-thumbnail-src=\"{}\"", escape_html(&video_thumbnail_url(&media_url)))
+            } else {
+                String::new()
+            },
         ));
         if content_type.starts_with("image/") {
             let loading = image_loading(prioritize_first_image);
@@ -2192,7 +2207,10 @@ fn render_gallery(
                 image_fetch_priority(loading),
             ));
         } else {
-            html.push_str("<span class=\"video-preview-frame\" data-video-preview-frame aria-hidden=\"true\"><video class=\"gallery-video-preview\" muted playsinline preload=\"none\" data-gallery-video-preview></video><span class=\"video-placeholder\"><span class=\"play-icon\">▶</span><span>Video</span></span></span>");
+            html.push_str(&format!(
+                "<span class=\"video-preview-frame\" data-video-preview-frame aria-hidden=\"true\"><img class=\"video-thumbnail\" src=\"{}\" alt=\"\" loading=\"lazy\" data-video-thumbnail><span class=\"video-placeholder\"><span class=\"play-icon\">▶</span><span>Video</span></span></span>",
+                escape_html(&video_thumbnail_url(&media_url)),
+            ));
         }
         html.push_str(&render_media_label(block.header.as_deref()));
         html.push_str(&render_caption_span(block.body.as_deref()));
@@ -2256,6 +2274,10 @@ fn media_url(media_prefix: Option<&str>, post_id: i64, block_id: i64) -> String 
         Some(prefix) => format!("{prefix}/posts/{post_id}/blocks/{block_id}/media"),
         None => format!("/posts/{post_id}/blocks/{block_id}/media"),
     }
+}
+
+fn video_thumbnail_url(media_url: &str) -> String {
+    format!("{media_url}?thumbnail=1")
 }
 
 fn render_tags_html(tags: &[String], guest: bool) -> String {
@@ -2416,7 +2438,23 @@ async fn media<S: StorageClient>(
             return StatusCode::INTERNAL_SERVER_ERROR.into_response();
         }
     };
-    proxy_media(&state.storage, media, method, headers, uri.query().is_some_and(|query| query.split('&').any(|item| item == "download=1")), block_id).await
+    proxy_media(
+        &state.storage,
+        media,
+        method,
+        headers,
+        has_query_flag(uri.query(), "download"),
+        has_query_flag(uri.query(), "thumbnail"),
+        block_id,
+    ).await
+}
+
+fn has_query_flag(query: Option<&str>, name: &str) -> bool {
+    query.is_some_and(|query| {
+        query.split('&').any(|parameter| {
+            parameter.strip_prefix(name).is_some_and(|value| value == "=1")
+        })
+    })
 }
 
 async fn proxy_media<S: StorageClient>(
@@ -2425,10 +2463,14 @@ async fn proxy_media<S: StorageClient>(
     method: Method,
     headers: HeaderMap,
     download: bool,
+    thumbnail: bool,
     block_id: i64,
 ) -> Response {
+    if thumbnail && download {
+        return StatusCode::BAD_REQUEST.into_response();
+    }
     let head = method == Method::HEAD;
-    let range = if media.content_type.starts_with("video/") && !head {
+    let range = if media.content_type.starts_with("video/") && !head && !thumbnail {
         let mut values = headers.get_all(header::RANGE).iter();
         let value = values.next();
         if values.next().is_some() {
@@ -2445,16 +2487,21 @@ async fn proxy_media<S: StorageClient>(
         None
     };
 
-    let stored = match storage.get(&media.storage_key, range, head).await {
+    let stored = match storage.get(&media.storage_key, range, head, thumbnail).await {
         Ok(stored) => stored,
         Err(error) => {
             eprintln!("website storage request failed: {error}");
             return StatusCode::BAD_GATEWAY.into_response();
         }
     };
+    let response_content_type = if thumbnail {
+        "image/jpeg".to_owned()
+    } else {
+        media.content_type.clone()
+    };
     let mut builder = Response::builder()
         .status(stored.status)
-        .header(header::CONTENT_TYPE, media.content_type.clone())
+        .header(header::CONTENT_TYPE, response_content_type)
         .header(header::X_CONTENT_TYPE_OPTIONS, "nosniff");
     if download {
         let extension = match media.content_type.as_str() {
@@ -2470,9 +2517,14 @@ async fn proxy_media<S: StorageClient>(
         };
         builder = builder.header(header::CONTENT_DISPOSITION, format!("attachment; filename=\"media-{block_id}.{extension}\""));
     }
-    for name in [header::CONTENT_LENGTH, header::ACCEPT_RANGES, header::CONTENT_RANGE] {
-        if let Some(value) = stored.headers.get(&name) {
-            builder = builder.header(name, value);
+    if let Some(value) = stored.headers.get(header::CONTENT_LENGTH) {
+        builder = builder.header(header::CONTENT_LENGTH, value);
+    }
+    if !thumbnail {
+        for name in [header::ACCEPT_RANGES, header::CONTENT_RANGE] {
+            if let Some(value) = stored.headers.get(&name) {
+                builder = builder.header(name, value);
+            }
         }
     }
     if head {
@@ -2558,6 +2610,7 @@ mod tests {
             _key: &str,
             _range: Option<&str>,
             _head: bool,
+            _thumbnail: bool,
         ) -> Result<StorageResponse, String> {
             unreachable!()
         }
@@ -3415,8 +3468,10 @@ mod tests {
         assert!(html.contains("alt=\"photo&quot; onerror=&quot;alert(1)\""));
         assert!(html.contains("<img src=\"/posts/7/blocks/23/media\""));
         assert!(html.contains("data-media-src=\"/posts/7/blocks/22/media\""));
+        assert!(html.contains("data-thumbnail-src=\"/posts/7/blocks/22/media?thumbnail=1\""));
         assert!(html.contains("class=\"video-preview-frame\" data-video-preview-frame"));
-        assert!(html.contains("<video class=\"gallery-video-preview\" muted playsinline preload=\"none\" data-gallery-video-preview>"));
+        assert!(html.contains("class=\"video-thumbnail\" src=\"/posts/7/blocks/22/media?thumbnail=1\" alt=\"\" loading=\"lazy\" data-video-thumbnail"));
+        assert!(!html.contains("gallery-video-preview"));
         assert!(html.contains("<span>Video</span>"));
         assert!(html.contains("class=\"gallery-caption\">&lt;caption&gt;</span>"));
         assert!(html.contains("Nested body"));

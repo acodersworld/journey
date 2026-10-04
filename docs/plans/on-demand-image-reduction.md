@@ -5,8 +5,9 @@
 Let the object store return a smaller still image from an existing object, without
 creating another object key. This supplies ordinary website image sizes and the
 JPEG required by the separate WhatsApp share-preview plan. The original payload
-and its metadata remain unchanged. Implement this after the video-thumbnail work
-currently in progress; do not rewrite that work as part of this plan.
+and its metadata remain unchanged. The website video-thumbnail feature uses the
+existing thumbnail representation; keep that behavior unchanged while adding
+the separate image-reduction path described here.
 
 ## Request and response contract
 

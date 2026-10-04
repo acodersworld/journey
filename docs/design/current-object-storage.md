@@ -85,8 +85,9 @@ key cannot reuse an older object's image. Cache writes use a synced temporary
 file and atomic rename. Requests for one cache entry share an in-process
 generation lock; missing, malformed, or undecodable cache files are rebuilt.
 The cache is persistent across service restarts and can be deleted without
-affecting stored objects. This representation is private to the storage object
-service; it adds no public thumbnail URL or website behavior.
+affecting stored objects. The storage service itself adds no public thumbnail
+URL. The website can proxy this representation through its access-controlled
+media routes.
 
 Logical keys are nonempty UTF-8 of at most 1,024 bytes and cannot end in `/`.
 Content types contain 1 through 128 header bytes. The filesystem backend maps

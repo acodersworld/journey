@@ -191,34 +191,34 @@ in a modal vertical panel at the selected item, with the rest of the ordered
 gallery available through native wheel, touch, and keyboard scrolling. Each
 item keeps its heading and caption below its media, allowing the media to use
 the full panel width; standalone images use the same panel with one item. Panel
-images and video previews load as they approach the visible region; initial
+images and video thumbnails load as they approach the visible region; initial
 page images prioritize the first image and lazy-load later images. Direct pages
-and fragments reuse the same original-media URLs;
+and fragments reuse the same original-media URLs for playback and downloads;
 image resizing, format conversion, and variants are deferred.
 
-Video frames are previewed in the browser from the existing media URL. A
-gallery tile keeps its **Video** placeholder until a decoded frame is ready and
-sets its source only when it is within 800 CSS pixels of the viewport, using
-`IntersectionObserver` or a bounded scroll/resize check. Gallery panel previews
-use the same browser-generated first frame, load near the panel's visible
-region, and share a limit of two simultaneous preview requests. Video playback
-starts only after the visitor chooses **Play video**; the player then exposes
-native controls for playback and seeking. Closing the panel stops active
-players and preview requests. Standalone post videos and draft editor previews
-share the browser helper. After metadata loads, it seeks near the start only
-when no current frame is available and the player remains paused; starting
-playback or seeking prevents the preview seek. Draft files use their local
-object URL until the upload is saved, then switch to the authenticated media
-URL. Preview state is not persisted and no thumbnail object or database field
-is created.
+Stored videos use the object's generated JPEG thumbnail in standalone players,
+draft players, gallery tiles, and gallery panels. The website requests a
+thumbnail through the same authorized media route with `?thumbnail=1`; the
+route repeats the original access check and asks storage for the thumbnail
+representation. Gallery tile images use native lazy loading, and panel images
+load as entries approach the visible region. Playback keeps the original media
+URL and starts only after the visitor chooses **Play video** in the panel or a
+native player control. Standalone and saved draft players use `preload="none"`.
+Closing the panel stops active players. A video waiting for upload has a dark
+placeholder; the browser does not decode a local video to create a preview. A
+failed thumbnail leaves the placeholder visible and does not disable playback.
+Thumbnail state is not persisted and no thumbnail key or database field is
+created.
 
 HTML text and attributes are escaped. Image and video blocks use site media
 URLs that identify a post and media child ID, never a storage key. The backend
 confirms the child belongs to an accessible post and references an asset before
 asking storage for it. It streams response bodies and forwards single byte
-ranges for video. Image ranges are ignored. Adding `?download=1` makes the same
-authenticated media route return an attachment for browser-incompatible
-originals.
+ranges for original videos. Image ranges are ignored. Adding `?thumbnail=1`
+requests a JPEG representation after the same post and media access check;
+combining it with `?download=1` is rejected. Adding `?download=1` to the
+original-media URL makes the same authenticated media route return an
+attachment for browser-incompatible originals.
 
 The `journey-site import` and `journey-site db` commands provide explicit
 imports and read-only database inspection. The site TOML configuration selects

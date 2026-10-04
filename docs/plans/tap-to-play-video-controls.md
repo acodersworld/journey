@@ -11,8 +11,8 @@ two-second timer with this chosen behavior.
 ## Changes
 
 - Add one reusable video-control initializer for actual players. Keep native
-  controls for seeking, volume, and accessibility; exclude the hidden video
-  elements used solely to capture gallery thumbnails.
+  controls for seeking, volume, and accessibility. Gallery thumbnails are
+  images, so only actual players receive video control behavior.
 - Put a button over the picture area while leaving the native control bar
   uncovered. Its label and visible icon reflect the video's `play`, `pause`,
   and `ended` events. Call `play()` directly from the user's tap and handle a
@@ -28,8 +28,8 @@ two-second timer with this chosen behavior.
   three views.
 - Check that seeking and other native controls remain usable and that
   keyboard activation works.
-- Manually verify Firefox for Android and desktop Firefox. Thumbnail capture
-  behavior is outside this change.
+- Manually verify Firefox for Android and desktop Firefox. Thumbnail image
+  loading is outside this change.
 
 ## Assumption
 

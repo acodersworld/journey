@@ -487,6 +487,7 @@ mod tests {
             _key: &str,
             _range: Option<&str>,
             _head: bool,
+            _thumbnail: bool,
         ) -> impl std::future::Future<Output = Result<StorageResponse, String>> + Send {
             async { Err("GET is unused in import tests".to_owned()) }
         }

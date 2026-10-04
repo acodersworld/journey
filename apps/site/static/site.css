@@ -582,7 +582,13 @@ body.sidebar-modal-open {
 .draft-media-preview video {
   width: 100%;
   max-height: 12rem;
+  background: #090a09;
   object-fit: contain;
+}
+
+.draft-media-preview .draft-video-placeholder {
+  min-height: 6rem;
+  aspect-ratio: 4 / 3;
 }
 
 .draft-media-fields {
@@ -1239,8 +1245,7 @@ figcaption {
   background: linear-gradient(145deg, #242824, #111311 72%);
 }
 
-.video-preview-frame > video,
-.video-preview-frame > canvas {
+.video-preview-frame > img {
   position: absolute;
   inset: 0;
   width: 100%;
@@ -1249,7 +1254,7 @@ figcaption {
   visibility: hidden;
 }
 
-.video-preview-frame[data-ready] > canvas {
+.video-preview-frame[data-ready] > img {
   visibility: visible;
 }
 
@@ -1429,7 +1434,7 @@ figcaption {
   place-items: center;
 }
 
-.gallery-panel-video-frame > canvas {
+.gallery-panel-video-frame > img {
   object-fit: contain;
 }
 

@@ -54,6 +54,7 @@ pub trait StorageClient: Clone + Send + Sync + 'static {
         key: &str,
         range: Option<&str>,
         head: bool,
+        thumbnail: bool,
     ) -> impl Future<Output = Result<StorageResponse, String>> + Send;
 }
 
@@ -311,8 +312,9 @@ macro_rules! impl_storage_client {
                 key: &str,
                 range: Option<&str>,
                 head: bool,
+                thumbnail: bool,
             ) -> Result<StorageResponse, String> {
-                get(self, key, range, head).await
+                get(self, key, range, head, thumbnail).await
             }
         }
     };
@@ -347,10 +349,11 @@ impl StorageClient for SiteStorageClient {
         key: &str,
         range: Option<&str>,
         head: bool,
+        thumbnail: bool,
     ) -> Result<StorageResponse, String> {
         match self {
-            Self::H2c(client) => client.get(key, range, head).await,
-            Self::WebSocket(client) => client.get(key, range, head).await,
+            Self::H2c(client) => client.get(key, range, head, thumbnail).await,
+            Self::WebSocket(client) => client.get(key, range, head, thumbnail).await,
         }
     }
 }
@@ -374,6 +377,7 @@ async fn put_file<T: StorageRequestTransport>(
         Some(length),
         false,
         true,
+        None,
     )?;
     let (response, mut send) = transport.start_request(request, false).await?;
     let upload_result = async {
@@ -435,6 +439,7 @@ async fn put_stream<T: StorageRequestTransport>(
         content_length,
         false,
         true,
+        None,
     )?;
     let (response, mut send) = transport.start_request(request, false).await?;
     let mut sent = 0_u64;
@@ -470,9 +475,11 @@ async fn get<T: StorageRequestTransport>(
     key: &str,
     range: Option<&str>,
     head: bool,
+    thumbnail: bool,
 ) -> Result<StorageResponse, String> {
     let method = if head { Method::HEAD } else { Method::GET };
-    let request = storage_request(method, key, range, None, None, false, false)?;
+    let representation = thumbnail.then_some("thumbnail");
+    let request = storage_request(method, key, range, None, None, false, false, representation)?;
     let (response, _send) = transport.start_request(request, true).await?;
     let response = response.await.map_err(|error| error.to_string())?;
     let status = response.status();
@@ -507,6 +514,7 @@ fn storage_request(
     content_length: Option<u64>,
     create_only: bool,
     generate_key: bool,
+    representation: Option<&str>,
 ) -> Result<Request<()>, String> {
     let mut builder = Request::builder()
         .version(Version::HTTP_2)
@@ -526,6 +534,9 @@ fn storage_request(
     }
     if generate_key {
         builder = builder.header("Object-Key-Mode", "sha256");
+    }
+    if let Some(representation) = representation {
+        builder = builder.header("Object-Representation", representation);
     }
     builder.body(()).map_err(|error| error.to_string())
 }
@@ -582,7 +593,7 @@ mod tests {
     async fn websocket_storage_fails_promptly_without_a_connected_peer() {
         let client = WebSocketStorageClient::new(512 * 1024, 4 * 1024 * 1024);
         let started = std::time::Instant::now();
-        let error = client.get("media/missing", None, true).await.err().unwrap();
+        let error = client.get("media/missing", None, true, false).await.err().unwrap();
 
         assert_eq!(error, "storage WebSocket is unavailable");
         assert!(started.elapsed() < Duration::from_millis(100));
@@ -702,15 +713,15 @@ mod tests {
     #[tokio::test]
     async fn reconnects_after_storage_becomes_unavailable_and_restarts() {
         let server = start_reconnecting_storage_server().await;
-        server.client.get("first", None, true).await.unwrap();
+        server.client.get("first", None, true, false).await.unwrap();
         server.close_initial.send(()).unwrap();
         server.initial_closed.await.unwrap();
         wait_until_disconnected(&server.client).await;
 
-        assert!(server.client.get("while-down", None, true).await.is_err());
+        assert!(server.client.get("while-down", None, true, false).await.is_err());
         server.restart.send(()).unwrap();
         server.restarted.await.unwrap();
-        let response = server.client.get("after-restart", None, true).await.unwrap();
+        let response = server.client.get("after-restart", None, true, false).await.unwrap();
         assert_eq!(response.status, StatusCode::OK);
 
         server.finished.send(()).unwrap();
@@ -722,7 +733,7 @@ mod tests {
         const REQUEST_COUNT: usize = 8;
 
         let server = start_reconnecting_storage_server().await;
-        server.client.get("first", None, true).await.unwrap();
+        server.client.get("first", None, true, false).await.unwrap();
         server.close_initial.send(()).unwrap();
         server.initial_closed.await.unwrap();
         wait_until_disconnected(&server.client).await;
@@ -732,7 +743,7 @@ mod tests {
         let requests = (0..REQUEST_COUNT)
             .map(|_| {
                 let client = server.client.clone();
-                tokio::spawn(async move { client.get("concurrent", None, true).await })
+                tokio::spawn(async move { client.get("concurrent", None, true, false).await })
             })
             .collect::<Vec<_>>();
         for request in requests {
