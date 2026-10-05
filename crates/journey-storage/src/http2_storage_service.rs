@@ -406,6 +406,24 @@ impl<S: StoreInterface> Service<S> {
         request: Request<h2::RecvStream>,
         respond: h2::server::SendResponse<Bytes>,
     ) -> Result<(), ServiceError> {
+        let method = request.method().clone();
+        let path = request.uri().path().to_owned();
+        let stream_id = request.body().stream_id().as_u32();
+        self.handle_request(request, respond)
+            .await
+            .map_err(|source| ServiceError::Request {
+                method,
+                path,
+                stream_id,
+                source: Box::new(source),
+            })
+    }
+
+    async fn handle_request(
+        &self,
+        request: Request<h2::RecvStream>,
+        respond: h2::server::SendResponse<Bytes>,
+    ) -> Result<(), ServiceError> {
         let route = classify_route(request.uri().path());
         let method = request.method().clone();
         match route {
@@ -1104,18 +1122,54 @@ impl<S: StoreInterface> Service<S> {
 pub enum ServiceError {
     /// The HTTP/2 stream or connection failed.
     Http2(h2::Error),
+    /// The peer reset the HTTP/2 stream with `CANCEL`.
+    PeerCancelled(h2::Error),
+    /// The peer reset the response stream with the supplied reason.
+    PeerReset(h2::Reason),
     /// An HTTP response could not be constructed.
     Http(http::Error),
     /// The peer closed the stream before it had send capacity.
     StreamClosed,
+    /// A request failed while being handled.
+    Request {
+        method: Method,
+        path: String,
+        stream_id: u32,
+        source: Box<ServiceError>,
+    },
+}
+
+impl ServiceError {
+    /// Returns whether a GET was reset by the peer with the HTTP/2 `CANCEL` reason.
+    pub fn is_peer_cancelled_get(&self) -> bool {
+        matches!(
+            self,
+            Self::Request { method, source, .. }
+                if *method == Method::GET
+                    && matches!(
+                        source.as_ref(),
+                        Self::PeerCancelled(_)
+                            | Self::PeerReset(h2::Reason::CANCEL)
+                    )
+        )
+    }
 }
 
 impl fmt::Display for ServiceError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Http2(error) => write!(formatter, "HTTP/2 error: {error}"),
+            Self::PeerCancelled(error) => write!(formatter, "peer cancelled HTTP/2 stream: {error}"),
+            Self::PeerReset(reason) => write!(formatter, "peer reset HTTP/2 stream: {reason:?}"),
             Self::Http(error) => write!(formatter, "HTTP error: {error}"),
             Self::StreamClosed => formatter.write_str("HTTP/2 response stream closed"),
+            Self::Request { method, path, stream_id, source } => write!(
+                formatter,
+                "method={:?} path={:?} stream_id={}: {source}",
+                method,
+                path,
+                stream_id,
+            ),
         }
     }
 }
@@ -1123,16 +1177,24 @@ impl fmt::Display for ServiceError {
 impl std::error::Error for ServiceError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
-            Self::Http2(error) => Some(error),
+            Self::Http2(error) | Self::PeerCancelled(error) => Some(error),
             Self::Http(error) => Some(error),
-            Self::StreamClosed => None,
+            Self::PeerReset(_) | Self::StreamClosed => None,
+            Self::Request { source, .. } => Some(source.as_ref()),
         }
     }
 }
 
 impl From<h2::Error> for ServiceError {
     fn from(error: h2::Error) -> Self {
-        Self::Http2(error)
+        if error.is_reset()
+            && error.is_remote()
+            && error.reason() == Some(h2::Reason::CANCEL)
+        {
+            Self::PeerCancelled(error)
+        } else {
+            Self::Http2(error)
+        }
     }
 }
 
@@ -1311,13 +1373,7 @@ async fn send_payload(
     while offset < payload.len() {
         let requested = MAX_DATA_SEGMENT_SIZE.min(payload.len() - offset);
         stream.reserve_capacity(requested);
-        let capacity = poll_fn(|context| match stream.poll_capacity(context) {
-            Poll::Ready(Some(Ok(capacity))) if capacity > 0 => Poll::Ready(Ok(capacity)),
-            Poll::Ready(Some(Ok(_))) | Poll::Pending => Poll::Pending,
-            Poll::Ready(Some(Err(error))) => Poll::Ready(Err(ServiceError::Http2(error))),
-            Poll::Ready(None) => Poll::Ready(Err(ServiceError::StreamClosed)),
-        })
-        .await?;
+        let capacity = poll_fn(|context| poll_send_capacity(stream, context)).await?;
         let amount = requested.min(capacity);
         let end = offset + amount;
         stream.send_data(payload.slice(offset..end), end == payload.len())?;
@@ -1341,13 +1397,7 @@ async fn send_object_reader<O: ObjectInterface>(
         let capacity = if capacity > 0 {
             capacity
         } else {
-            poll_fn(|context| match stream.poll_capacity(context) {
-                Poll::Ready(Some(Ok(capacity))) if capacity > 0 => Poll::Ready(Ok(capacity)),
-                Poll::Ready(Some(Ok(_))) | Poll::Pending => Poll::Pending,
-                Poll::Ready(Some(Err(error))) => Poll::Ready(Err(ServiceError::Http2(error))),
-                Poll::Ready(None) => Poll::Ready(Err(ServiceError::StreamClosed)),
-            })
-            .await?
+            poll_fn(|context| poll_send_capacity(stream, context)).await?
         };
         let requested = requested.min(capacity);
         buffer.resize(requested, 0);
@@ -1378,6 +1428,23 @@ async fn send_object_reader<O: ObjectInterface>(
     Ok(())
 }
 
+fn poll_send_capacity(
+    stream: &mut h2::SendStream<Bytes>,
+    context: &mut std::task::Context<'_>,
+) -> Poll<Result<usize, ServiceError>> {
+    match stream.poll_reset(context) {
+        Poll::Ready(Ok(reason)) => return Poll::Ready(Err(ServiceError::PeerReset(reason))),
+        Poll::Ready(Err(error)) => return Poll::Ready(Err(error.into())),
+        Poll::Pending => {}
+    }
+    match stream.poll_capacity(context) {
+        Poll::Ready(Some(Ok(capacity))) if capacity > 0 => Poll::Ready(Ok(capacity)),
+        Poll::Ready(Some(Ok(_))) | Poll::Pending => Poll::Pending,
+        Poll::Ready(Some(Err(error))) => Poll::Ready(Err(error.into())),
+        Poll::Ready(None) => Poll::Ready(Err(ServiceError::StreamClosed)),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1402,7 +1469,7 @@ mod tests {
     };
     use tokio::{
         io::{duplex, DuplexStream},
-        sync::{Notify, RwLock},
+        sync::{mpsc, Notify, RwLock},
         task::{JoinHandle, JoinSet},
     };
 
@@ -1474,6 +1541,22 @@ mod tests {
     }
 
     const SECRET_STORAGE_ERROR: &str = "secret internal storage detail /private/path";
+
+    #[test]
+    fn unclassified_stream_closure_keeps_request_context() {
+        let error = ServiceError::Request {
+            method: Method::GET,
+            path: "/objects/video.mp4".to_owned(),
+            stream_id: 17,
+            source: Box::new(ServiceError::StreamClosed),
+        };
+
+        assert!(!error.is_peer_cancelled_get());
+        let message = error.to_string();
+        assert!(message.contains("method=GET"));
+        assert!(message.contains("path=\"/objects/video.mp4\""));
+        assert!(message.contains("stream_id=17"));
+    }
 
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     enum FailureOperation {
@@ -2101,6 +2184,7 @@ mod tests {
 
     struct TestConnection {
         sender: client::SendRequest<Bytes>,
+        errors: mpsc::UnboundedReceiver<ServiceError>,
         _client_task: JoinHandle<()>,
         _server_task: JoinHandle<()>,
     }
@@ -2110,7 +2194,8 @@ mod tests {
         client_window: Option<u32>,
     ) -> TestConnection {
         let (client_io, server_io) = duplex(256 * 1024 * 1024);
-        let server_task = tokio::spawn(run_test_server(server_io, Service::new(store)));
+        let (error_sender, errors) = mpsc::unbounded_channel();
+        let server_task = tokio::spawn(run_test_server(server_io, Service::new(store), error_sender));
         let mut builder = client::Builder::new();
         if let Some(window) = client_window {
             builder
@@ -2123,6 +2208,7 @@ mod tests {
         });
         TestConnection {
             sender,
+            errors,
             _client_task: client_task,
             _server_task: server_task,
         }
@@ -2132,7 +2218,11 @@ mod tests {
         connection(store, None).await
     }
 
-    async fn run_test_server<S: StoreInterface>(io: DuplexStream, service: Service<S>) {
+    async fn run_test_server<S: StoreInterface>(
+        io: DuplexStream,
+        service: Service<S>,
+        error_sender: mpsc::UnboundedSender<ServiceError>,
+    ) {
         let mut connection = server::handshake(io).await.unwrap();
         let mut handlers = JoinSet::new();
         loop {
@@ -2140,8 +2230,11 @@ mod tests {
                 accepted = connection.accept() => match accepted {
                     Some(Ok((request, respond))) => {
                         let service = service.clone();
+                        let error_sender = error_sender.clone();
                         handlers.spawn(async move {
-                            let _ = service.handle(request, respond).await;
+                            if let Err(error) = service.handle(request, respond).await {
+                                let _ = error_sender.send(error);
+                            }
                         });
                     }
                     Some(Err(_)) | None => break,
@@ -2286,7 +2379,7 @@ mod tests {
     }
 
     async fn close_connection(connection: TestConnection) {
-        let TestConnection { sender, _client_task, _server_task } = connection;
+        let TestConnection { sender, _client_task, _server_task, .. } = connection;
         drop(sender);
         _client_task.abort();
         _server_task.abort();
@@ -4017,6 +4110,40 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn peer_cancelled_get_is_classified_with_safe_request_context() {
+        let payload = Bytes::from(vec![7; 1024 * 1024]);
+        let store = Arc::new(
+            Store::new([object("large.bin", "application/octet-stream", payload)]).unwrap(),
+        );
+        let mut connection = connection(store, Some(1)).await;
+        let request = Request::builder()
+            .method(Method::GET)
+            .uri("/objects/large.bin?token=must-not-be-logged")
+            .body(())
+            .unwrap();
+        let (response, mut request_stream) = connection.sender.send_request(request, true).unwrap();
+        let response = response.await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let stream_id = request_stream.stream_id().as_u32();
+        request_stream.send_reset(h2::Reason::CANCEL);
+        drop(response.into_body());
+
+        let error = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            connection.errors.recv(),
+        )
+        .await
+        .expect("server did not report the reset GET")
+        .expect("server error channel closed");
+        assert!(error.is_peer_cancelled_get());
+        let message = error.to_string();
+        assert!(message.contains("method=GET"));
+        assert!(message.contains("path=\"/objects/large.bin\""));
+        assert!(message.contains(&format!("stream_id={stream_id}")));
+        assert!(!message.contains("must-not-be-logged"));
+    }
+
+    #[tokio::test]
     async fn reset_during_upload_leaves_existing_object_unchanged() {
         let store = sample_store();
         let mut connection = connection(store.clone(), None).await;
@@ -4028,8 +4155,21 @@ mod tests {
             .unwrap();
         let (response, mut stream) = connection.sender.send_request(request, false).unwrap();
         send_frame(&mut stream, b"partial upload", false).await.unwrap();
+        let stream_id = stream.stream_id().as_u32();
         stream.send_reset(h2::Reason::CANCEL);
         assert!(response.await.is_err());
+        let error = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            connection.errors.recv(),
+        )
+        .await
+        .expect("server did not report the reset PUT")
+        .expect("server error channel closed");
+        assert!(!error.is_peer_cancelled_get());
+        let message = error.to_string();
+        assert!(message.contains("method=PUT"));
+        assert!(message.contains("path=\"/objects/image.jpg\""));
+        assert!(message.contains(&format!("stream_id={stream_id}")));
 
         let mut original = stored_object(&store, "image.jpg").await;
         assert_eq!(original.metadata().content_type().as_header_value().as_bytes(), b"image/jpeg");

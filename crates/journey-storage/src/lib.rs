@@ -24,5 +24,5 @@ pub use storage_filesystem::{
     FilesystemPutContextWithGeneratedName, FilesystemPutContextWithKey, FilesystemStore,
     FilesystemStoreConfig,
 };
-pub use http2_storage_service::Service;
+pub use http2_storage_service::{Service, ServiceError};
 pub use storage_web_interface::{serve_web_interface, WebCredentials, WebCredentialsError};

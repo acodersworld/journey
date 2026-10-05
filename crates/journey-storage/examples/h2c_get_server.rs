@@ -226,7 +226,9 @@ async fn serve_connection<S: StoreInterface + Sync + Send>(
                     let service = Arc::clone(&service);
                     requests.spawn(async move {
                         if let Err(error) = service.handle(request, respond).await {
-                            eprintln!("HTTP/2 request failed: {error}");
+                            if !error.is_peer_cancelled_get() {
+                                eprintln!("HTTP/2 request failed: {error}");
+                            }
                         }
                     });
                 }
