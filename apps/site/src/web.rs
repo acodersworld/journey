@@ -14,12 +14,15 @@ use std::{io, net::{IpAddr, SocketAddr}, time::{Duration, SystemTime, UNIX_EPOCH
 use crate::{
     auth,
     db::{AccountRole, AuthenticatedAccount, Database, FeedCursor, MediaReference, NewBlock, Post, PostAccess, SaveDraftResult, ShareAccess, SidebarData},
-    storage::{StorageBody, StorageClient, UPLOAD_LIMIT_ERROR},
+    storage::{ImageReductionDimensions, ImageReductionFit, ImageReductionFormat, ImageReductionOptions, StorageBody, StorageClient, UPLOAD_LIMIT_ERROR},
 };
 
 const DEFAULT_FEED_LIMIT: usize = 10;
 const MAX_FEED_LIMIT: usize = 100;
 pub const DEFAULT_MAX_MEDIA_UPLOAD_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+const WHATSAPP_PREVIEW_IMAGE_MAX_BYTES: u64 = 599_999;
+const WHATSAPP_PREVIEW_IMAGE_WIDTH: u32 = 1_200;
+const WHATSAPP_PREVIEW_IMAGE_HEIGHT: u32 = 300;
 
 #[derive(Clone)]
 pub struct AppState<S: StorageClient> {
@@ -247,6 +250,10 @@ pub fn router<S: StorageClient>(state: AppState<S>) -> Router {
         .route("/api/auth/current", get(current_account::<S>))
         .route("/api/auth/logout", post(logout::<S>))
         .route("/share/{share_link_id}/{secret}", get(open_share_link::<S>))
+        .route(
+            "/share/{share_link_id}/whatsapp-preview-image/{random_name}",
+            get(whatsapp_preview_image::<S>),
+        )
         .route("/share/{share_link_id}/posts/{post_id}", get(shared_post_page::<S>))
         .route(
             "/share/{share_link_id}/posts/{post_id}/blocks/{block_id}/media",
@@ -282,7 +289,12 @@ async fn authenticate<S: StorageClient>(
 async fn open_share_link<S: StorageClient>(
     State(state): State<AppState<S>>,
     Path((share_link_id, secret)): Path<(String, String)>,
+    headers: HeaderMap,
+    uri: Uri,
 ) -> Response {
+    if is_whatsapp_preview_user_agent(&headers) && !has_query_flag(uri.query(), "open") {
+        return whatsapp_share_link_preview(&state, &share_link_id, &secret, &headers, &uri).await;
+    }
     let now = unix_time();
     let session_token = auth::new_session_token();
     match state
@@ -312,6 +324,149 @@ async fn open_share_link<S: StorageClient>(
             no_store(StatusCode::INTERNAL_SERVER_ERROR.into_response())
         }
     }
+}
+
+async fn whatsapp_share_link_preview<S: StorageClient>(
+    state: &AppState<S>,
+    share_link_id: &str,
+    secret: &str,
+    headers: &HeaderMap,
+    uri: &Uri,
+) -> Response {
+    if !valid_share_link_id(share_link_id) || !valid_token(secret) {
+        return share_not_found();
+    }
+    let origin = match share_preview_origin(headers, uri, &state.security) {
+        Some(origin) => origin,
+        None => return no_store(StatusCode::BAD_REQUEST.into_response()),
+    };
+    let post = match state.database.whatsapp_share_preview(
+        share_link_id.to_owned(),
+        auth::session_token_digest(secret),
+        unix_time(),
+    ).await {
+        Ok(Some(post)) => post,
+        Ok(None) => return share_not_found(),
+        Err(error) => {
+            eprintln!("website WhatsApp share preview lookup failed: {error}");
+            return no_store(StatusCode::INTERNAL_SERVER_ERROR.into_response());
+        }
+    };
+    let share_url = format!("{origin}/share/{share_link_id}/{secret}");
+    let open_url = format!("{share_url}?open=1");
+    let image_url = match first_post_media(&post.blocks) {
+        Some(block) => {
+            let token = auth::new_session_token();
+            match state.database.create_whatsapp_preview_image(
+                share_link_id.to_owned(),
+                auth::session_token_digest(secret),
+                auth::session_token_digest(&token),
+                block.id,
+                unix_time(),
+            ).await {
+                Ok(Some(_)) => Some(format!(
+                    "{origin}/share/{share_link_id}/whatsapp-preview-image/{token}.jpg"
+                )),
+                Ok(None) => return share_not_found(),
+                Err(error) => {
+                    eprintln!("website WhatsApp image capability creation failed: {error}");
+                    return no_store(StatusCode::INTERNAL_SERVER_ERROR.into_response());
+                }
+            }
+        }
+        None => None,
+    };
+    no_store(Html(render_whatsapp_share_preview(
+        &post,
+        &share_url,
+        &open_url,
+        image_url.as_deref(),
+    )).into_response())
+}
+
+async fn whatsapp_preview_image<S: StorageClient>(
+    State(state): State<AppState<S>>,
+    Path((share_link_id, random_name)): Path<(String, String)>,
+    method: Method,
+) -> Response {
+    let Some(token) = random_name.strip_suffix(".jpg") else {
+        return share_not_found();
+    };
+    if !valid_share_link_id(&share_link_id) || !valid_token(token) {
+        return share_not_found();
+    }
+    let media = match state.database.whatsapp_preview_media(
+        share_link_id,
+        auth::session_token_digest(token),
+        unix_time(),
+    ).await {
+        Ok(Some(media)) => media,
+        Ok(None) => return share_not_found(),
+        Err(error) => {
+            eprintln!("website WhatsApp preview image lookup failed: {error}");
+            return no_store(StatusCode::INTERNAL_SERVER_ERROR.into_response());
+        }
+    };
+    let options = ImageReductionOptions::new(
+        ImageReductionDimensions::BoundingBox {
+            width: WHATSAPP_PREVIEW_IMAGE_WIDTH,
+            height: WHATSAPP_PREVIEW_IMAGE_HEIGHT,
+        },
+        ImageReductionFit::Pad,
+        ImageReductionFormat::Jpeg,
+        Some(WHATSAPP_PREVIEW_IMAGE_MAX_BYTES),
+    ).expect("WhatsApp preview image reduction options are valid");
+    let head = method == Method::HEAD;
+    let stored = match state.storage.get_reduced_image(
+        &media.storage_key,
+        options,
+        is_media_type(&media.content_type, "video/"),
+        head,
+    ).await {
+        Ok(stored) if stored.status == StatusCode::OK => stored,
+        Ok(_) => return no_store(StatusCode::BAD_GATEWAY.into_response()),
+        Err(error) => {
+            eprintln!("website WhatsApp preview image fetch failed: {error}");
+            return no_store(StatusCode::BAD_GATEWAY.into_response());
+        }
+    };
+    let content_type = stored.headers.get(header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.split(';').next())
+        .map(str::trim);
+    if content_type != Some("image/jpeg") {
+        return no_store(StatusCode::BAD_GATEWAY.into_response());
+    }
+    let content_length = match stored.headers.get(header::CONTENT_LENGTH) {
+        Some(value) => match value.to_str().ok().and_then(|value| value.parse::<u64>().ok()) {
+            Some(length) if (1..=WHATSAPP_PREVIEW_IMAGE_MAX_BYTES).contains(&length) => length,
+            _ => return no_store(StatusCode::BAD_GATEWAY.into_response()),
+        },
+        None => return no_store(StatusCode::BAD_GATEWAY.into_response()),
+    };
+    let mut builder = Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, "image/jpeg")
+        .header(header::X_CONTENT_TYPE_OPTIONS, "nosniff");
+    builder = builder.header(header::CONTENT_LENGTH, content_length);
+    let body = if head {
+        Body::empty()
+    } else {
+        let mut streamed_bytes = 0_u64;
+        let body = stored.body.map(move |chunk| match chunk {
+            Ok(bytes) => {
+                streamed_bytes = streamed_bytes.saturating_add(bytes.len() as u64);
+                if streamed_bytes > WHATSAPP_PREVIEW_IMAGE_MAX_BYTES {
+                    Err(io::Error::other("reduced preview image exceeded its byte limit"))
+                } else {
+                    Ok(bytes)
+                }
+            }
+            Err(error) => Err(error),
+        });
+        Body::from_stream(body)
+    };
+    no_store(builder.body(body).unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response()))
 }
 
 async fn shared_post_page<S: StorageClient>(
@@ -479,6 +634,84 @@ fn valid_share_link_id(id: &str) -> bool {
 
 fn share_not_found() -> Response {
     no_store((StatusCode::NOT_FOUND, "share link not found\n").into_response())
+}
+
+fn is_whatsapp_preview_user_agent(headers: &HeaderMap) -> bool {
+    let Some(user_agent) = headers.get(header::USER_AGENT).and_then(|value| value.to_str().ok()) else {
+        return false;
+    };
+    let mut words = user_agent.split_ascii_whitespace();
+    while let Some(word) = words.next() {
+        let Some(version) = word.strip_prefix("WhatsApp/") else {
+            continue;
+        };
+        let components: Vec<_> = version.split('.').collect();
+        if components.len() == 4
+            && components[0] == "2"
+            && components[1..].iter().all(|component| {
+                !component.is_empty() && component.bytes().all(|byte| byte.is_ascii_digit())
+            })
+            && words.next().is_some_and(|kind| matches!(kind, "A" | "I" | "N"))
+        {
+            return true;
+        }
+    }
+    false
+}
+
+fn first_post_media(blocks: &[crate::db::PostBlock]) -> Option<&crate::db::PostBlock> {
+    for block in blocks {
+        if block.storage_key.is_some()
+            && block.content_type.as_deref().is_some_and(|content_type| {
+                is_media_type(content_type, "image/") || is_media_type(content_type, "video/")
+            })
+        {
+            return Some(block);
+        }
+        if let Some(media) = first_post_media(&block.children) {
+            return Some(media);
+        }
+    }
+    None
+}
+
+fn is_media_type(content_type: &str, media_type_prefix: &str) -> bool {
+    content_type
+        .get(..media_type_prefix.len())
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case(media_type_prefix))
+}
+
+fn share_preview_origin(headers: &HeaderMap, uri: &Uri, security: &SiteSecurity) -> Option<String> {
+    if let Some(origin) = &security.public_origin {
+        return Some(origin.key.clone());
+    }
+    let request_origin = if let Some(authority) = uri.authority() {
+        let scheme = uri.scheme_str().unwrap_or("http");
+        parse_origin(&format!("{scheme}://{authority}"))
+    } else {
+        let host = headers.get(header::HOST)?.to_str().ok()?;
+        parse_origin(&format!("http://{host}"))
+    }?;
+    request_origin.is_loopback().then_some(request_origin.key)
+}
+
+fn render_whatsapp_share_preview(
+    post: &Post,
+    share_url: &str,
+    open_url: &str,
+    image_url: Option<&str>,
+) -> String {
+    let title = escape_html(&post.summary.title);
+    let summary = escape_html(&post.summary.summary);
+    let share_url = escape_html(share_url);
+    let open_url = escape_html(open_url);
+    let image_metadata = image_url.map(|image_url| format!(
+        "<meta property=\"og:image\" content=\"{}\"><meta property=\"og:image:type\" content=\"image/jpeg\"><meta property=\"og:image:width\" content=\"1200\"><meta property=\"og:image:height\" content=\"300\">",
+        escape_html(image_url),
+    )).unwrap_or_default();
+    format!(
+        "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width, initial-scale=1\"><meta property=\"og:type\" content=\"article\"><meta property=\"og:url\" content=\"{share_url}\"><meta property=\"og:title\" content=\"{title}\"><meta property=\"og:description\" content=\"{summary}\"><meta name=\"description\" content=\"{summary}\"><meta name=\"twitter:card\" content=\"summary_large_image\">{image_metadata}<title>{title} · Journey</title></head><body><main><h1>{title}</h1><p>{summary}</p><a id=\"open-post\" href=\"{open_url}\">Open post</a></main><script>window.location.replace(document.getElementById('open-post').href);</script></body></html>"
+    )
 }
 
 async fn login<S: StorageClient>(
@@ -2565,9 +2798,12 @@ mod tests {
     use std::{
         net::{IpAddr, Ipv4Addr, SocketAddr},
         path::{Path, PathBuf},
+        sync::{Arc, Mutex},
         time::{Duration, SystemTime, UNIX_EPOCH},
     };
 
+    use bytes::Bytes;
+    use futures_util::stream;
     use rusqlite::Connection;
 
     use super::{
@@ -2576,8 +2812,8 @@ mod tests {
     };
     use crate::{
         auth,
-        db::{AccountRole, Database, NewPost, Post, PostAccess, PostBlock, PostSummary, ShareAccess, SidebarData},
-        storage::{StorageBody, StorageClient, StorageResponse},
+        db::{AccountRole, Database, ImportedAccount, NewBlock, NewPost, Post, PostAccess, PostBlock, PostSummary, ShareAccess, SidebarData},
+        storage::{ImageReductionDimensions, ImageReductionFit, ImageReductionFormat, ImageReductionOptions, StorageBody, StorageClient, StorageResponse},
     };
     use axum::{
         body::{to_bytes, Body},
@@ -2589,6 +2825,23 @@ mod tests {
 
     #[derive(Clone)]
     struct UnusedStorage;
+
+    #[derive(Clone)]
+    struct PreviewStorage {
+        requests: Arc<Mutex<Vec<(String, bool, ImageReductionOptions)>>>,
+        bytes: Bytes,
+        declared_length: Option<u64>,
+    }
+
+    impl PreviewStorage {
+        fn new(bytes: Bytes, declared_length: Option<u64>) -> Self {
+            Self {
+                requests: Arc::new(Mutex::new(Vec::new())),
+                bytes,
+                declared_length,
+            }
+        }
+    }
 
     impl StorageClient for UnusedStorage {
         async fn put_file(&self, _content_type: &str, _path: &Path) -> Result<String, String> {
@@ -2616,11 +2869,75 @@ mod tests {
         }
     }
 
+    impl StorageClient for PreviewStorage {
+        async fn put_file(&self, _content_type: &str, _path: &Path) -> Result<String, String> {
+            unreachable!()
+        }
+
+        async fn put_stream(
+            &self,
+            _content_type: &str,
+            _content_length: Option<u64>,
+            _body: StorageBody,
+            _max_bytes: u64,
+        ) -> Result<(String, u64), String> {
+            unreachable!()
+        }
+
+        async fn get(
+            &self,
+            _key: &str,
+            _range: Option<&str>,
+            _head: bool,
+            _thumbnail: bool,
+        ) -> Result<StorageResponse, String> {
+            unreachable!()
+        }
+
+        async fn get_reduced_image(
+            &self,
+            key: &str,
+            options: ImageReductionOptions,
+            video_thumbnail: bool,
+            head: bool,
+        ) -> Result<StorageResponse, String> {
+            self.requests.lock().unwrap().push((key.to_owned(), video_thumbnail, options));
+            let mut headers = http::HeaderMap::new();
+            headers.insert(header::CONTENT_TYPE, "image/jpeg".parse().unwrap());
+            if let Some(length) = self.declared_length {
+                headers.insert(header::CONTENT_LENGTH, length.to_string().parse().unwrap());
+            }
+            let body: StorageBody = if head {
+                Box::pin(stream::empty())
+            } else {
+                Box::pin(stream::iter([Ok(self.bytes.clone())]))
+            };
+            Ok(StorageResponse {
+                status: StatusCode::OK,
+                headers,
+                body,
+            })
+        }
+    }
+
     async fn get_route(app: &axum::Router, target: &str) -> Response {
         app.clone()
             .oneshot(
                 Request::builder()
                     .uri(target)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+    }
+
+    async fn get_route_with_user_agent(app: &axum::Router, target: &str, user_agent: &str) -> Response {
+        app.clone()
+            .oneshot(
+                Request::builder()
+                    .uri(target)
+                    .header(header::USER_AGENT, user_agent)
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -3504,6 +3821,26 @@ mod tests {
     }
 
     #[test]
+    fn whatsapp_preview_user_agent_requires_the_documented_version_and_client_marker() {
+        for marker in ["A", "I", "N"] {
+            let mut headers = http::HeaderMap::new();
+            headers.insert(header::USER_AGENT, format!("WhatsApp/2.24.1.78 {marker}").parse().unwrap());
+            assert!(super::is_whatsapp_preview_user_agent(&headers));
+        }
+        for user_agent in [
+            "WhatsApp/2.24.1 A",
+            "WhatsApp/3.24.1.78 A",
+            "WhatsApp/2.24.1.78 X",
+            "WhatsApp/2.x.1.78 A",
+            "Mozilla/5.0",
+        ] {
+            let mut headers = http::HeaderMap::new();
+            headers.insert(header::USER_AGENT, user_agent.parse().unwrap());
+            assert!(!super::is_whatsapp_preview_user_agent(&headers));
+        }
+    }
+
+    #[test]
     fn sidebar_shows_five_newest_drafts_before_the_expand_control() {
         let sidebar = SidebarData {
             drafts: Some((1..=7).rev().map(|id| PostSummary {
@@ -3523,5 +3860,288 @@ mod tests {
         assert!(newest < fifth);
         assert!(fifth < sixth);
         assert!(html.find("sidebar-drafts-heading").unwrap() < html.find("sidebar-recent-heading").unwrap());
+    }
+
+    #[tokio::test]
+    async fn whatsapp_share_previews_issue_revocable_bounded_image_capabilities() {
+        fn media(key: &str, content_type: &str) -> NewBlock {
+            NewBlock {
+                id: None,
+                header: None,
+                body: None,
+                storage_key: Some(key.to_owned()),
+                content_type: Some(content_type.to_owned()),
+                alt: None,
+                children: Vec::new(),
+            }
+        }
+
+        fn gallery(children: Vec<NewBlock>) -> NewBlock {
+            NewBlock {
+                id: None,
+                header: Some("Gallery".to_owned()),
+                body: None,
+                storage_key: None,
+                content_type: None,
+                alt: None,
+                children,
+            }
+        }
+
+        fn post(title: &str, summary: &str, blocks: Vec<NewBlock>) -> NewPost {
+            NewPost {
+                author_username: "writer".to_owned(),
+                title: title.to_owned(),
+                published_at: Some(1_767_225_600),
+                summary: summary.to_owned(),
+                tags: Vec::new(),
+                blocks,
+            }
+        }
+
+        async fn create_link(database: &Database, post_id: i64, created_at: Duration) -> (String, String) {
+            let id = auth::new_share_link_id();
+            let secret = auth::new_share_link_secret();
+            database.create_share_link(
+                id.clone(),
+                post_id,
+                auth::session_token_digest(&secret),
+                created_at,
+                ShareAccess::Author("writer".to_owned()),
+            ).await.unwrap().unwrap();
+            (id, secret)
+        }
+
+        fn image_url(html: &str) -> String {
+            let marker = "property=\"og:image\" content=\"";
+            let start = html.find(marker).unwrap() + marker.len();
+            let end = html[start..].find('"').unwrap() + start;
+            html[start..end].to_owned()
+        }
+
+        let nonce = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+        let path = std::env::temp_dir().join(format!("journey-site-whatsapp-preview-{}-{nonce}.sqlite3", std::process::id()));
+        let database = Database::new(path.clone());
+        database.replace_posts_and_add_accounts(
+            vec![
+                post(
+                    "A <title> & \"quote\"",
+                    "Summary <b> & \"quote\"",
+                    vec![gallery(vec![
+                        media("media/first-photo", "image/jpeg"),
+                        media("media/second-video", "video/mp4"),
+                    ])],
+                ),
+                post(
+                    "Video first",
+                    "Video summary",
+                    vec![gallery(vec![
+                        media("media/first-video", "video/mp4"),
+                        media("media/second-photo", "image/jpeg"),
+                    ])],
+                ),
+                post("Text only", "No image here", Vec::new()),
+            ],
+            vec![ImportedAccount {
+                username: "writer".to_owned(),
+                role: AccountRole::Write,
+                password_hash: "unused-test-hash".to_owned(),
+            }],
+        ).await.unwrap();
+        let storage = PreviewStorage::new(Bytes::from_static(b"jpeg"), Some(4));
+        let security = super::SiteSecurity::from_config(
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 3000),
+            Some("https://journey.example"),
+            3600,
+            super::DEFAULT_MAX_MEDIA_UPLOAD_BYTES,
+            false,
+        ).unwrap();
+        let app = router(super::state_with_security(database.clone(), storage.clone(), security.clone()));
+        let now = super::unix_time();
+        let (photo_link_id, photo_secret) = create_link(&database, 1, now).await;
+        let (video_link_id, video_secret) = create_link(&database, 2, now).await;
+        let (text_link_id, text_secret) = create_link(&database, 3, now).await;
+        let photo_target = format!("/share/{photo_link_id}/{photo_secret}");
+        let video_target = format!("/share/{video_link_id}/{video_secret}");
+        let text_target = format!("/share/{text_link_id}/{text_secret}");
+
+        assert_eq!(
+            get_route_with_user_agent(&app, &format!("/share/{photo_link_id}/{}", auth::new_share_link_secret()), "WhatsApp/2.24.1.78 A").await.status(),
+            StatusCode::NOT_FOUND,
+        );
+        let (expired_link_id, expired_secret) = create_link(
+            &database,
+            1,
+            now.saturating_sub(Duration::from_secs(90_000)),
+        ).await;
+        assert_eq!(
+            get_route_with_user_agent(&app, &format!("/share/{expired_link_id}/{expired_secret}"), "WhatsApp/2.24.1.78 A").await.status(),
+            StatusCode::NOT_FOUND,
+        );
+
+        const WHATSAPP_USER_AGENT: &str = "WhatsApp/2.24.1.78 A";
+        let photo_preview = get_route_with_user_agent(&app, &photo_target, WHATSAPP_USER_AGENT).await;
+        assert_eq!(photo_preview.status(), StatusCode::OK);
+        assert_eq!(photo_preview.headers().get(header::CACHE_CONTROL).unwrap(), "private, no-store");
+        assert!(photo_preview.headers().get(header::SET_COOKIE).is_none());
+        let body = to_bytes(photo_preview.into_body(), 300 * 1024).await.unwrap();
+        let photo_html = String::from_utf8(body.to_vec()).unwrap();
+        assert!(photo_html.contains("property=\"og:url\" content=\"https://journey.example/share/"));
+        assert!(photo_html.contains("property=\"og:title\" content=\"A &lt;title&gt; &amp; &quot;quote&quot;\""));
+        assert!(photo_html.contains("property=\"og:description\" content=\"Summary &lt;b&gt; &amp; &quot;quote&quot;\""));
+        assert!(photo_html.contains("property=\"og:image:width\" content=\"1200\""));
+        assert!(photo_html.contains("property=\"og:image:height\" content=\"300\""));
+        assert!(photo_html.contains("Open post"));
+        assert!(photo_html.contains("?open=1"));
+        assert!(photo_html.contains("window.location.replace(document.getElementById('open-post').href)"));
+        let photo_image_url = image_url(&photo_html);
+        assert!(photo_image_url.starts_with("https://journey.example/share/"));
+        let photo_image_path = photo_image_url.strip_prefix("https://journey.example").unwrap();
+        let photo_image = get_route(&app, photo_image_path).await;
+        assert_eq!(photo_image.status(), StatusCode::OK);
+        assert_eq!(photo_image.headers().get(header::CONTENT_TYPE).unwrap(), "image/jpeg");
+        assert_eq!(photo_image.headers().get(header::CACHE_CONTROL).unwrap(), "private, no-store");
+        assert!(photo_image.headers().get(header::SET_COOKIE).is_none());
+        assert_eq!(to_bytes(photo_image.into_body(), usize::MAX).await.unwrap(), Bytes::from_static(b"jpeg"));
+        let requests = storage.requests.lock().unwrap().clone();
+        assert_eq!(requests[0].0, "media/first-photo");
+        assert!(!requests[0].1);
+        assert_eq!(requests[0].2, ImageReductionOptions::new(
+            ImageReductionDimensions::BoundingBox { width: 1200, height: 300 },
+            ImageReductionFit::Pad,
+            ImageReductionFormat::Jpeg,
+            Some(599_999),
+        ).unwrap());
+        let connection = Connection::open(&path).unwrap();
+        let capability_expiry: i64 = connection.query_row(
+            "SELECT expires_at FROM share_preview_images WHERE share_link_id = ?1",
+            [&photo_link_id],
+            |row| row.get(0),
+        ).unwrap();
+        let share_expiry: i64 = connection.query_row(
+            "SELECT expires_at FROM share_links WHERE id = ?1",
+            [&photo_link_id],
+            |row| row.get(0),
+        ).unwrap();
+        assert!(capability_expiry <= share_expiry);
+        let capability_remaining = capability_expiry - super::unix_time().as_secs() as i64;
+        assert!((290..=300).contains(&capability_remaining));
+        connection.execute(
+            "UPDATE share_preview_images SET expires_at = ?2 WHERE share_link_id = ?1",
+            rusqlite::params![photo_link_id, super::unix_time().as_secs() as i64 - 1],
+        ).unwrap();
+        drop(connection);
+        assert_eq!(get_route(&app, photo_image_path).await.status(), StatusCode::NOT_FOUND);
+
+        let (short_link_id, short_secret) = create_link(
+            &database,
+            1,
+            now.saturating_sub(Duration::from_secs(86_340)),
+        ).await;
+        let short_target = format!("/share/{short_link_id}/{short_secret}");
+        let short_preview = get_route_with_user_agent(&app, &short_target, WHATSAPP_USER_AGENT).await;
+        assert_eq!(short_preview.status(), StatusCode::OK);
+        let short_body = to_bytes(short_preview.into_body(), 300 * 1024).await.unwrap();
+        let short_html = String::from_utf8(short_body.to_vec()).unwrap();
+        let connection = Connection::open(&path).unwrap();
+        let short_capability_expiry: i64 = connection.query_row(
+            "SELECT expires_at FROM share_preview_images WHERE share_link_id = ?1",
+            [&short_link_id],
+            |row| row.get(0),
+        ).unwrap();
+        let short_share_expiry: i64 = connection.query_row(
+            "SELECT expires_at FROM share_links WHERE id = ?1",
+            [&short_link_id],
+            |row| row.get(0),
+        ).unwrap();
+        let short_image_path = image_url(&short_html).strip_prefix("https://journey.example").unwrap().to_owned();
+        drop(connection);
+        assert_eq!(short_capability_expiry, short_share_expiry);
+        assert!(image_url(&short_html).starts_with("https://journey.example/share/"));
+        let connection = Connection::open(&path).unwrap();
+        connection.execute(
+            "UPDATE share_links SET expires_at = ?2 WHERE id = ?1",
+            rusqlite::params![short_link_id, super::unix_time().as_secs() as i64 - 1],
+        ).unwrap();
+        drop(connection);
+        assert_eq!(get_route(&app, &short_image_path).await.status(), StatusCode::NOT_FOUND);
+
+        let video_preview = get_route_with_user_agent(&app, &video_target, WHATSAPP_USER_AGENT).await;
+        assert_eq!(video_preview.status(), StatusCode::OK);
+        assert!(video_preview.headers().get(header::SET_COOKIE).is_none());
+        let body = to_bytes(video_preview.into_body(), 300 * 1024).await.unwrap();
+        let video_html = String::from_utf8(body.to_vec()).unwrap();
+        let video_image_path = image_url(&video_html).strip_prefix("https://journey.example").unwrap().to_owned();
+        let video_image = get_route(&app, &video_image_path).await;
+        assert_eq!(video_image.status(), StatusCode::OK);
+        let _ = to_bytes(video_image.into_body(), usize::MAX).await.unwrap();
+        assert!(storage.requests.lock().unwrap()[1].1);
+        assert_eq!(storage.requests.lock().unwrap()[1].0, "media/first-video");
+        assert!(database.revoke_share_link(
+            video_link_id,
+            super::unix_time(),
+            ShareAccess::Author("writer".to_owned()),
+        ).await.unwrap());
+        assert_eq!(get_route(&app, &video_image_path).await.status(), StatusCode::NOT_FOUND);
+
+        let (oversized_link_id, oversized_secret) = create_link(&database, 1, super::unix_time()).await;
+        let oversized_target = format!("/share/{oversized_link_id}/{oversized_secret}");
+        let oversized_preview = get_route_with_user_agent(&app, &oversized_target, WHATSAPP_USER_AGENT).await;
+        let oversized_body = to_bytes(oversized_preview.into_body(), 300 * 1024).await.unwrap();
+        let oversized_html = String::from_utf8(oversized_body.to_vec()).unwrap();
+        let oversized_image_path = image_url(&oversized_html).strip_prefix("https://journey.example").unwrap().to_owned();
+        let oversized_storage = PreviewStorage::new(Bytes::from_static(b"jpeg"), Some(600_000));
+        let oversized_app = router(super::state_with_security(
+            database.clone(),
+            oversized_storage,
+            security.clone(),
+        ));
+        let oversized_response = get_route(&oversized_app, &oversized_image_path).await;
+        assert_eq!(oversized_response.status(), StatusCode::BAD_GATEWAY);
+        assert_eq!(oversized_response.headers().get(header::CACHE_CONTROL).unwrap(), "private, no-store");
+
+        let streamed_oversized_storage = PreviewStorage::new(
+            Bytes::from(vec![b'x'; 600_000]),
+            Some(1),
+        );
+        let streamed_oversized_app = router(super::state_with_security(
+            database.clone(),
+            streamed_oversized_storage,
+            security.clone(),
+        ));
+        let streamed_oversized_response = get_route(&streamed_oversized_app, &oversized_image_path).await;
+        assert_eq!(streamed_oversized_response.status(), StatusCode::OK);
+        assert!(to_bytes(streamed_oversized_response.into_body(), 700_000).await.is_err());
+
+        let text_preview = get_route_with_user_agent(&app, &text_target, WHATSAPP_USER_AGENT).await;
+        assert_eq!(text_preview.status(), StatusCode::OK);
+        let body = to_bytes(text_preview.into_body(), 300 * 1024).await.unwrap();
+        let text_html = String::from_utf8(body.to_vec()).unwrap();
+        assert!(!text_html.contains("property=\"og:image\""));
+
+        let browser = get_route_with_user_agent(&app, &photo_target, "Mozilla/5.0").await;
+        assert_eq!(browser.status(), StatusCode::SEE_OTHER);
+        assert_eq!(browser.headers().get(header::LOCATION).unwrap().to_str().unwrap(), format!("/share/{photo_link_id}/posts/1"));
+        assert!(browser.headers().get(header::SET_COOKIE).is_some());
+        let browser_from_whatsapp = get_route_with_user_agent(
+            &app,
+            &format!("{photo_target}?open=1"),
+            WHATSAPP_USER_AGENT,
+        ).await;
+        assert_eq!(browser_from_whatsapp.status(), StatusCode::SEE_OTHER);
+        assert!(browser_from_whatsapp.headers().get(header::SET_COOKIE).is_some());
+
+        let (unpublished_link_id, unpublished_secret) = create_link(&database, 1, super::unix_time()).await;
+        let unpublished_target = format!("/share/{unpublished_link_id}/{unpublished_secret}");
+        let unpublished_preview = get_route_with_user_agent(&app, &unpublished_target, WHATSAPP_USER_AGENT).await;
+        let unpublished_body = to_bytes(unpublished_preview.into_body(), 300 * 1024).await.unwrap();
+        let unpublished_html = String::from_utf8(unpublished_body.to_vec()).unwrap();
+        let unpublished_image_path = image_url(&unpublished_html).strip_prefix("https://journey.example").unwrap().to_owned();
+        let connection = Connection::open(&path).unwrap();
+        connection.execute("UPDATE posts SET published = 0 WHERE id = 1", []).unwrap();
+        drop(connection);
+        assert_eq!(get_route(&app, &unpublished_image_path).await.status(), StatusCode::NOT_FOUND);
+
+        std::fs::remove_file(path).unwrap();
     }
 }

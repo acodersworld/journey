@@ -99,7 +99,7 @@ CREATE TABLE IF NOT EXISTS login_throttles (
 );
 ";
 
-const CURRENT_SCHEMA_VERSION: i64 = 8;
+const CURRENT_SCHEMA_VERSION: i64 = 9;
 const REBUILD_DATABASE_MESSAGE: &str = "site database schema is outdated; recreate the SQLite database and run the destructive importer again";
 
 const SHARE_SCHEMA: &str = "\
@@ -127,6 +127,14 @@ CREATE TABLE IF NOT EXISTS share_sessions (
 );
 CREATE INDEX IF NOT EXISTS share_sessions_expiry ON share_sessions(expires_at);
 CREATE INDEX IF NOT EXISTS share_sessions_link ON share_sessions(share_link_id);
+CREATE TABLE IF NOT EXISTS share_preview_images (
+    token_digest TEXT PRIMARY KEY CHECK (length(token_digest) = 64),
+    share_link_id TEXT NOT NULL REFERENCES share_links(id) ON DELETE CASCADE,
+    block_id INTEGER NOT NULL REFERENCES post_blocks(id) ON DELETE CASCADE,
+    expires_at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS share_preview_images_expiry ON share_preview_images(expires_at);
+CREATE INDEX IF NOT EXISTS share_preview_images_link ON share_preview_images(share_link_id);
 ";
 
 #[derive(Clone)]
@@ -359,6 +367,7 @@ impl Database {
                 || table_exists(connection, "login_throttles")?
                 || table_exists(connection, "share_links")?
                 || table_exists(connection, "share_sessions")?
+                || table_exists(connection, "share_preview_images")?
                 || table_exists(connection, "site_settings")?
                 || table_exists(connection, "media_assets")?;
             let published_at_type = if table_exists(connection, "posts")? {
@@ -988,6 +997,111 @@ impl Database {
         .await
     }
 
+    pub async fn whatsapp_share_preview(
+        &self,
+        share_link_id: String,
+        link_token_digest: String,
+        now: Duration,
+    ) -> Result<Option<Post>, String> {
+        self.run(move |connection| {
+            let transaction = connection.transaction()?;
+            let now_seconds = unix_seconds(now);
+            let link = transaction
+                .query_row(
+                    "SELECT l.post_id FROM share_links AS l \
+                     JOIN posts AS p ON p.id = l.post_id \
+                     WHERE l.id = ?1 AND l.token_digest = ?2 AND l.expires_at > ?3 \
+                       AND l.revoked_at IS NULL AND p.published = 1",
+                    params![share_link_id, link_token_digest, now_seconds],
+                    |row| row.get::<_, i64>(0),
+                )
+                .optional()?;
+            let Some(post_id) = link else {
+                transaction.commit()?;
+                return Ok(None);
+            };
+            let post = load_post(&transaction, post_id, PostAccess::Published)?;
+            transaction.commit()?;
+            Ok(post)
+        })
+        .await
+    }
+
+    pub async fn create_whatsapp_preview_image(
+        &self,
+        share_link_id: String,
+        link_token_digest: String,
+        image_token_digest: String,
+        block_id: i64,
+        now: Duration,
+    ) -> Result<Option<Duration>, String> {
+        self.run(move |connection| {
+            let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let now_seconds = unix_seconds(now);
+            let link_expiry = transaction
+                .query_row(
+                    "SELECT l.expires_at FROM share_links AS l \
+                     JOIN posts AS p ON p.id = l.post_id \
+                     WHERE l.id = ?1 AND l.token_digest = ?2 AND l.expires_at > ?3 \
+                       AND l.revoked_at IS NULL AND p.published = 1 \
+                       AND EXISTS (SELECT 1 FROM post_blocks AS b \
+                         JOIN media_assets AS a ON a.storage_key = b.storage_key \
+                         WHERE b.id = ?4 AND b.post_id = p.id \
+                           AND (a.content_type LIKE 'image/%' OR a.content_type LIKE 'video/%'))",
+                    params![share_link_id, link_token_digest, now_seconds, block_id],
+                    |row| row.get::<_, i64>(0),
+                )
+                .optional()?;
+            let Some(link_expiry) = link_expiry else {
+                transaction.commit()?;
+                return Ok(None);
+            };
+            let requested_expiry = now_seconds
+                .checked_add(300)
+                .ok_or(rusqlite::Error::IntegralValueOutOfRange(0, now_seconds))?;
+            let expires_at = requested_expiry.min(link_expiry);
+            transaction.execute(
+                "INSERT INTO share_preview_images (token_digest, share_link_id, block_id, expires_at) \
+                 VALUES (?1, ?2, ?3, ?4)",
+                params![image_token_digest, share_link_id, block_id, expires_at],
+            )?;
+            transaction.commit()?;
+            Ok(Some(duration_from_seconds(expires_at)))
+        })
+        .await
+    }
+
+    pub async fn whatsapp_preview_media(
+        &self,
+        share_link_id: String,
+        image_token_digest: String,
+        now: Duration,
+    ) -> Result<Option<MediaReference>, String> {
+        self.run(move |connection| {
+            let now_seconds = unix_seconds(now);
+            connection
+                .query_row(
+                    "SELECT a.storage_key, a.content_type FROM share_preview_images AS i \
+                     JOIN share_links AS l ON l.id = i.share_link_id \
+                     JOIN posts AS p ON p.id = l.post_id \
+                     JOIN post_blocks AS b ON b.id = i.block_id AND b.post_id = p.id \
+                     JOIN media_assets AS a ON a.storage_key = b.storage_key \
+                     WHERE i.token_digest = ?1 AND i.share_link_id = ?2 AND i.expires_at > ?3 \
+                       AND l.expires_at > ?3 AND l.revoked_at IS NULL AND p.published = 1 \
+                       AND (a.content_type LIKE 'image/%' OR a.content_type LIKE 'video/%')",
+                    params![image_token_digest, share_link_id, now_seconds],
+                    |row| {
+                        Ok(MediaReference {
+                            storage_key: row.get(0)?,
+                            content_type: row.get(1)?,
+                        })
+                    },
+                )
+                .optional()
+        })
+        .await
+    }
+
     pub async fn shared_post(
         &self,
         share_link_id: String,
@@ -1446,6 +1560,11 @@ impl Database {
             if table_exists(&connection, "share_sessions").map_err(|error| error.to_string())? {
                 connection
                     .execute("DELETE FROM share_sessions WHERE expires_at <= ?1", [unix_seconds(unix_time())])
+                    .map_err(|error| error.to_string())?;
+            }
+            if table_exists(&connection, "share_preview_images").map_err(|error| error.to_string())? {
+                connection
+                    .execute("DELETE FROM share_preview_images WHERE expires_at <= ?1", [unix_seconds(unix_time())])
                     .map_err(|error| error.to_string())?;
             }
             operation(&mut connection).map_err(|error| error.to_string())
