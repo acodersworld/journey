@@ -4,6 +4,7 @@
 bind = "127.0.0.1:8080"
 database_path = "./journey-site.sqlite3"
 session_ttl_seconds = 604800
+whatsapp_preview_image_ttl_seconds = 10
 max_media_upload_bytes = 2147483648
 
 [storage]

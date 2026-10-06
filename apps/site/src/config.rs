@@ -25,6 +25,7 @@ pub struct SiteSettings {
     pub control_socket: PathBuf,
     pub allow_insecure_lan_http: bool,
     pub session_ttl_seconds: i64,
+    pub whatsapp_preview_image_ttl_seconds: i64,
     pub max_media_upload_bytes: u64,
 }
 
@@ -57,6 +58,7 @@ impl Default for SiteSettings {
             control_socket: control::default_socket_path(),
             allow_insecure_lan_http: false,
             session_ttl_seconds: 7 * 24 * 60 * 60,
+            whatsapp_preview_image_ttl_seconds: 10,
             max_media_upload_bytes: crate::web::DEFAULT_MAX_MEDIA_UPLOAD_BYTES,
         }
     }

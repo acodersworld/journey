@@ -321,6 +321,7 @@ async fn main() -> AppResult<()> {
                 config.site.public_origin.as_deref(),
                 config.site.session_ttl_seconds,
                 config.site.max_media_upload_bytes,
+                config.site.whatsapp_preview_image_ttl_seconds,
                 allow_insecure_lan_http,
             )
             .map_err(std::io::Error::other)?;
@@ -409,11 +410,32 @@ async fn main() -> AppResult<()> {
                 control::serve(control_listener, control_database, control_storage, control_shutdown).await
             });
 
+            let app_state = web::state_with_security(database, storage.clone(), security);
+            let cleanup_state = app_state.clone();
+            let mut cleanup_shutdown = shutdown.clone();
+            listener_tasks.spawn(async move {
+                let mut cleanup_interval = tokio::time::interval_at(
+                    tokio::time::Instant::now() + Duration::from_secs(60),
+                    Duration::from_secs(60),
+                );
+                loop {
+                    tokio::select! {
+                        signal = shutdown::requested(&mut cleanup_shutdown) => {
+                            signal.map_err(std::io::Error::other)?;
+                            return Ok(());
+                        }
+                        _ = cleanup_interval.tick() => {
+                            web::whatsapp_preview::cleanup_expired(&cleanup_state);
+                        }
+                    }
+                }
+            });
+
             let shutdown_storage = storage.clone();
             let mut http_server = Box::pin(async move {
                 axum::serve(
                     listener,
-                    web::router(web::state_with_security(database, storage, security))
+                    web::router(app_state)
                         .into_make_service_with_connect_info::<SocketAddr>(),
                 )
                 .await

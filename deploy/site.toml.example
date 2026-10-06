@@ -9,6 +9,7 @@ public_origin = "http://127.0.0.1:8080"
 control_socket = "/home/ben/src/journey/deploy/data/control.sock"
 allow_insecure_lan_http = true
 session_ttl_seconds = 604800
+whatsapp_preview_image_ttl_seconds = 10
 max_media_upload_bytes = 2147483648
 
 [storage]

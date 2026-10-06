@@ -16,7 +16,8 @@ secret, creation and expiry times, and an optional revocation time. The raw
 secret is shown only by the create command. `share_sessions` stores a digest of
 an independently generated session token, its link ID, creation time, and an
 expiry no later than the link's fixed expiry. Routine database operations
-remove expired share sessions and WhatsApp preview-image capabilities.
+remove expired share sessions. Preview-image authorizations are process-local
+memory entries removed by a periodic cleanup task.
 
 ## Guest access
 
@@ -67,11 +68,15 @@ omit `og:image`. This request does not create a guest session or set a cookie.
 Other user agents keep the normal session-cookie and redirect flow.
 
 The image URL is `/share/{link-id}/whatsapp-preview-image/{random-name}.jpg`.
-SQLite stores only its SHA-256 digest, share link ID, selected media block, and
-expiry in `share_preview_images`. The URL expires after five minutes or at the
-share link's expiry, whichever comes first. Each fetch rechecks that the image
-capability and share link are live and that the post is still published and
-unrevoked. Image requests need no cookie or share secret.
+The process stores its SHA-256 token digest, share link ID, selected media
+block, and monotonic expiry deadline in a shared memory map. Its default
+lifetime is 10 seconds, configured by
+`site.whatsapp_preview_image_ttl_seconds`, and is capped by the share link's
+remaining lifetime. Cleanup removes expired entries every 60 seconds; every
+image request also rejects an expired entry immediately. Each accepted fetch
+then rechecks SQLite for link expiry, revocation, publication state, and media
+ownership. Image requests need no cookie or share secret. A process restart
+invalidates every outstanding preview-image URL.
 
 The site asks storage for a JPEG with a 1,200-pixel maximum edge and a
 599,999-byte limit, preserving the source aspect ratio without padding. It
@@ -84,6 +89,7 @@ selects the regular guest-session flow even in a WhatsApp in-app browser.
 WhatsApp may retain a card after its image URL expires or the share link is
 revoked.
 
-The capability table is part of site schema version 9. Startup rejects older
-databases with the existing rebuild instruction; development databases must
-be recreated and the destructive importer run again.
+The in-memory capability map is not part of the SQLite schema. Removing the
+former capability table advances the site schema to version 10. Startup rejects
+older databases with the existing rebuild instruction; development databases
+must be recreated and the destructive importer run again.
