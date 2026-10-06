@@ -35,59 +35,23 @@ pub struct StorageResponse {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ImageReductionDimensions {
-    MaxEdge(u32),
-    BoundingBox { width: u32, height: u32 },
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ImageReductionFit {
-    Contain,
-    Pad,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ImageReductionFormat {
-    Preserve,
-    Jpeg,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ImageReductionOptions {
-    dimensions: ImageReductionDimensions,
-    fit: ImageReductionFit,
-    format: ImageReductionFormat,
+    max_edge: u32,
     max_bytes: Option<u64>,
 }
 
 impl ImageReductionOptions {
     pub fn new(
-        dimensions: ImageReductionDimensions,
-        fit: ImageReductionFit,
-        format: ImageReductionFormat,
+        max_edge: u32,
         max_bytes: Option<u64>,
     ) -> Result<Self, String> {
-        let valid_dimension = |value: u32| (1..=2_048).contains(&value);
-        match dimensions {
-            ImageReductionDimensions::MaxEdge(edge) if !valid_dimension(edge) => {
-                return Err("Image dimensions must be between 1 and 2048 pixels".to_owned());
-            }
-            ImageReductionDimensions::BoundingBox { width, height }
-                if !valid_dimension(width) || !valid_dimension(height) =>
-            {
-                return Err("Image dimensions must be between 1 and 2048 pixels".to_owned());
-            }
-            _ => {}
+        if !(1..=2_048).contains(&max_edge) {
+            return Err("Image dimensions must be between 1 and 2048 pixels".to_owned());
         }
-        if fit == ImageReductionFit::Pad
-            && !matches!(dimensions, ImageReductionDimensions::BoundingBox { .. })
-        {
-            return Err("Padded image output requires width and height".to_owned());
+        if max_bytes == Some(0) {
+            return Err("Image byte limit must be positive".to_owned());
         }
-        if max_bytes == Some(0) || (max_bytes.is_some() && format != ImageReductionFormat::Jpeg) {
-            return Err("Image byte limit requires explicit JPEG output and a positive limit".to_owned());
-        }
-        Ok(Self { dimensions, fit, format, max_bytes })
+        Ok(Self { max_edge, max_bytes })
     }
 }
 
@@ -633,34 +597,21 @@ async fn get_reduced_image<T: StorageRequestTransport>(
     let representation = if video_thumbnail { "thumbnail" } else { "reduced-image" };
     let mut request = storage_request(method, key, None, None, None, false, false, Some(representation))?;
     let headers = request.headers_mut();
-    match options.dimensions {
-        ImageReductionDimensions::MaxEdge(edge) => {
-            let value = edge.to_string().parse().map_err(|error| format!("invalid image edge header: {error}"))?;
-            headers.insert("Object-Image-Max-Edge", value);
-        }
-        ImageReductionDimensions::BoundingBox { width, height } => {
-            let width = width.to_string().parse().map_err(|error| format!("invalid image width header: {error}"))?;
-            let height = height.to_string().parse().map_err(|error| format!("invalid image height header: {error}"))?;
-            headers.insert("Object-Image-Width", width);
-            headers.insert("Object-Image-Height", height);
-        }
-    }
-    let fit = match options.fit {
-        ImageReductionFit::Contain => "contain",
-        ImageReductionFit::Pad => "pad",
-    };
+    let edge = options.max_edge.to_string();
+    let edge = edge.parse().map_err(|error| format!("invalid image edge header: {error}"))?;
+    headers.insert("Object-Image-Max-Edge", edge);
     headers.insert(
         "Object-Image-Fit",
-        fit.parse().map_err(|error| format!("invalid image fit header: {error}"))?,
+        "contain"
+            .parse()
+            .map_err(|error| format!("invalid image fit header: {error}"))?,
     );
-    if options.format == ImageReductionFormat::Jpeg {
-        headers.insert(
-            "Object-Image-Format",
-            "jpeg"
-                .parse()
-                .map_err(|error| format!("invalid image format header: {error}"))?,
-        );
-    }
+    headers.insert(
+        "Object-Image-Format",
+        "jpeg"
+            .parse()
+            .map_err(|error| format!("invalid image format header: {error}"))?,
+    );
     if let Some(max_bytes) = options.max_bytes {
         let value = max_bytes
             .to_string()

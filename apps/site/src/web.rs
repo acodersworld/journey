@@ -14,7 +14,7 @@ use std::{io, net::{IpAddr, SocketAddr}, time::{Duration, SystemTime, UNIX_EPOCH
 use crate::{
     auth,
     db::{AccountRole, AuthenticatedAccount, Database, FeedCursor, MediaReference, NewBlock, Post, PostAccess, SaveDraftResult, ShareAccess, SidebarData},
-    storage::{ImageReductionDimensions, ImageReductionFit, ImageReductionFormat, ImageReductionOptions, StorageBody, StorageClient, UPLOAD_LIMIT_ERROR},
+    storage::{ImageReductionOptions, StorageBody, StorageClient, UPLOAD_LIMIT_ERROR},
 };
 
 const DEFAULT_FEED_LIMIT: usize = 10;
@@ -407,9 +407,7 @@ async fn whatsapp_preview_image<S: StorageClient>(
         }
     };
     let options = ImageReductionOptions::new(
-        ImageReductionDimensions::MaxEdge(WHATSAPP_PREVIEW_IMAGE_MAX_EDGE),
-        ImageReductionFit::Contain,
-        ImageReductionFormat::Jpeg,
+        WHATSAPP_PREVIEW_IMAGE_MAX_EDGE,
         Some(WHATSAPP_PREVIEW_IMAGE_MAX_BYTES),
     ).expect("WhatsApp preview image reduction options are valid");
     let head = method == Method::HEAD;
@@ -2859,7 +2857,7 @@ mod tests {
     use crate::{
         auth,
         db::{AccountRole, Database, ImportedAccount, NewBlock, NewPost, Post, PostAccess, PostBlock, PostSummary, ShareAccess, SidebarData},
-        storage::{ImageReductionDimensions, ImageReductionFit, ImageReductionFormat, ImageReductionOptions, StorageBody, StorageClient, StorageResponse},
+        storage::{ImageReductionOptions, StorageBody, StorageClient, StorageResponse},
     };
     use axum::{
         body::{to_bytes, Body},
@@ -4057,9 +4055,7 @@ mod tests {
         assert_eq!(requests[0].0, "media/first-photo");
         assert!(!requests[0].1);
         assert_eq!(requests[0].2, ImageReductionOptions::new(
-            ImageReductionDimensions::MaxEdge(1200),
-            ImageReductionFit::Contain,
-            ImageReductionFormat::Jpeg,
+            1200,
             Some(599_999),
         ).unwrap());
         let connection = Connection::open(&path).unwrap();

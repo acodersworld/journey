@@ -118,10 +118,12 @@ thumbnail behavior. All representation and image-option headers appear in
 `Vary`, and generated responses return their actual content type and length.
 `HEAD` generates the same representation as `GET` but sends no body.
 
-The storage client exposes a typed `get_reduced_image` method so callers do not
-need to construct protocol headers. The website can use the same options for
-stored photos and video thumbnails. The filesystem and in-memory stores share
-the implementation over their existing payload readers; they create no image
+The site storage client exposes a typed `get_reduced_image` method for max-edge,
+contain-fit JPEG output with an optional byte cap, so callers do not need to
+construct protocol headers. The storage protocol also supports bounding-box
+dimensions, padded output, and preserving supported source formats for clients
+that need those options. The filesystem and in-memory stores share the
+implementation over their existing payload readers; they create no image
 variant object or image-reduction cache. Native decode and encode work runs in
 blocking tasks under a shared two-job semaphore. Source images are limited to
 64 MiB and decoded images to 16 million pixels. The original payload and
