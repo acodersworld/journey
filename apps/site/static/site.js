@@ -34,16 +34,26 @@ function formatLocalTimes(root) {
 
 syncBrowserTimezone();
 
-function initializeVideoThumbnails(root = document) {
+function initializeGalleryMediaImages(root = document) {
   const images = [];
-  if (root.matches?.('img[data-video-thumbnail]')) images.push(root);
-  images.push(...root.querySelectorAll?.('img[data-video-thumbnail]') || []);
+  const selector = 'img[data-video-thumbnail], img.gallery-panel-image';
+  if (root.matches?.(selector)) images.push(root);
+  images.push(...root.querySelectorAll?.(selector) || []);
   images.forEach(image => {
     if (image.hasAttribute('data-src')) return;
-    if (image.complete && image.naturalWidth > 0) {
+    if (image.complete && image.naturalWidth > 0 && image.hasAttribute('data-video-thumbnail')) {
       image.closest('[data-video-preview-frame]')?.setAttribute('data-ready', '');
     }
+    updateGalleryMediaAspectRatio(image);
   });
+}
+
+function updateGalleryMediaAspectRatio(image) {
+  if (image.naturalWidth === 0 || image.naturalHeight === 0) return;
+  image.closest('.gallery-panel-media')?.style.setProperty(
+    '--gallery-media-ratio',
+    `${image.naturalWidth} / ${image.naturalHeight}`,
+  );
 }
 
 function initializeVideoControls(video, container = video?.parentElement) {
@@ -97,11 +107,22 @@ function createVideoPlayerFrame(video, className = '') {
 
 document.querySelectorAll('video[data-video-controls]').forEach(video => initializeVideoControls(video));
 
+document.addEventListener('play', event => {
+  const playingVideo = event.target;
+  if (!(playingVideo instanceof HTMLVideoElement)) return;
+  document.querySelectorAll('video').forEach(video => {
+    if (video !== playingVideo && !video.paused) video.pause();
+  });
+}, true);
+
 document.addEventListener('load', event => {
   const image = event.target;
-  if (!(image instanceof HTMLImageElement) || !image.hasAttribute('data-video-thumbnail')) return;
-  image.hidden = false;
-  image.closest('[data-video-preview-frame]')?.setAttribute('data-ready', '');
+  if (!(image instanceof HTMLImageElement)) return;
+  if (image.hasAttribute('data-video-thumbnail')) {
+    image.hidden = false;
+    image.closest('[data-video-preview-frame]')?.setAttribute('data-ready', '');
+  }
+  updateGalleryMediaAspectRatio(image);
 }, true);
 
 document.addEventListener('error', event => {
@@ -111,7 +132,7 @@ document.addEventListener('error', event => {
   image.closest('[data-video-preview-frame]')?.removeAttribute('data-ready');
 }, true);
 
-initializeVideoThumbnails();
+initializeGalleryMediaImages();
 
 const sidebarLayout = document.querySelector('#site-layout');
 
@@ -1352,7 +1373,7 @@ if (feed) {
         if (!article || !article.matches('article.post')) throw new Error('Invalid post fragment');
         feed.append(article);
         formatLocalTimes(article);
-        initializeVideoThumbnails(article);
+        initializeGalleryMediaImages(article);
         nextCursor = typeof page.next_cursor === 'string' ? page.next_cursor : null;
       }
 
@@ -1408,7 +1429,7 @@ if (galleryPanel) {
       image.src = image.dataset.src;
       image.removeAttribute('data-src');
     });
-    initializeVideoThumbnails(entry);
+    initializeGalleryMediaImages(entry);
   }
 
   function checkPanelMediaVisibility() {
@@ -1463,12 +1484,14 @@ if (galleryPanel) {
     media.dataset.mediaSrc = mediaUrl;
 
     if (mediaType.startsWith('image/')) {
+      media.classList.add('gallery-panel-image-media');
       const image = document.createElement('img');
       image.className = 'gallery-panel-image';
       image.alt = item.dataset.alt || '';
       image.dataset.src = mediaUrl;
       media.append(image);
     } else if (mediaType.startsWith('video/')) {
+      media.classList.add('gallery-panel-video-media');
       const frame = document.createElement('div');
       frame.className = 'video-preview-frame gallery-panel-video-frame';
       frame.dataset.videoPreviewFrame = '';
@@ -1497,6 +1520,10 @@ if (galleryPanel) {
         player.preload = 'none';
         player.poster = item.dataset.thumbnailSrc || '';
         player.setAttribute('aria-label', itemLabel || `Video ${index + 1}`);
+        player.addEventListener('loadedmetadata', () => {
+          if (!media.isConnected || player.videoWidth === 0 || player.videoHeight === 0) return;
+          media.style.setProperty('--gallery-media-ratio', `${player.videoWidth} / ${player.videoHeight}`);
+        });
         const playerFrame = createVideoPlayerFrame(player, 'gallery-panel-player-frame');
         frame.replaceChildren(playerFrame);
         player.src = mediaUrl;

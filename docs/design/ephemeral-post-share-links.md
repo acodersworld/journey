@@ -58,13 +58,13 @@ They return private no-store responses.
 
 ## WhatsApp card previews
 
-The copied `/share/{link-id}/{secret}` URL also serves WhatsApp's documented
-`WhatsApp/2.x.x.x A|I|N` user-agent form. A valid crawler request receives a
-small HTML page with escaped title and summary metadata and absolute `og:url`
-and, when media exists, `og:image` URLs. The first image or video thumbnail in
-post order is used; text-only posts omit `og:image`. This request does not
-create a guest session or set a cookie. Other user agents keep the normal
-session-cookie and redirect flow.
+The copied `/share/{link-id}/{secret}` URL also serves WhatsApp user agents of
+the form `WhatsApp/2.x.x.x`, optionally followed by the `A`, `I`, or `N` client
+marker. A valid crawler request receives a small HTML page with escaped title
+and summary metadata and absolute `og:url` and, when media exists, `og:image`
+URLs. The first image or video thumbnail in post order is used; text-only posts
+omit `og:image`. This request does not create a guest session or set a cookie.
+Other user agents keep the normal session-cookie and redirect flow.
 
 The image URL is `/share/{link-id}/whatsapp-preview-image/{random-name}.jpg`.
 SQLite stores only its SHA-256 digest, share link ID, selected media block, and
@@ -73,8 +73,9 @@ share link's expiry, whichever comes first. Each fetch rechecks that the image
 capability and share link are live and that the post is still published and
 unrevoked. Image requests need no cookie or share secret.
 
-The site asks storage for a padded 1200×300 JPEG with a 599,999-byte limit,
-using its reduced-image representation for photos and reduced thumbnail
+The site asks storage for a JPEG with a 1,200-pixel maximum edge and a
+599,999-byte limit, preserving the source aspect ratio without padding. It
+uses its reduced-image representation for photos and reduced thumbnail
 representation for videos. It checks the response type and declared length,
 enforces the size limit while streaming, and applies private no-store caching
 to both preview and image responses. The preview page includes an “Open post”

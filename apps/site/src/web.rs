@@ -21,8 +21,7 @@ const DEFAULT_FEED_LIMIT: usize = 10;
 const MAX_FEED_LIMIT: usize = 100;
 pub const DEFAULT_MAX_MEDIA_UPLOAD_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 const WHATSAPP_PREVIEW_IMAGE_MAX_BYTES: u64 = 599_999;
-const WHATSAPP_PREVIEW_IMAGE_WIDTH: u32 = 1_200;
-const WHATSAPP_PREVIEW_IMAGE_HEIGHT: u32 = 300;
+const WHATSAPP_PREVIEW_IMAGE_MAX_EDGE: u32 = 1_200;
 
 #[derive(Clone)]
 pub struct AppState<S: StorageClient> {
@@ -396,7 +395,7 @@ async fn whatsapp_preview_image<S: StorageClient>(
         return share_not_found();
     }
     let media = match state.database.whatsapp_preview_media(
-        share_link_id,
+        share_link_id.clone(),
         auth::session_token_digest(token),
         unix_time(),
     ).await {
@@ -408,11 +407,8 @@ async fn whatsapp_preview_image<S: StorageClient>(
         }
     };
     let options = ImageReductionOptions::new(
-        ImageReductionDimensions::BoundingBox {
-            width: WHATSAPP_PREVIEW_IMAGE_WIDTH,
-            height: WHATSAPP_PREVIEW_IMAGE_HEIGHT,
-        },
-        ImageReductionFit::Pad,
+        ImageReductionDimensions::MaxEdge(WHATSAPP_PREVIEW_IMAGE_MAX_EDGE),
+        ImageReductionFit::Contain,
         ImageReductionFormat::Jpeg,
         Some(WHATSAPP_PREVIEW_IMAGE_MAX_BYTES),
     ).expect("WhatsApp preview image reduction options are valid");
@@ -424,9 +420,23 @@ async fn whatsapp_preview_image<S: StorageClient>(
         head,
     ).await {
         Ok(stored) if stored.status == StatusCode::OK => stored,
-        Ok(_) => return no_store(StatusCode::BAD_GATEWAY.into_response()),
+        Ok(stored) => {
+            eprintln!(
+                "website WhatsApp preview image storage returned an unexpected status: share_link_id={share_link_id} storage_key={:?} source_content_type={:?} status={} response_content_type={:?} response_content_length={:?}",
+                media.storage_key,
+                media.content_type,
+                stored.status,
+                stored.headers.get(header::CONTENT_TYPE),
+                stored.headers.get(header::CONTENT_LENGTH),
+            );
+            return no_store(StatusCode::BAD_GATEWAY.into_response());
+        }
         Err(error) => {
-            eprintln!("website WhatsApp preview image fetch failed: {error}");
+            eprintln!(
+                "website WhatsApp preview image storage request failed: share_link_id={share_link_id} storage_key={:?} source_content_type={:?}: {error}",
+                media.storage_key,
+                media.content_type,
+            );
             return no_store(StatusCode::BAD_GATEWAY.into_response());
         }
     };
@@ -435,14 +445,37 @@ async fn whatsapp_preview_image<S: StorageClient>(
         .and_then(|value| value.split(';').next())
         .map(str::trim);
     if content_type != Some("image/jpeg") {
+        eprintln!(
+            "website WhatsApp preview image storage returned an unexpected content type: share_link_id={share_link_id} storage_key={:?} source_content_type={:?} response_content_type={:?} response_content_length={:?}",
+            media.storage_key,
+            media.content_type,
+            stored.headers.get(header::CONTENT_TYPE),
+            stored.headers.get(header::CONTENT_LENGTH),
+        );
         return no_store(StatusCode::BAD_GATEWAY.into_response());
     }
     let content_length = match stored.headers.get(header::CONTENT_LENGTH) {
         Some(value) => match value.to_str().ok().and_then(|value| value.parse::<u64>().ok()) {
             Some(length) if (1..=WHATSAPP_PREVIEW_IMAGE_MAX_BYTES).contains(&length) => length,
-            _ => return no_store(StatusCode::BAD_GATEWAY.into_response()),
+            _ => {
+                eprintln!(
+                    "website WhatsApp preview image storage returned an invalid content length: share_link_id={share_link_id} storage_key={:?} source_content_type={:?} response_content_length={:?} maximum={WHATSAPP_PREVIEW_IMAGE_MAX_BYTES}",
+                    media.storage_key,
+                    media.content_type,
+                    stored.headers.get(header::CONTENT_LENGTH),
+                );
+                return no_store(StatusCode::BAD_GATEWAY.into_response());
+            }
         },
-        None => return no_store(StatusCode::BAD_GATEWAY.into_response()),
+        None => {
+            eprintln!(
+                "website WhatsApp preview image storage omitted content length: share_link_id={share_link_id} storage_key={:?} source_content_type={:?} response_content_type={:?} maximum={WHATSAPP_PREVIEW_IMAGE_MAX_BYTES}",
+                media.storage_key,
+                media.content_type,
+                stored.headers.get(header::CONTENT_TYPE),
+            );
+            return no_store(StatusCode::BAD_GATEWAY.into_response());
+        }
     };
     let mut builder = Response::builder()
         .status(StatusCode::OK)
@@ -452,17 +485,26 @@ async fn whatsapp_preview_image<S: StorageClient>(
     let body = if head {
         Body::empty()
     } else {
+        let body_share_link_id = share_link_id.clone();
         let mut streamed_bytes = 0_u64;
         let body = stored.body.map(move |chunk| match chunk {
             Ok(bytes) => {
                 streamed_bytes = streamed_bytes.saturating_add(bytes.len() as u64);
                 if streamed_bytes > WHATSAPP_PREVIEW_IMAGE_MAX_BYTES {
+                    eprintln!(
+                        "website WhatsApp preview image stream exceeded its byte limit: share_link_id={body_share_link_id} bytes={streamed_bytes} maximum={WHATSAPP_PREVIEW_IMAGE_MAX_BYTES}"
+                    );
                     Err(io::Error::other("reduced preview image exceeded its byte limit"))
                 } else {
                     Ok(bytes)
                 }
             }
-            Err(error) => Err(error),
+            Err(error) => {
+                eprintln!(
+                    "website WhatsApp preview image stream failed: share_link_id={body_share_link_id}: {error}"
+                );
+                Err(error)
+            }
         });
         Body::from_stream(body)
     };
@@ -646,12 +688,16 @@ fn is_whatsapp_preview_user_agent(headers: &HeaderMap) -> bool {
             continue;
         };
         let components: Vec<_> = version.split('.').collect();
+        let client_marker_matches = match words.clone().next() {
+            Some(marker) => matches!(marker, "A" | "I" | "N"),
+            None => true,
+        };
         if components.len() == 4
             && components[0] == "2"
             && components[1..].iter().all(|component| {
                 !component.is_empty() && component.bytes().all(|byte| byte.is_ascii_digit())
             })
-            && words.next().is_some_and(|kind| matches!(kind, "A" | "I" | "N"))
+            && client_marker_matches
         {
             return true;
         }
@@ -706,7 +752,7 @@ fn render_whatsapp_share_preview(
     let share_url = escape_html(share_url);
     let open_url = escape_html(open_url);
     let image_metadata = image_url.map(|image_url| format!(
-        "<meta property=\"og:image\" content=\"{}\"><meta property=\"og:image:type\" content=\"image/jpeg\"><meta property=\"og:image:width\" content=\"1200\"><meta property=\"og:image:height\" content=\"300\">",
+        "<meta property=\"og:image\" content=\"{}\"><meta property=\"og:image:type\" content=\"image/jpeg\">",
         escape_html(image_url),
     )).unwrap_or_default();
     format!(
@@ -2546,7 +2592,7 @@ fn render_caption(caption: Option<&str>) -> String {
 
 fn html_head(title: &str) -> String {
     format!(
-        "<meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width, initial-scale=1\"><title>{}</title><link rel=\"stylesheet\" href=\"/site.css\"><script src=\"/site.js\" defer></script>",
+        "<meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width, initial-scale=1, viewport-fit=cover\"><title>{}</title><link rel=\"stylesheet\" href=\"/site.css\"><script src=\"/site.js\" defer></script>",
         escape_html(title),
     )
 }
@@ -3821,16 +3867,20 @@ mod tests {
     }
 
     #[test]
-    fn whatsapp_preview_user_agent_requires_the_documented_version_and_client_marker() {
+    fn whatsapp_preview_user_agent_accepts_the_observed_version_with_or_without_client_marker() {
         for marker in ["A", "I", "N"] {
             let mut headers = http::HeaderMap::new();
             headers.insert(header::USER_AGENT, format!("WhatsApp/2.24.1.78 {marker}").parse().unwrap());
             assert!(super::is_whatsapp_preview_user_agent(&headers));
         }
+        let mut observed_headers = http::HeaderMap::new();
+        observed_headers.insert(header::USER_AGENT, "WhatsApp/2.23.20.0".parse().unwrap());
+        assert!(super::is_whatsapp_preview_user_agent(&observed_headers));
         for user_agent in [
             "WhatsApp/2.24.1 A",
             "WhatsApp/3.24.1.78 A",
             "WhatsApp/2.24.1.78 X",
+            "WhatsApp/2.23.20.0 X",
             "WhatsApp/2.x.1.78 A",
             "Mozilla/5.0",
         ] {
@@ -3966,7 +4016,7 @@ mod tests {
         let text_target = format!("/share/{text_link_id}/{text_secret}");
 
         assert_eq!(
-            get_route_with_user_agent(&app, &format!("/share/{photo_link_id}/{}", auth::new_share_link_secret()), "WhatsApp/2.24.1.78 A").await.status(),
+            get_route_with_user_agent(&app, &format!("/share/{photo_link_id}/{}", auth::new_share_link_secret()), "WhatsApp/2.23.20.0").await.status(),
             StatusCode::NOT_FOUND,
         );
         let (expired_link_id, expired_secret) = create_link(
@@ -3975,11 +4025,11 @@ mod tests {
             now.saturating_sub(Duration::from_secs(90_000)),
         ).await;
         assert_eq!(
-            get_route_with_user_agent(&app, &format!("/share/{expired_link_id}/{expired_secret}"), "WhatsApp/2.24.1.78 A").await.status(),
+            get_route_with_user_agent(&app, &format!("/share/{expired_link_id}/{expired_secret}"), "WhatsApp/2.23.20.0").await.status(),
             StatusCode::NOT_FOUND,
         );
 
-        const WHATSAPP_USER_AGENT: &str = "WhatsApp/2.24.1.78 A";
+        const WHATSAPP_USER_AGENT: &str = "WhatsApp/2.23.20.0";
         let photo_preview = get_route_with_user_agent(&app, &photo_target, WHATSAPP_USER_AGENT).await;
         assert_eq!(photo_preview.status(), StatusCode::OK);
         assert_eq!(photo_preview.headers().get(header::CACHE_CONTROL).unwrap(), "private, no-store");
@@ -3989,8 +4039,8 @@ mod tests {
         assert!(photo_html.contains("property=\"og:url\" content=\"https://journey.example/share/"));
         assert!(photo_html.contains("property=\"og:title\" content=\"A &lt;title&gt; &amp; &quot;quote&quot;\""));
         assert!(photo_html.contains("property=\"og:description\" content=\"Summary &lt;b&gt; &amp; &quot;quote&quot;\""));
-        assert!(photo_html.contains("property=\"og:image:width\" content=\"1200\""));
-        assert!(photo_html.contains("property=\"og:image:height\" content=\"300\""));
+        assert!(!photo_html.contains("property=\"og:image:width\""));
+        assert!(!photo_html.contains("property=\"og:image:height\""));
         assert!(photo_html.contains("Open post"));
         assert!(photo_html.contains("?open=1"));
         assert!(photo_html.contains("window.location.replace(document.getElementById('open-post').href)"));
@@ -4007,8 +4057,8 @@ mod tests {
         assert_eq!(requests[0].0, "media/first-photo");
         assert!(!requests[0].1);
         assert_eq!(requests[0].2, ImageReductionOptions::new(
-            ImageReductionDimensions::BoundingBox { width: 1200, height: 300 },
-            ImageReductionFit::Pad,
+            ImageReductionDimensions::MaxEdge(1200),
+            ImageReductionFit::Contain,
             ImageReductionFormat::Jpeg,
             Some(599_999),
         ).unwrap());
