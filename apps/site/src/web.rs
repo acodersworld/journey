@@ -1771,6 +1771,19 @@ fn render_draft_editor(
     role: AccountRole,
     created: bool,
 ) -> String {
+    let content = render_draft_editor_content(post, created, false);
+    render_site_page(
+        if post.is_some() { "Edit draft" } else { "New draft" },
+        sidebar,
+        &content,
+        false,
+        username,
+        role,
+        false,
+    )
+}
+
+fn render_draft_editor_content(post: Option<&Post>, created: bool, overlay: bool) -> String {
     let post_id = post.map(|post| post.summary.id.to_string()).unwrap_or_default();
     let heading = if post.is_some() { "Edit draft" } else { "New draft" };
     let confirmation = if created {
@@ -1778,12 +1791,21 @@ fn render_draft_editor(
     } else {
         ""
     };
-    let content = concat!(
-        "<main class=\"site site-new-post\">",
-        "<header class=\"new-post-heading\"><p class=\"back-link\"><a href=\"/\">All posts</a></p><h1 data-editor-heading></h1></header>",
-        "<form class=\"draft-form\" id=\"draft-form\" data-draft-post-id=\"",
+    let back_link = if overlay {
+        ""
+    } else {
+        "<p class=\"back-link\"><a href=\"/\">All posts</a></p>"
+    };
+    let main_class = if overlay {
+        "site site-new-post new-post-editor-content"
+    } else {
+        "site site-new-post"
+    };
+    let mut content = format!(
+        "<main class=\"{main_class}\"><header class=\"new-post-heading\">{back_link}<h1 id=\"new-post-editor-heading\" data-editor-heading>{}</h1></header>{confirmation}",
+        escape_html(heading),
     );
-    let mut content = content.to_owned();
+    content.push_str("<form class=\"draft-form\" id=\"draft-form\" data-draft-post-id=\"");
     content.push_str(&escape_html(&post_id));
     content.push_str(concat!(
         "\" novalidate>",
@@ -1795,9 +1817,14 @@ fn render_draft_editor(
         "<div class=\"draft-submit-area\"><p id=\"draft-status\" role=\"status\" aria-live=\"polite\">Not saved yet.</p><div class=\"draft-submit-actions\"><div class=\"draft-action-group\"><button class=\"draft-submit-button\" id=\"draft-submit\" type=\"submit\">Save draft</button><div class=\"draft-publish-control\"><button class=\"post-publish-button\" id=\"draft-publish\" type=\"button\" data-publish-post=\"\" aria-describedby=\"draft-publish-help\" hidden>Publish</button><p class=\"draft-publish-help\" id=\"draft-publish-help\" hidden>Add a title before publishing.</p></div></div></div></div>",
         "</form></main>",
     ));
-    let content = content.replace("<h1 data-editor-heading></h1>", &format!("<h1 data-editor-heading>{}</h1>", escape_html(heading)))
-        .replace("</header>", &format!("</header>{confirmation}"));
-    render_site_page(heading, sidebar, &content, false, username, role, false)
+    content
+}
+
+fn render_new_post_overlay() -> String {
+    format!(
+        "<dialog id=\"new-post-editor-dialog\" class=\"new-post-editor-dialog\" aria-labelledby=\"new-post-editor-heading\"><button class=\"new-post-editor-close\" type=\"button\" aria-label=\"Close new post editor\">×</button>{}<input class=\"new-post-photo-input\" id=\"new-post-overlay-photo-input\" type=\"file\" accept=\"image/jpeg,image/png,image/webp,image/gif,image/heic,image/heif,.jpg,.jpeg,.png,.webp,.gif,.heic,.heif\" multiple></dialog>",
+        render_draft_editor_content(None, false, true),
+    )
 }
 
 fn render_feed_controls(main_open: &str, feed: &str, next_cursor: Option<&str>) -> String {
@@ -1868,13 +1895,21 @@ fn render_site_page(
     } else {
         ""
     };
+    let new_post_overlay = if show_new_post
+        && matches!(role, AccountRole::Write | AccountRole::Admin)
+    {
+        render_new_post_overlay()
+    } else {
+        String::new()
+    };
     let html = format!(
-        "<!doctype html><html lang=\"en\"><head>{}</head><body><div class=\"site-layout\" id=\"site-layout\"><button class=\"sidebar-toggle\" id=\"sidebar-toggle\" type=\"button\" aria-controls=\"site-sidebar\" aria-expanded=\"false\" aria-label=\"Open sidebar\"><span aria-hidden=\"true\">›</span></button><button class=\"sidebar-backdrop\" id=\"sidebar-backdrop\" type=\"button\" aria-label=\"Close sidebar\" hidden></button>{}{}{}</div>{}{}{}{}</body></html>",
+        "<!doctype html><html lang=\"en\"><head>{}</head><body><div class=\"site-layout\" id=\"site-layout\"><button class=\"sidebar-toggle\" id=\"sidebar-toggle\" type=\"button\" aria-controls=\"site-sidebar\" aria-expanded=\"false\" aria-label=\"Open sidebar\"><span aria-hidden=\"true\">›</span></button><button class=\"sidebar-backdrop\" id=\"sidebar-backdrop\" type=\"button\" aria-label=\"Close sidebar\" hidden></button>{}{}{}</div>{}{}{}{}{}</body></html>",
         html_head(title),
         render_sidebar(sidebar),
         render_account_controls(username),
         content,
         new_post_button,
+        new_post_overlay,
         gallery_panel,
         PUBLISH_DIALOG_HTML,
         SHARE_DIALOG_HTML,

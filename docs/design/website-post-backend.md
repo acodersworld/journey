@@ -137,6 +137,15 @@ a placement, and edit each placement's label, caption, and alt text. Save plus
 autosave send the entire tree with its revision. The editor serializes saves
 and uploads and saves a target root before uploading to it. Save and upload
 status remain visible, and a revision conflict asks the author to reload.
+On mobile, tapping **+ New post** opens the editor in a full-screen overlay on
+the current page and launches the browser's multiple-image picker from that
+tap. The platform picker can offer camera and file choices. Selecting photos
+creates the first root block and queues them in selection order through the
+editor's normal upload flow. Canceling the picker leaves the blank editor open
+without creating or saving a draft; closing the overlay returns to the
+underlying page. Desktop navigation and direct visits to `/posts/new` open the
+editor normally. The normal Add media action continues to support photos and
+videos.
 Publishing warns that some browsers may not display original media and
 provides an authenticated `?download=1` fallback. The publish dialog uses
 server time by default or accepts a browser-local date and time override.

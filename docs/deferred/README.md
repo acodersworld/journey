@@ -6,5 +6,6 @@ the implementation decisions are settled.
 
 - [Storage diagnostics and administration](storage-diagnostics-and-administration.md)
 - [Website image variants](website-image-variants.md)
+- [Journal mobile app using a WebView](journal-mobile-webview-app.md)
 - [HTTP/2-over-WebSocket crate extraction](h2-over-websocket-crate-extraction.md)
 - [HTTP/2-over-WebSocket verification checklist](h2-over-websocket-hardening-checklist.md)

@@ -381,6 +381,7 @@ if (publishDialog) {
 }
 
 const draftForm = document.querySelector('#draft-form');
+const newPostEditorDialog = document.querySelector('#new-post-editor-dialog');
 
 if (draftForm) {
   const rootBlockList = document.querySelector('#draft-root-blocks');
@@ -398,6 +399,7 @@ if (draftForm) {
   let dirty = false;
   let saveTimer = null;
   let operationQueue = Promise.resolve();
+  let queuedOperationCount = 0;
   const uploadedFiles = new WeakMap();
   let draggedMedia = null;
 
@@ -412,8 +414,9 @@ if (draftForm) {
   }
 
   function queueOperation(operation) {
+    queuedOperationCount += 1;
     const result = operationQueue.then(operation);
-    operationQueue = result.catch(() => {});
+    operationQueue = result.catch(() => {}).finally(() => { queuedOperationCount -= 1; });
     return result;
   }
 
@@ -759,7 +762,9 @@ if (draftForm) {
       postId = saved.id;
       revision = saved.revision;
       draftForm.dataset.draftPostId = String(postId);
-      if (wasNew) window.history.replaceState(null, '', `/posts/${encodeURIComponent(postId)}`);
+      if (wasNew && (!newPostEditorDialog || newPostEditorDialog.open)) {
+        window.history.replaceState(window.history.state, '', `/posts/${encodeURIComponent(postId)}`);
+      }
       applySavedIds(saved, snapshot);
       updatePublishButton();
       if (editVersion === snapshot.version) {
@@ -1141,6 +1146,89 @@ if (draftForm) {
     saveTimer = null;
     return queueOperation(() => saveDraftNow());
   };
+
+  const newPostLink = document.querySelector('.new-post-float');
+  const mobileNewPostLayout = window.matchMedia(
+    '(max-width: 600px), (orientation: landscape) and (max-height: 500px) and (pointer: coarse)',
+  ).matches;
+  if (newPostEditorDialog && newPostLink && !postId && mobileNewPostLayout) {
+    const photoInput = document.querySelector('#new-post-overlay-photo-input');
+
+    function resetNewDraftEditor() {
+      if (saveTimer) window.clearTimeout(saveTimer);
+      saveTimer = null;
+      rootBlockList.querySelectorAll('[data-preview-url]').forEach(item => URL.revokeObjectURL(item.dataset.previewUrl));
+      rootBlockList.replaceChildren();
+      titleInput.value = '';
+      summaryInput.value = '';
+      tagsInput.value = '';
+      postId = null;
+      revision = null;
+      editVersion = 0;
+      dirty = false;
+      draftForm.dataset.draftPostId = '';
+      clearDraftError();
+      updateDraftBlockControls();
+      updatePublishButton();
+      updateStatus('Not saved yet.');
+    }
+
+    function addChosenPhotos() {
+      const files = Array.from(photoInput.files || []);
+      photoInput.value = '';
+      if (files.length === 0) return;
+      const block = makeDraftBlock();
+      rootBlockList.append(block);
+      updateDraftBlockControls();
+      block.querySelector('[data-block-field="header"]').focus({ preventScroll: true });
+      queueMediaUpload(block, files);
+    }
+
+    newPostLink.addEventListener('click', event => {
+      event.preventDefault();
+      const hasPendingUploads = Boolean(rootBlockList.querySelector('[data-upload-pending]'));
+      const hasUnfinishedWork = postId || dirty || saveTimer || queuedOperationCount > 0
+        || draftForm.hasAttribute('aria-busy') || hasPendingUploads;
+      if (postId && !dirty && !saveTimer && queuedOperationCount === 0
+        && !draftForm.hasAttribute('aria-busy') && !hasPendingUploads) {
+        resetNewDraftEditor();
+      } else if (hasUnfinishedWork) {
+        if (saveTimer) window.clearTimeout(saveTimer);
+        saveTimer = null;
+        queueOperation(() => saveDraftNow(true)).then(() => {
+          window.location.assign(newPostLink.href);
+        }).catch(() => {
+          newPostEditorDialog.showModal();
+          window.history.pushState(
+            { journeyNewPostOverlay: true },
+            '',
+            postId ? `/posts/${encodeURIComponent(postId)}` : '/posts/new',
+          );
+        });
+        return;
+      }
+      newPostEditorDialog.showModal();
+      window.history.pushState({ journeyNewPostOverlay: true }, '', '/posts/new');
+      photoInput.click();
+    });
+    photoInput.addEventListener('change', addChosenPhotos);
+    photoInput.addEventListener('cancel', () => titleInput.focus({ preventScroll: true }));
+    newPostEditorDialog.querySelector('.new-post-editor-close').addEventListener('click', () => newPostEditorDialog.close());
+    newPostEditorDialog.addEventListener('click', event => {
+      if (event.target === newPostEditorDialog) newPostEditorDialog.close();
+    });
+    newPostEditorDialog.addEventListener('close', () => {
+      if (window.history.state?.journeyNewPostOverlay) window.history.back();
+      if (newPostLink.isConnected) newPostLink.focus({ preventScroll: true });
+    });
+    window.addEventListener('popstate', () => {
+      if (window.history.state?.journeyNewPostOverlay) {
+        if (!newPostEditorDialog.open) newPostEditorDialog.showModal();
+      } else if (newPostEditorDialog.open) {
+        newPostEditorDialog.close();
+      }
+    });
+  }
 
   updatePublishButton();
   loadExistingDraft();

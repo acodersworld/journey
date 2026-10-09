@@ -881,6 +881,59 @@ body.sidebar-modal-open {
   padding: 2.6rem 1.5rem 1.5rem;
 }
 
+.new-post-editor-dialog {
+  position: fixed;
+  inset: 0;
+  width: 100vw;
+  height: 100vh;
+  height: 100dvh;
+  max-width: none;
+  max-height: 100vh;
+  max-height: 100dvh;
+  margin: 0;
+  padding: 0;
+  overflow: auto;
+  border: 0;
+  background: #111311;
+  color: #ecece6;
+}
+
+.new-post-editor-dialog::backdrop {
+  background: rgb(0 0 0 / 78%);
+}
+
+.new-post-editor-close {
+  position: fixed;
+  z-index: 1;
+  top: max(0.75rem, env(safe-area-inset-top));
+  right: max(0.75rem, env(safe-area-inset-right));
+  width: 2.7rem;
+  height: 2.7rem;
+  border: 1px solid #65695f;
+  border-radius: 50%;
+  background: #20231f;
+  color: #f0efe9;
+  font-size: 1.55rem;
+  line-height: 1;
+  cursor: pointer;
+}
+
+.new-post-editor-close:hover {
+  border-color: #d2b17b;
+  background: #2a2c26;
+}
+
+.new-post-editor-content {
+  width: min(100% - 2rem, 48rem);
+  margin: 0 auto;
+  padding-top: max(4.5rem, calc(env(safe-area-inset-top) + 3.5rem));
+  padding-bottom: max(2rem, env(safe-area-inset-bottom));
+}
+
+.new-post-photo-input {
+  display: none;
+}
+
 .publish-dialog form {
   margin: 0;
 }
