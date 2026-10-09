@@ -10,7 +10,9 @@ COPY Cargo.toml Cargo.lock ./
 COPY apps ./apps
 COPY crates ./crates
 COPY src ./src
-RUN cargo build --locked --release -p journey-storage-service
+ARG BUILD_COMMIT
+RUN test -n "$BUILD_COMMIT" || (echo "BUILD_COMMIT build argument is required" >&2; exit 1)
+RUN BUILD_COMMIT="$BUILD_COMMIT" cargo build --locked --release -p journey-storage-service
 
 FROM debian:trixie-slim
 

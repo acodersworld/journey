@@ -30,6 +30,7 @@ async fn main() -> AppResult<()> {
     let Some(config_path) = config_path_from_arguments()? else {
         return Ok(());
     };
+    println!("journey-storage-service {}", env!("JOURNEY_BINARY_VERSION"));
     let config = AppConfig::load(Some(config_path))?;
     let mut shutdown = shutdown::listen();
 
@@ -197,6 +198,10 @@ fn config_path_from_arguments() -> AppResult<Option<PathBuf>> {
             print_help();
             Ok(None)
         }
+        [argument] if argument == "-V" || argument == "--version" => {
+            println!("journey-storage-service {}", env!("JOURNEY_BINARY_VERSION"));
+            Ok(None)
+        }
         [flag, path] if flag == "--config" || flag == "-c" => Ok(Some(PathBuf::from(path))),
         [flag] if flag == "--config" || flag == "-c" => {
             Err(format!("{flag} requires a TOML configuration file path").into())
@@ -212,7 +217,7 @@ fn print_help() {
     println!(
         r#"journey-storage-service
 
-Usage: journey-storage-service [--config <PATH>]
+Usage: journey-storage-service [--config <PATH>] [-V|--version]
 
 Select the TOML configuration with --config or JOURNEY_CONFIG.
 See deploy/storage.toml.example for the available settings."#

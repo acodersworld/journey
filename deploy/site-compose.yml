@@ -25,7 +25,7 @@ services:
         max-file: "2"
 
   site:
-    image: ${JOURNEY_IMAGE:?set JOURNEY_IMAGE to the built image tag}
+    image: ${JOURNEY_SITE_IMAGE:?set JOURNEY_SITE_IMAGE to the site image tag}
     command:
       - /usr/local/bin/journey-site
       - serve

@@ -6,22 +6,29 @@ outbound `ws://` connection to the site host; HTTP/2 storage requests travel
 inside that WebSocket session. This is a disposable test for a trusted LAN.
 Do not forward either port from the internet.
 
-## Build and copy the image
+## Build and copy the images
 
-Build one image from the repository root, then make it available on both hosts:
+Build separate site and storage images from the current commit. The helper uses
+one temporary depth-one clone, so staged, unstaged, and untracked changes in
+the checkout are excluded:
 
-    docker build -t journey-lan:test .
-    docker image save journey-lan:test -o journey-lan.tar
-    scp journey-lan.tar <site-host>:/tmp/
-    scp journey-lan.tar <storage-host>:/tmp/
+    ./deploy/build-image.sh all
+    docker image save journal-site:latest -o journey-site.tar
+    docker image save storage:latest -o journey-storage.tar
+    scp journey-site.tar <site-host>:/tmp/
+    scp journey-storage.tar <storage-host>:/tmp/
 
-On each host, load the image and copy the `deploy/` bundle:
+On the site host, load the site image and copy the `deploy/` bundle:
 
-    docker image load -i /tmp/journey-lan.tar
+    docker image load -i /tmp/journey-site.tar
 
-The Compose image tag must match `JOURNEY_IMAGE` in that host's environment
-file. For remote hosts, transfer `journey-lan.tar` and the deployment files by
-your usual trusted LAN or SSH method.
+On the storage host, load the storage image and copy the `deploy/` bundle:
+
+    docker image load -i /tmp/journey-storage.tar
+
+The image tags must match `JOURNEY_SITE_IMAGE` and `JOURNEY_STORAGE_IMAGE` in
+their respective host environment files. For remote hosts, transfer the image
+archives and deployment files by your usual trusted LAN or SSH method.
 
 ## Configure the shared secret
 
@@ -38,7 +45,7 @@ Copy `site-compose.yml`, `nginx.conf`, `site.env.example`, and
 examples to `.env` and `site.toml`, then set:
 
 - `SITE_LAN_IP` to the site's LAN address.
-- `JOURNEY_IMAGE` to the image tag loaded above.
+- `JOURNEY_SITE_IMAGE` to the site image tag loaded above.
 - `JOURNEY_IMPORT_DIR` to a host directory containing manifests and their
   referenced media files.
 - `site.toml`'s `site.public_origin` to `http://` followed by the site's LAN
@@ -71,7 +78,7 @@ Copy `storage-compose.yml`, `storage.env.example`, and
 `storage.toml`, then set:
 
 - `STORAGE_LAN_IP` to the storage host's LAN address.
-- `JOURNEY_IMAGE` to the image tag loaded above.
+- `JOURNEY_STORAGE_IMAGE` to the storage image tag loaded above.
 - `storage.toml`'s `site_connection.websocket_url` to
   `ws://<site-LAN-address>/internal/storage`.
 - `storage.toml`'s `site_connection.websocket_secret` to the same secret as the

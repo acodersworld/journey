@@ -1,6 +1,6 @@
 services:
   storage:
-    image: ${JOURNEY_IMAGE:?set JOURNEY_IMAGE to the built image tag}
+    image: ${JOURNEY_STORAGE_IMAGE:?set JOURNEY_STORAGE_IMAGE to the storage image tag}
     command: ["/usr/local/bin/journey-storage-service"]
     environment:
       JOURNEY_CONFIG: /etc/journey/storage.toml

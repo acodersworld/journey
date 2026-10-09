@@ -29,7 +29,7 @@ type AppResult<T> = Result<T, Box<dyn Error + Send + Sync>>;
 #[command(
     name = "journey-site",
     about = "Post backend and manifest importer",
-    version,
+    version = env!("JOURNEY_BINARY_VERSION"),
     after_help = "Configuration:\n  --config <PATH> or JOURNEY_CONFIG selects a TOML configuration file.\n  See deploy/site.toml.example for the available settings."
 )]
 struct Cli {
@@ -126,6 +126,9 @@ async fn main() -> AppResult<()> {
         println!();
         return Ok(());
     };
+    if matches!(&command, Commands::Serve(_)) {
+        println!("journey-site {}", env!("JOURNEY_BINARY_VERSION"));
+    }
 
     let config = config::AppConfig::load(config_path)?;
     let database = Database::new(config.site.database_path.clone());
