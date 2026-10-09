@@ -161,8 +161,17 @@ newest complete post for the selected month and uses the same on-demand feed
 pagination to load later complete posts. The archive uses the normal post
 renderer, including media and gallery panel support. Its cursor and month are
 embedded in the feed element so later API requests stay within the archive.
+Every post shows a byline using its author's account username, even when
+another account is viewing or sharing it. Published posts show the publication
+time after the username; drafts show the author alone. The shared renderer
+supplies this byline on feeds, direct post pages, loaded fragments,
+authenticated share previews, and guest shared posts. Usernames are HTML
+escaped.
+
 Every publication `<time>` has a UTC ISO 8601 `datetime` value and readable UTC
-fallback text; the browser formats it in local time.
+fallback text. The browser formats it with the viewer's local time zone and
+locale, including for posts loaded later as feed fragments. The byline and
+Share button wrap within the metadata row on narrow screens.
 
 A JavaScript-readable `journey_timezone` cookie stores the browser's IANA time
 zone with `Path=/` and `SameSite=Lax`. Invalid or absent values use UTC. On a

@@ -2049,11 +2049,22 @@ fn render_post_with_media_prefix(
         String::new()
     };
     let published_at = render_time_element(post.summary.published_at.as_ref());
+    let byline = if published_at.is_empty() {
+        format!(
+            "<p class=\"post-byline\">By {}</p>",
+            escape_html(&post.author_username),
+        )
+    } else {
+        format!(
+            "<p class=\"post-byline\">By {} · {published_at}</p>",
+            escape_html(&post.author_username),
+        )
+    };
     format!(
         "<article class=\"post\" data-post-id=\"{}\"><header class=\"post-header\"><h1>{}</h1><div class=\"post-date-row\">{}{}</div><p class=\"summary\">{}</p></header>{}{}</article>",
         post.summary.id,
         escape_html(&post.summary.title),
-        published_at,
+        byline,
         share_control,
         escape_html(&post.summary.summary),
         render_tags_html(&post.tags, media_prefix.is_some()),
@@ -2819,7 +2830,9 @@ mod tests {
         assert_eq!(post.blocks.len(), 2);
         assert_eq!(post.blocks[0].body.as_deref(), Some("Child"));
         assert_eq!(post.blocks[1].body.as_deref(), Some("Second"));
-        assert!(!super::render_post(&post, true, false).contains("<time"));
+        let draft_html = super::render_post(&post, true, false);
+        assert!(draft_html.contains("<p class=\"post-byline\">By writer-one</p>"));
+        assert!(!draft_html.contains("<time"));
 
         let writer_creation_page = request(&app, "GET", "/posts/new", &writer_cookie, None).await;
         assert_eq!(writer_creation_page.status(), StatusCode::OK);
@@ -3436,6 +3449,9 @@ mod tests {
         assert_eq!(html.matches("<article class=\"post\"").count(), 1);
         assert!(html.contains("data-next-cursor=\"1767268800:12\""));
         assert!(html.contains("Post 12"));
+        assert!(html.contains(
+            "<p class=\"post-byline\">By test-author · <time datetime=\"2026-01-01T12:00:00Z\" data-local-time>"
+        ));
         assert!(!html.contains("data-post-id=\"11\""));
         assert!(html.contains("id=\"load-more\""));
 
@@ -3452,7 +3468,7 @@ mod tests {
                 summary: "A <summary>".to_owned(),
             },
             published: true,
-            author_username: "owner".to_owned(),
+            author_username: "owner<script>".to_owned(),
             tags: vec!["<tag>".to_owned()],
             revision: 1,
             blocks: vec![
@@ -3528,11 +3544,14 @@ mod tests {
         let html = render_full_post(
             &SidebarData::default(),
             &post,
-            "owner",
+            "viewer",
             AccountRole::Admin,
             false,
             Some(&ShareAccess::Admin),
         );
+        assert!(html.contains(
+            "<p class=\"post-byline\">By owner&lt;script&gt; · <time datetime=\"2026-01-01T12:00:00Z\" data-local-time>"
+        ));
         assert!(html.contains("<p class=\"tags\">"));
         assert!(html.contains("class=\"tag-label\">Tags:</span>"));
         assert!(html.contains("href=\"/tags?tag=%3Ctag%3E\">&lt;tag&gt;</a>"));
@@ -3551,9 +3570,13 @@ mod tests {
         assert!(html.contains("Nested body"));
         assert!(!html.contains("/posts/7/blocks/18/media"));
         assert!(!html.contains("<script>body</script>"));
-        assert!(html.contains("Signed in as <strong>owner</strong>"));
+        assert!(html.contains("Signed in as <strong>viewer</strong>"));
         assert!(html.contains("action=\"/logout\" method=\"post\""));
-        assert!(!super::render_shared_post(&post, "/share/example").contains("new-post-float"));
+        let shared_html = super::render_shared_post(&post, "/share/example");
+        assert!(shared_html.contains(
+            "<p class=\"post-byline\">By owner&lt;script&gt; · <time datetime=\"2026-01-01T12:00:00Z\" data-local-time>"
+        ));
+        assert!(!shared_html.contains("new-post-float"));
         assert_eq!(escape_html("'&\"<>"), "&#39;&amp;&quot;&lt;&gt;");
     }
 

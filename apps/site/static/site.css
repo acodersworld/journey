@@ -776,6 +776,15 @@ body.sidebar-modal-open {
   gap: 0.75rem;
 }
 
+.post-byline {
+  min-width: 0;
+  margin: 0;
+  color: #b6b9b1;
+  font-size: 0.9rem;
+  line-height: 1.4;
+  overflow-wrap: anywhere;
+}
+
 .post-share-button,
 .post-publish-button,
 .share-copy-button,
