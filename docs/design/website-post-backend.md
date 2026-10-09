@@ -277,11 +277,15 @@ Draft edit and media upload operations require the author to have `write`
 permission or the account to have `admin`; author credit alone gives a `read`
 account no write permission. Published posts cannot be edited.
 
-The development site has no schema migration process. Incompatible database
-changes require recreating the SQLite database and running the destructive
-importer again. Startup rejects an outdated database, including a date-text
-`published_at` column, with this rebuild instruction; legacy-row migrations are
-not part of the development workflow.
+The website is live as of 9 October 2026. Future schema changes must be
+backwards compatible with the deployed schema or include a tested, versioned
+migration that preserves existing data. Recreating the live database or running
+the destructive importer is not an upgrade procedure.
+
+The current startup code still rejects outdated schemas, including a date-text
+`published_at` column, with the pre-deployment rebuild instruction. No general
+migration mechanism has been implemented yet; the next schema change must
+provide the required upgrade path rather than relying on that rejection.
 
 The browser uses a server-rendered `GET`/`POST /login` form and `POST /logout`;
 the form works without JavaScript and reuses the JSON endpoints' credential,

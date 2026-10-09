@@ -11,9 +11,10 @@ successfully or removed.
 
 - Allow draft media children with no storage key. Their existing header, body,
   and alt fields preserve text entered before an upload finishes. Do not store
-  the device filename. Bump the site database schema version; an existing
-  database must be recreated and the destructive importer rerun, as required
-  by `AGENTS.md`.
+  the device filename. Keep the schema change backwards compatible or provide
+  a versioned migration from the deployed schema that preserves existing data,
+  as required by `AGENTS.md`. Do not recreate the live database or rerun the
+  destructive importer to upgrade it.
 - When files are selected, save their slots in the draft **before** streaming
   bytes. Keep the current upload endpoint and same-file upload pool. After
   storage confirms an upload, attach its key through the normal draft save;
@@ -39,6 +40,8 @@ successfully or removed.
   successful upload followed by a failed draft save remains unfinished.
 - Verify the publish API rejects unfinished slots even when called directly,
   and that imported posts with completed media remain publishable.
+- Verify the schema upgrade preserves existing posts, media placements,
+  accounts, and share links from the deployed database.
 
 ## Assumptions
 

@@ -90,6 +90,6 @@ WhatsApp may retain a card after its image URL expires or the share link is
 revoked.
 
 The in-memory capability map is not part of the SQLite schema. Removing the
-former capability table advances the site schema to version 10. Startup rejects
-older databases with the existing rebuild instruction; development databases
-must be recreated and the destructive importer run again.
+former capability table advanced the site schema to version 10 during
+development. The website is now live; future schema changes must remain
+backwards compatible or provide a tested migration preserving deployed data.
