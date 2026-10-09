@@ -21,9 +21,8 @@ successfully or removed.
   consider the slot complete only when that save succeeds. A failed upload or
   save leaves the slot unfinished. Keep it visible with Retry and Remove;
   after a reload, Retry asks the author to select a file again.
-- Remove the publish requirement for a block with text. In the publish
-  transaction, reject drafts containing any unfinished media slot. Keep the
-  nonblank title, ownership, date, and already-published checks.
+- In the publish transaction, reject drafts containing any unfinished media
+  slot. Keep the nonblank title, ownership, date, and already-published checks.
 - In both the draft editor and draft post page, disable Publish for a blank
   title or unfinished slots. Reuse the existing helper below the editor button
   and add the same visible reason below the post-page button. Show unfinished

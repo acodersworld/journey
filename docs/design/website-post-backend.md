@@ -17,12 +17,11 @@ the content-derived storage key. Each placement references that asset and
 stores its own label, caption, and alt text. Reusing or duplicating a file adds
 another child row without copying the original. Imported posts are always
 published; HTTP-created posts are drafts until their author or an admin
-publishes them. Draft titles can be blank, but publication requires a title
-and nonblank block text. All
-post and media lookups require a session: `read` accounts can access published
-posts, `write` accounts can also access their own drafts, and `admin` accounts
-can access every draft. Feeds and navigation lists contain published posts
-only.
+publishes them. Draft titles can be blank, but a nonblank title is required
+for publication. All post and media lookups require a session: `read` accounts
+can access published posts, `write` accounts can also access their own drafts,
+and `admin` accounts can access every draft. Feeds and navigation lists contain
+published posts only.
 
 Post and block IDs are regenerated on each full import. They remain stable for
 in-place edits. Feed ordering is publication instant descending, then ID
@@ -120,13 +119,13 @@ by name or size.
 
 `POST /api/posts/{id}/publish` publishes an existing draft immediately. Its
 optional `published_at` integer selects a UTC Unix second; when omitted, the
-server's current second is used. Publication requires a nonblank title and at
-least one nonblank root header or body. The route applies the origin check and
-allows the draft's `write` author or an `admin`. Other posts and missing posts
-return `404`, already published posts return `409`, and a future timestamp or a
-post without any nonblank block header or body returns `400`. The content
-validation and state transition occur in one immediate SQLite transaction.
-Success is `204 No Content`.
+server's current second is used. Publication requires a nonblank title, while
+block headers, bodies, captions, and the post summary are optional. The route
+applies the origin check and allows the draft's `write` author or an `admin`.
+Other posts and missing posts return `404`, already published posts return
+`409`, and a future or out-of-range timestamp or a blank title returns `400`.
+The content validation and state transition occur in one immediate SQLite
+transaction. Success is `204 No Content`.
 
 `GET /posts/new` serves the empty editor to authenticated `write` and `admin`
 accounts. An existing editable draft opens the same editor prefilled with its

@@ -258,7 +258,6 @@ pub enum PublishPostResult {
     Published,
     NotFound,
     AlreadyPublished,
-    MissingText,
     MissingTitle,
     FutureTimestamp,
     InvalidTimestamp,
@@ -1326,28 +1325,6 @@ impl Database {
             }) {
                 return Ok(PublishPostResult::InvalidTimestamp);
             }
-            let has_text = {
-                let mut statement = transaction.prepare(
-                    "SELECT header, body FROM post_blocks WHERE post_id = ?1",
-                )?;
-                let rows = statement.query_map([id], |row| {
-                    Ok((row.get::<_, Option<String>>(0)?, row.get::<_, Option<String>>(1)?))
-                })?;
-                let mut has_text = false;
-                for row in rows {
-                    let (header, body) = row?;
-                    if header.as_deref().is_some_and(|value| !value.trim().is_empty())
-                        || body.as_deref().is_some_and(|value| !value.trim().is_empty())
-                    {
-                        has_text = true;
-                        break;
-                    }
-                }
-                has_text
-            };
-            if !has_text {
-                return Ok(PublishPostResult::MissingText);
-            }
             let published_at = requested_published_at.unwrap_or(now);
             transaction.execute(
                 "UPDATE posts SET published = 1, published_at = ?1 WHERE id = ?2 AND published = 0",
@@ -1820,6 +1797,147 @@ mod tests {
             tags: Vec::new(),
             blocks: Vec::new(),
         }
+    }
+
+    #[tokio::test]
+    async fn publishing_requires_a_title_but_not_block_text() {
+        let path = test_database_path();
+        let database = Database::new(path.clone());
+        database.initialize().await.unwrap();
+        for (username, role) in [
+            ("writer-one", super::AccountRole::Write),
+            ("writer-two", super::AccountRole::Write),
+            ("site-admin", super::AccountRole::Admin),
+        ] {
+            database
+                .create_account(username.to_owned(), role, "test-hash".to_owned())
+                .await
+                .unwrap();
+        }
+
+        let title_only_id = database
+            .create_draft(
+                "writer-one".to_owned(),
+                "Title only".to_owned(),
+                String::new(),
+                Vec::new(),
+                Vec::new(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            database
+                .publish_draft(title_only_id, "writer-one".to_owned(), false, None)
+                .await
+                .unwrap(),
+            super::PublishPostResult::Published,
+        );
+
+        let media_only_id = database
+            .create_draft(
+                "writer-one".to_owned(),
+                "Media only".to_owned(),
+                String::new(),
+                Vec::new(),
+                vec![NewBlock {
+                    id: None,
+                    header: None,
+                    body: None,
+                    storage_key: None,
+                    content_type: None,
+                    alt: None,
+                    children: vec![NewBlock {
+                        id: None,
+                        header: None,
+                        body: None,
+                        storage_key: Some("media/publish-without-text".to_owned()),
+                        content_type: Some("image/jpeg".to_owned()),
+                        alt: None,
+                        children: Vec::new(),
+                    }],
+                }],
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            database
+                .publish_draft(media_only_id, "writer-one".to_owned(), false, None)
+                .await
+                .unwrap(),
+            super::PublishPostResult::Published,
+        );
+
+        for title in ["", " \n\t"] {
+            let blank_title_id = database
+                .create_draft(
+                    "writer-one".to_owned(),
+                    title.to_owned(),
+                    String::new(),
+                    Vec::new(),
+                    Vec::new(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                database
+                    .publish_draft(blank_title_id, "writer-one".to_owned(), false, None)
+                    .await
+                    .unwrap(),
+                super::PublishPostResult::MissingTitle,
+            );
+        }
+
+        let owned_draft_id = database
+            .create_draft(
+                "writer-one".to_owned(),
+                "Ownership check".to_owned(),
+                String::new(),
+                Vec::new(),
+                Vec::new(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            database
+                .publish_draft(owned_draft_id, "writer-two".to_owned(), false, None)
+                .await
+                .unwrap(),
+            super::PublishPostResult::NotFound,
+        );
+        assert_eq!(
+            database
+                .publish_draft(owned_draft_id, "site-admin".to_owned(), true, None)
+                .await
+                .unwrap(),
+            super::PublishPostResult::Published,
+        );
+
+        let dated_draft_id = database
+            .create_draft(
+                "writer-one".to_owned(),
+                "Date check".to_owned(),
+                String::new(),
+                Vec::new(),
+                Vec::new(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            database
+                .publish_draft(dated_draft_id, "writer-one".to_owned(), false, Some(i64::MAX))
+                .await
+                .unwrap(),
+            super::PublishPostResult::FutureTimestamp,
+        );
+        assert_eq!(
+            database
+                .publish_draft(dated_draft_id, "writer-one".to_owned(), false, Some(i64::MIN))
+                .await
+                .unwrap(),
+            super::PublishPostResult::InvalidTimestamp,
+        );
+
+        std::fs::remove_file(path).unwrap();
     }
 
     #[tokio::test]

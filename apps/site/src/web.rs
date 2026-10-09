@@ -1359,10 +1359,6 @@ async fn publish_post<S: StorageClient>(
         Ok(crate::db::PublishPostResult::AlreadyPublished) => {
             no_store(StatusCode::CONFLICT.into_response())
         }
-        Ok(crate::db::PublishPostResult::MissingText) => no_store((
-            StatusCode::BAD_REQUEST,
-            "a post needs a text block with a nonblank header or body before it can be published\n",
-        ).into_response()),
         Ok(crate::db::PublishPostResult::MissingTitle) => no_store((
             StatusCode::BAD_REQUEST,
             "a post needs a nonblank title before it can be published\n",
