@@ -450,7 +450,7 @@ impl Drop for FilesystemPutContext {
             && let Err(error) = fs::remove_file(temp_path)
             && error.kind() != std::io::ErrorKind::NotFound
         {
-            eprintln!("failed to remove unpublished upload {}: {error}", temp_path.display());
+            log::warn!("unpublished_upload_cleanup_failed error={error}");
         }
     }
 }
@@ -737,7 +737,7 @@ fn initialize_store(
     let thumbnail_cache = ThumbnailCache::open(root.join("thumbnail-cache"), config.thumbnail_time_ms)?;
     clear_part_directory(&part_dir, &config.journal_path)?;
     let (index, skipped) = scan_objects(&objects_dir, &config.journal_path)?;
-    eprintln!("filesystem object store ready: indexed {} objects, skipped {skipped} files", index.len());
+    log::info!("filesystem_object_store_ready indexed_objects={} skipped_files={skipped}", index.len());
     Ok(InitOutput {
         root,
         objects_dir,

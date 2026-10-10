@@ -19,3 +19,6 @@ websocket_bind = "0.0.0.0:8081"
 websocket_secret = "replace-with-a-long-random-secret"
 initial_window_size = 33554432
 initial_connection_window_size = 67108864
+
+[logging]
+level = "info"

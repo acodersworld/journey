@@ -14,6 +14,8 @@ pub struct AppConfig {
     pub management: ManagementSettings,
     #[serde(default)]
     pub site_connection: SiteConnectionSettings,
+    #[serde(default)]
+    pub logging: journey_logging::LoggingSettings,
 }
 
 #[derive(Debug, Deserialize)]
@@ -23,6 +25,7 @@ pub struct StorageSettings {
     pub initial_stream_window_size: u32,
     pub initial_connection_window_size: u32,
     pub thumbnail_time_ms: u64,
+    pub range_get_summary_interval_seconds: u64,
 }
 
 #[derive(Debug, Deserialize)]
@@ -46,6 +49,7 @@ impl Default for AppConfig {
             storage: StorageSettings::default(),
             management: ManagementSettings::default(),
             site_connection: SiteConnectionSettings::default(),
+            logging: journey_logging::LoggingSettings::default(),
         }
     }
 }
@@ -57,7 +61,20 @@ impl Default for StorageSettings {
             initial_stream_window_size: 32 * 1024 * 1024,
             initial_connection_window_size: 64 * 1024 * 1024,
             thumbnail_time_ms: 0,
+            range_get_summary_interval_seconds: 10,
         }
+    }
+}
+
+impl StorageSettings {
+    pub fn validate_range_get_summary_interval(&self) -> std::io::Result<()> {
+        if self.range_get_summary_interval_seconds == 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "storage.range_get_summary_interval_seconds must be positive",
+            ));
+        }
+        Ok(())
     }
 }
 
@@ -121,4 +138,27 @@ fn default_object_dir() -> PathBuf {
         .filter(|path| path.is_absolute())
         .map(|home| home.join(".local/share/journey/storage/objects"))
         .unwrap_or_else(|| PathBuf::from("journey-storage-data/objects"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn legacy_storage_configuration_gets_logging_and_summary_defaults() {
+        let config: AppConfig = toml::from_str(
+            "[storage]\nobject_dir = \"objects\"\n[management]\nusername = \"user\"\npassword = \"pass\"\n[site_connection]\nwebsocket_secret = \"secret\"\n",
+        )
+        .unwrap();
+        assert_eq!(config.logging.level, "info");
+        assert_eq!(config.logging.queue_capacity, 65_536);
+        assert_eq!(config.storage.range_get_summary_interval_seconds, 10);
+        assert!(config.storage.validate_range_get_summary_interval().is_ok());
+    }
+
+    #[test]
+    fn range_summary_interval_must_be_positive() {
+        let settings = StorageSettings { range_get_summary_interval_seconds: 0, ..StorageSettings::default() };
+        assert!(settings.validate_range_get_summary_interval().is_err());
+    }
 }

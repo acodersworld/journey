@@ -161,23 +161,33 @@ impl H2cStorageClient {
             .initial_window_size(self.initial_window_size)
             .initial_connection_window_size(self.initial_connection_window_size);
 
-        let stream = TcpStream::connect(self.address)
-            .await
-            .map_err(|error| error.to_string())?;
-        let (sender, connection) = builder.handshake(stream)
-            .await
-            .map_err(|error| error.to_string())?;
+        let stream = match TcpStream::connect(self.address).await {
+            Ok(stream) => stream,
+            Err(error) => {
+                log::error!("storage_connection_failed transport=h2c address={} error={error}", self.address);
+                return Err(error.to_string());
+            }
+        };
+        let (sender, connection) = match builder.handshake(stream).await {
+            Ok(connection) => connection,
+            Err(error) => {
+                log::error!("storage_connection_failed transport=h2c address={} error={error}", self.address);
+                return Err(error.to_string());
+            }
+        };
         let generation = state
             .generation
             .checked_add(1)
             .ok_or_else(|| "storage h2c connection generation overflow".to_owned())?;
         state.generation = generation;
         state.sender = Some(sender);
+        log::info!("storage_connection_established transport=h2c address={}", self.address);
         let shared_connection = Arc::clone(&self.connection);
         let driver = tokio::spawn(async move {
             if let Err(error) = connection.await {
-                eprintln!("storage h2c connection ended: {error}");
+                log::error!("storage h2c connection ended: {error}");
             }
+            log::info!("storage_connection_closed transport=h2c");
             let mut state = shared_connection.lock().await;
             if state.generation == generation {
                 state.sender = None;
@@ -285,7 +295,7 @@ impl WebSocketStorageClient {
             state.sender = Some(session.sender());
             state.generation
         };
-        println!("site storage WebSocket session connected");
+        log::info!("storage_connection_established transport=websocket");
         let result = tokio::select! {
             result = session.wait() => result.map_err(|error| error.to_string()),
             signal = crate::shutdown::requested(&mut shutdown) => {
@@ -300,7 +310,7 @@ impl WebSocketStorageClient {
         if state.generation == generation {
             state.sender = None;
         }
-        println!("site storage WebSocket session ended");
+        log::info!("storage_connection_closed transport=websocket");
         result
     }
 

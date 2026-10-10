@@ -881,6 +881,7 @@ dependencies = [
  "bytes",
  "h2",
  "http",
+ "log",
  "tokio",
 ]
 
@@ -905,6 +906,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "journey-logging"
+version = "0.1.0"
+dependencies = [
+ "jiff",
+ "log",
+ "serde",
+]
+
+[[package]]
 name = "journey-site"
 version = "0.1.0"
 dependencies = [
@@ -917,8 +927,10 @@ dependencies = [
  "h2",
  "http",
  "jiff",
+ "journey-logging",
  "journey-websocket",
  "libc",
+ "log",
  "rand 0.8.8",
  "rusqlite",
  "serde",
@@ -944,8 +956,10 @@ dependencies = [
  "h2",
  "http",
  "http-body-util",
+ "journey-logging",
  "jpeg-decoder",
  "libc",
+ "log",
  "percent-encoding",
  "serde",
  "serde_json",
@@ -961,8 +975,10 @@ name = "journey-storage-service"
 version = "0.1.0"
 dependencies = [
  "http",
+ "journey-logging",
  "journey-storage",
  "journey-websocket",
+ "log",
  "serde",
  "tokio",
  "toml",

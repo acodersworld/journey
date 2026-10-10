@@ -14,6 +14,8 @@ pub struct AppConfig {
     pub site: SiteSettings,
     #[serde(default)]
     pub storage: StorageSettings,
+    #[serde(default)]
+    pub logging: journey_logging::LoggingSettings,
 }
 
 #[derive(Debug, Deserialize)]
@@ -45,6 +47,7 @@ impl Default for AppConfig {
         Self {
             site: SiteSettings::default(),
             storage: StorageSettings::default(),
+            logging: journey_logging::LoggingSettings::default(),
         }
     }
 }
@@ -103,5 +106,21 @@ fn resolve_path(base: &Path, path: PathBuf) -> PathBuf {
         path
     } else {
         base.join(path)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn legacy_site_configuration_gets_logging_defaults() {
+        let config: AppConfig = toml::from_str(
+            "[site]\nbind = \"127.0.0.1:8080\"\n[storage]\ntransport = \"h2c\"\n",
+        )
+        .unwrap();
+        assert_eq!(config.logging.level, "info");
+        assert_eq!(config.logging.queue_capacity, 65_536);
+        assert_eq!(config.logging.slow_enqueue_warning_ms, 100);
     }
 }

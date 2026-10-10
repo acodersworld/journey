@@ -13,3 +13,6 @@ h2c_address = "127.0.0.1:8081"
 websocket_bind = "127.0.0.1:8081"
 initial_window_size = 524288
 initial_connection_window_size = 4194304
+
+[logging]
+level = "info"

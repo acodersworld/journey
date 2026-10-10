@@ -59,7 +59,7 @@ where
         let (request, respond) = result?;
         tokio::spawn(async move {
             if let Err(error) = respond_to(request, respond).await {
-                eprintln!("HTTP/2 request failed: {error}");
+                log::error!("http2_request_failed error={error}");
             }
         });
     }

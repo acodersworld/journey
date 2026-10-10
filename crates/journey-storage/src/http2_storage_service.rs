@@ -13,7 +13,10 @@ use http::{
 };
 use percent_encoding::percent_decode_str;
 use serde::Serialize;
-use std::sync::Arc;
+use std::sync::{
+    atomic::{AtomicU16, Ordering},
+    Arc,
+};
 
 use crate::storage_interface::{
     ContentType, GetResult, ImageFit, ImageOutputFormat, ImageReductionRequest, ImageReductionSize,
@@ -22,6 +25,7 @@ use crate::storage_interface::{
     StoreErrorKind, StoreInterface,
 };
 use crate::storage_image_reduction::reduce_image;
+use crate::range_get_logging::{RangeGetAggregator, RangeGetOutcome};
 
 const MAX_DATA_SEGMENT_SIZE: usize = 64 * 1024;
 const NOT_FOUND_BODY: &[u8] = b"not found\n";
@@ -41,6 +45,8 @@ const OBJECT_VARY: &str = concat!(
     "Object-Representation, Object-Image-Max-Edge, Object-Image-Width, ",
     "Object-Image-Height, Object-Image-Fit, Object-Image-Format, Object-Image-Max-Bytes",
 );
+
+static NEXT_STORAGE_REQUEST_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum Route {
@@ -386,18 +392,47 @@ fn parse_positive_u64(value: &str) -> Result<u64, ()> {
 #[derive(Debug)]
 pub struct Service<S: StoreInterface> {
     store: Arc<S>,
+    range_get_aggregator: Option<RangeGetAggregator>,
+}
+
+struct TrackedRespond {
+    inner: h2::server::SendResponse<Bytes>,
+    status: Arc<AtomicU16>,
+}
+
+impl TrackedRespond {
+    fn send_response(
+        &mut self,
+        response: Response<()>,
+        end_of_stream: bool,
+    ) -> Result<h2::SendStream<Bytes>, h2::Error> {
+        let status = response.status().as_u16();
+        let result = self.inner.send_response(response, end_of_stream);
+        if result.is_ok() {
+            self.status.store(status, Ordering::Relaxed);
+        }
+        result
+    }
 }
 
 impl<S: StoreInterface> Clone for Service<S> {
     fn clone(&self) -> Self {
-        Self { store: Arc::clone(&self.store) }
+        Self {
+            store: Arc::clone(&self.store),
+            range_get_aggregator: self.range_get_aggregator.clone(),
+        }
     }
 }
 
 impl<S: StoreInterface> Service<S> {
     /// Creates a service backed by the supplied mutable catalogue.
     pub fn new(store: Arc<S>) -> Self {
-        Self { store }
+        Self { store, range_get_aggregator: None }
+    }
+
+    /// Creates a service with periodic summaries for ranged object GETs.
+    pub fn with_range_get_aggregator(store: Arc<S>, range_get_aggregator: RangeGetAggregator) -> Self {
+        Self { store, range_get_aggregator: Some(range_get_aggregator) }
     }
 
     /// Handles one accepted HTTP/2 request and sends its complete response.
@@ -409,20 +444,119 @@ impl<S: StoreInterface> Service<S> {
         let method = request.method().clone();
         let path = request.uri().path().to_owned();
         let stream_id = request.body().stream_id().as_u32();
-        self.handle_request(request, respond)
+        let route = match classify_route(request.uri().path()) {
+            Route::Object(raw_key) => decode_object_path(&raw_key)
+                .map(|key| {
+                    let representation = match parse_object_representation(request.headers()) {
+                        Ok(ObjectRepresentation::Original) => "original",
+                        Ok(ObjectRepresentation::Thumbnail) => "thumbnail",
+                        Ok(ObjectRepresentation::ReducedImage) => "reduced_image",
+                        Err(()) => "invalid",
+                    };
+                    format!("object key={key:?} representation={representation}")
+                })
+                .unwrap_or_else(|_| "object".to_owned()),
+            Route::Collection => "collection".to_owned(),
+            Route::EmptyKey => "empty_key".to_owned(),
+            Route::Unknown => "unknown".to_owned(),
+        };
+        let request_id = NEXT_STORAGE_REQUEST_ID.fetch_add(1, Ordering::Relaxed);
+        let range_group = if method == Method::GET && request.headers().contains_key(header::RANGE) {
+            match classify_route(request.uri().path()) {
+                Route::Object(raw_key) => decode_object_path(&raw_key).ok().map(|key| {
+                    let representation = match parse_object_representation(request.headers()) {
+                        Ok(ObjectRepresentation::Original) => "original",
+                        Ok(ObjectRepresentation::Thumbnail) => "thumbnail",
+                        Ok(ObjectRepresentation::ReducedImage) => "reduced_image",
+                        Err(()) => "invalid",
+                    };
+                    (key, representation)
+                }),
+                _ => None,
+            }
+        } else {
+            None
+        };
+        let is_range_get = range_group.is_some();
+        if is_range_get {
+            log::debug!(
+                "storage_request_started request_id={request_id} method={} route={route}",
+                method
+            );
+        } else {
+            log::info!(
+                "storage_request_started request_id={request_id} method={} route={route}",
+                method
+            );
+        }
+        let range_id = match (&self.range_get_aggregator, &range_group) {
+            (Some(aggregator), Some((key, representation))) => {
+                aggregator.started(request_id, key, representation);
+                Some(request_id)
+            }
+            _ => None,
+        };
+        let started = std::time::Instant::now();
+        let mut bytes_handed_to_transport = 0;
+        let status = Arc::new(AtomicU16::new(0));
+        let result = self
+            .handle_request(
+                request,
+                TrackedRespond { inner: respond, status: Arc::clone(&status) },
+                request_id,
+                &mut bytes_handed_to_transport,
+            )
             .await
             .map_err(|source| ServiceError::Request {
-                method,
+                method: method.clone(),
                 path,
                 stream_id,
                 source: Box::new(source),
-            })
+            });
+        if let (Some(aggregator), Some((key, representation)), Some(range_id)) =
+            (&self.range_get_aggregator, range_group, range_id)
+        {
+            let response_status = status.load(Ordering::Relaxed);
+            let outcome = match &result {
+                Ok(()) if response_status < 400 => RangeGetOutcome::Completed,
+                Ok(()) => RangeGetOutcome::Failed,
+                Err(error) if error.is_peer_cancelled_get() => RangeGetOutcome::Cancelled,
+                Err(_) => RangeGetOutcome::Failed,
+            };
+            if matches!(outcome, RangeGetOutcome::Failed) {
+                log::warn!(
+                    "storage_range_get_failed request_id={request_id} key={key:?} representation={representation} status={response_status}"
+                );
+            }
+            aggregator.finished(range_id, &key, representation, outcome, bytes_handed_to_transport);
+        }
+        let response_status = status.load(Ordering::Relaxed);
+        if is_range_get {
+            log::debug!(
+                "storage_request_finished request_id={request_id} method={} route={route} status={} outcome={} duration_ms={}",
+                method,
+                response_status,
+                if result.is_ok() { "response_ready" } else { "transport_error" },
+                started.elapsed().as_millis(),
+            );
+        } else {
+            log::info!(
+                "storage_request_finished request_id={request_id} method={} route={route} status={} outcome={} duration_ms={}",
+                method,
+                response_status,
+                if result.is_ok() { "response_ready" } else { "transport_error" },
+                started.elapsed().as_millis(),
+            );
+        }
+        result
     }
 
     async fn handle_request(
         &self,
         request: Request<h2::RecvStream>,
-        respond: h2::server::SendResponse<Bytes>,
+        respond: TrackedRespond,
+        request_id: u64,
+        bytes_handed_to_transport: &mut u64,
     ) -> Result<(), ServiceError> {
         let route = classify_route(request.uri().path());
         let method = request.method().clone();
@@ -441,7 +575,7 @@ impl<S: StoreInterface> Service<S> {
                             );
                         }
                     };
-                    self.handle_list(query, respond).await
+                    self.handle_list(query, respond, request_id).await
                 }
                 Method::PUT => {
                     if request.uri().query().is_some()
@@ -458,6 +592,7 @@ impl<S: StoreInterface> Service<S> {
                         request,
                         PutTarget::Generated { prefix: String::new() },
                         respond,
+                        request_id,
                     )
                     .await
                 }
@@ -542,6 +677,7 @@ impl<S: StoreInterface> Service<S> {
                             request,
                             PutTarget::Generated { prefix: decoded_key },
                             respond,
+                            request_id,
                         )
                         .await;
                 }
@@ -579,7 +715,14 @@ impl<S: StoreInterface> Service<S> {
                                 ObjectRepresentation::Original => unreachable!(),
                             }
                         } else {
-                            self.handle_get(&key, request.headers(), respond).await
+                            self.handle_get(
+                                &key,
+                                request.headers(),
+                                respond,
+                                request_id,
+                                bytes_handed_to_transport,
+                            )
+                            .await
                         }
                     }
                     Method::HEAD => {
@@ -607,7 +750,7 @@ impl<S: StoreInterface> Service<S> {
                         }
                     }
                     Method::PUT => match parse_generated_key_mode(request.headers()) {
-                        Ok(false) => self.handle_put(request, PutTarget::WithKey(key), respond).await,
+                        Ok(false) => self.handle_put(request, PutTarget::WithKey(key), respond, request_id).await,
                         _ => send_text_response(
                             respond,
                             StatusCode::BAD_REQUEST,
@@ -660,8 +803,10 @@ impl<S: StoreInterface> Service<S> {
         &self,
         request: Request<h2::RecvStream>,
         target: PutTarget,
-        mut respond: h2::server::SendResponse<Bytes>,
+        mut respond: TrackedRespond,
+        request_id: u64,
     ) -> Result<(), ServiceError> {
+        let operation_started = std::time::Instant::now();
         let condition = match parse_put_condition(request.headers()) {
             Ok(condition) => condition,
             Err(()) => {
@@ -720,7 +865,7 @@ impl<S: StoreInterface> Service<S> {
             {
                 Ok(context) => HttpPutContext::WithKey { key, context },
                 Err(error) => {
-                    eprintln!("storage PUT context creation failed: {error}");
+                    log::error!("storage PUT context creation failed: {error}");
                     return send_text_response(
                         respond,
                         StatusCode::INTERNAL_SERVER_ERROR,
@@ -736,7 +881,7 @@ impl<S: StoreInterface> Service<S> {
             {
                 Ok(context) => HttpPutContext::Generated { prefix, context },
                 Err(error) => {
-                    eprintln!("storage PUT context creation failed: {error}");
+                    log::error!("storage PUT context creation failed: {error}");
                     return send_text_response(
                         respond,
                         StatusCode::INTERNAL_SERVER_ERROR,
@@ -753,7 +898,7 @@ impl<S: StoreInterface> Service<S> {
             let length = data.len();
 
             if let Err(error) = put_context.append(&data).await {
-                eprintln!("storage PUT body append failed: {error}");
+                log::error!("storage PUT body append failed: {error}");
                 return send_text_response(
                     respond,
                     StatusCode::INTERNAL_SERVER_ERROR,
@@ -790,7 +935,7 @@ impl<S: StoreInterface> Service<S> {
                 );
             }
             Err(error) => {
-                eprintln!("storage PUT commit failed: {error}");
+                log::error!("storage PUT commit failed: {error}");
                 return send_text_response(
                     respond,
                     StatusCode::INTERNAL_SERVER_ERROR,
@@ -803,7 +948,7 @@ impl<S: StoreInterface> Service<S> {
         let key_header = match HeaderValue::from_bytes(key.as_str().as_bytes()) {
             Ok(value) => value,
             Err(error) => {
-                eprintln!("published object key cannot be returned in Object-Key: {error}");
+                log::error!("published object key cannot be returned in Object-Key: {error}");
                 return send_text_response(
                     respond,
                     StatusCode::INTERNAL_SERVER_ERROR,
@@ -817,7 +962,7 @@ impl<S: StoreInterface> Service<S> {
                 match HeaderValue::from_bytes(name.as_str().as_bytes()) {
                     Ok(value) => Some(value),
                     Err(error) => {
-                        eprintln!(
+                        log::error!(
                             "published object name cannot be returned in Object-Name: {error}"
                         );
                         return send_text_response(
@@ -843,6 +988,10 @@ impl<S: StoreInterface> Service<S> {
         }
         let response = response_builder.body(())?;
         respond.send_response(response, true)?;
+        log::info!(
+            "storage_put_completed request_id={request_id} key={key:?} status=200 duration_ms={}",
+            operation_started.elapsed().as_millis(),
+        );
         Ok(())
     }
 
@@ -850,7 +999,9 @@ impl<S: StoreInterface> Service<S> {
         &self,
         key: &Key,
         headers: &http::HeaderMap,
-        mut respond: h2::server::SendResponse<Bytes>,
+        mut respond: TrackedRespond,
+        request_id: u64,
+        bytes_handed_to_transport: &mut u64,
     ) -> Result<(), ServiceError> {
         let range = match parse_range_header(headers) {
             Ok(range) => range,
@@ -876,7 +1027,7 @@ impl<S: StoreInterface> Service<S> {
                         NOT_FOUND_BODY,
                     );
                 }
-                eprintln!("storage GET lookup failed for key {key:?}: {error}");
+                log::error!("storage GET lookup failed for key {key:?}: {error}");
                 return send_object_error_response(
                     respond,
                     StatusCode::INTERNAL_SERVER_ERROR,
@@ -917,7 +1068,7 @@ impl<S: StoreInterface> Service<S> {
                 .and_then(|end| end.checked_sub(1))
                 .filter(|end| span.size() > 0 && *end < metadata.payload_length())
             else {
-                eprintln!("storage GET returned invalid selected span for key {key:?}");
+                log::error!("storage GET returned invalid selected span for key {key:?}");
                 return send_object_error_response(
                     respond,
                     StatusCode::INTERNAL_SERVER_ERROR,
@@ -938,20 +1089,31 @@ impl<S: StoreInterface> Service<S> {
         }
 
         let mut stream = respond.send_response(response, false)?;
-        send_object_reader(
+        let report_range_bytes = headers.contains_key(header::RANGE);
+        let range_get_aggregator = self.range_get_aggregator.as_ref();
+        *bytes_handed_to_transport = send_object_reader(
             &mut stream,
             read_object.object_mut(),
             content_length,
             key.as_str(),
+            |bytes| {
+                if report_range_bytes {
+                    if let Some(aggregator) = range_get_aggregator {
+                        aggregator.bytes_sent(request_id, key.as_str(), "original", bytes);
+                    }
+                }
+            },
         )
-        .await
+        .await?;
+        Ok(())
     }
 
     async fn handle_head(
         &self,
         key: &Key,
-        respond: h2::server::SendResponse<Bytes>,
+        respond: TrackedRespond,
     ) -> Result<(), ServiceError> {
+        let operation_started = std::time::Instant::now();
         let metadata = match self.store.stat(key).await {
             Ok(metadata) => metadata,
             Err(error) if error.kind() == StoreErrorKind::NotFound => {
@@ -964,7 +1126,7 @@ impl<S: StoreInterface> Service<S> {
                 );
             }
             Err(error) => {
-                eprintln!("storage HEAD lookup failed for key {key:?}: {error}");
+                log::error!("storage HEAD lookup failed for key {key:?}: {error}");
                 return send_object_error_response(
                     respond,
                     StatusCode::INTERNAL_SERVER_ERROR,
@@ -985,6 +1147,11 @@ impl<S: StoreInterface> Service<S> {
             .body(())?;
         let mut respond = respond;
         respond.send_response(response, true)?;
+        log::info!(
+            "storage_head_completed key={:?} representation=original status=200 duration_ms={}",
+            key.as_str(),
+            operation_started.elapsed().as_millis(),
+        );
         Ok(())
     }
 
@@ -993,7 +1160,7 @@ impl<S: StoreInterface> Service<S> {
         key: &Key,
         options: Option<ImageReductionRequest>,
         is_head: bool,
-        respond: h2::server::SendResponse<Bytes>,
+        respond: TrackedRespond,
     ) -> Result<(), ServiceError> {
         let thumbnail = match self.store.get_thumbnail(key).await {
             Ok(thumbnail) => thumbnail,
@@ -1014,7 +1181,7 @@ impl<S: StoreInterface> Service<S> {
         key: &Key,
         options: ImageReductionRequest,
         is_head: bool,
-        respond: h2::server::SendResponse<Bytes>,
+        respond: TrackedRespond,
     ) -> Result<(), ServiceError> {
         let image = match self.store.get_reduced_image(key, options).await {
             Ok(image) => image,
@@ -1026,10 +1193,10 @@ impl<S: StoreInterface> Service<S> {
     async fn handle_delete(
         &self,
         key: &Key,
-        respond: h2::server::SendResponse<Bytes>,
+        respond: TrackedRespond,
     ) -> Result<(), ServiceError> {
         if let Err(error) = self.store.delete(key).await {
-            eprintln!("storage DELETE failed for key {key:?}: {error}");
+            log::error!("storage DELETE failed for key {key:?}: {error}");
             return send_text_response(
                 respond,
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -1050,8 +1217,12 @@ impl<S: StoreInterface> Service<S> {
     async fn handle_list(
         &self,
         query: ListQuery,
-        respond: h2::server::SendResponse<Bytes>,
+        respond: TrackedRespond,
+        request_id: u64,
     ) -> Result<(), ServiceError> {
+        let operation_started = std::time::Instant::now();
+        let prefix = query.prefix.clone();
+        log::info!("storage_list_started request_id={request_id} prefix={prefix:?}");
         let cursor = query
             .cursor
             .map(ListCursor::new);
@@ -1059,7 +1230,10 @@ impl<S: StoreInterface> Service<S> {
         let page = match self.store.list(request).await {
             Ok(page) => page,
             Err(error) => {
-                eprintln!("storage LIST failed: {error}");
+                log::error!(
+                    "storage_list_failed request_id={request_id} prefix={prefix:?} status=500 duration_ms={} error={error}",
+                    operation_started.elapsed().as_millis(),
+                );
                 return send_text_response(
                     respond,
                     StatusCode::INTERNAL_SERVER_ERROR,
@@ -1087,7 +1261,10 @@ impl<S: StoreInterface> Service<S> {
         let objects = match objects {
             Ok(objects) => objects,
             Err(error) => {
-                eprintln!("storage LIST returned invalid content type metadata: {error}");
+                log::error!(
+                    "storage_list_failed request_id={request_id} prefix={prefix:?} status=500 duration_ms={} reason=invalid_content_type_metadata error={error}",
+                    operation_started.elapsed().as_millis(),
+                );
                 return send_text_response(
                     respond,
                     StatusCode::INTERNAL_SERVER_ERROR,
@@ -1104,7 +1281,10 @@ impl<S: StoreInterface> Service<S> {
         let payload = match serde_json::to_vec(&response) {
             Ok(payload) => Bytes::from(payload),
             Err(error) => {
-                eprintln!("HTTP LIST response serialization failed: {error}");
+                log::error!(
+                    "storage_list_failed request_id={request_id} prefix={prefix:?} status=500 duration_ms={} reason=response_serialization error={error}",
+                    operation_started.elapsed().as_millis(),
+                );
                 return send_text_response(
                     respond,
                     StatusCode::INTERNAL_SERVER_ERROR,
@@ -1113,7 +1293,19 @@ impl<S: StoreInterface> Service<S> {
                 );
             }
         };
-        send_json_response(respond, payload).await
+        let entry_count = response.objects.len();
+        let result = send_json_response(respond, payload).await;
+        match &result {
+            Ok(()) => log::info!(
+                "storage_list_completed request_id={request_id} prefix={prefix:?} status=200 entries={entry_count} duration_ms={}",
+                operation_started.elapsed().as_millis(),
+            ),
+            Err(error) => log::error!(
+                "storage_list_failed request_id={request_id} prefix={prefix:?} duration_ms={} error={error}",
+                operation_started.elapsed().as_millis(),
+            ),
+        }
+        result
     }
 }
 
@@ -1130,6 +1322,8 @@ pub enum ServiceError {
     Http(http::Error),
     /// The peer closed the stream before it had send capacity.
     StreamClosed,
+    /// Reading an object body failed after its response headers were sent.
+    ReaderFailure(String),
     /// A request failed while being handled.
     Request {
         method: Method,
@@ -1163,6 +1357,7 @@ impl fmt::Display for ServiceError {
             Self::PeerReset(reason) => write!(formatter, "peer reset HTTP/2 stream: {reason:?}"),
             Self::Http(error) => write!(formatter, "HTTP error: {error}"),
             Self::StreamClosed => formatter.write_str("HTTP/2 response stream closed"),
+            Self::ReaderFailure(error) => write!(formatter, "object reader failed: {error}"),
             Self::Request { method, path, stream_id, source } => write!(
                 formatter,
                 "method={:?} path={:?} stream_id={}: {source}",
@@ -1179,7 +1374,7 @@ impl std::error::Error for ServiceError {
         match self {
             Self::Http2(error) | Self::PeerCancelled(error) => Some(error),
             Self::Http(error) => Some(error),
-            Self::PeerReset(_) | Self::StreamClosed => None,
+            Self::PeerReset(_) | Self::StreamClosed | Self::ReaderFailure(_) => None,
             Self::Request { source, .. } => Some(source.as_ref()),
         }
     }
@@ -1205,7 +1400,7 @@ impl From<http::Error> for ServiceError {
 }
 
 fn request_error(
-    respond: h2::server::SendResponse<Bytes>,
+    respond: TrackedRespond,
     is_head: bool,
     status: StatusCode,
     allow: Option<&'static str>,
@@ -1219,7 +1414,7 @@ fn request_error(
 }
 
 fn send_empty_response(
-    mut respond: h2::server::SendResponse<Bytes>,
+    mut respond: TrackedRespond,
     status: StatusCode,
     allow: Option<&'static str>,
     content_type: Option<&http::HeaderValue>,
@@ -1243,7 +1438,7 @@ fn send_empty_response(
 }
 
 fn send_object_error_response(
-    mut respond: h2::server::SendResponse<Bytes>,
+    mut respond: TrackedRespond,
     status: StatusCode,
     is_head: bool,
     allow: Option<&'static str>,
@@ -1276,7 +1471,7 @@ fn send_image_storage_error(
     key: &Key,
     operation: &str,
     is_head: bool,
-    respond: h2::server::SendResponse<Bytes>,
+    respond: TrackedRespond,
 ) -> Result<(), ServiceError> {
     let (status, body) = match error.kind() {
         StoreErrorKind::NotFound => (StatusCode::NOT_FOUND, NOT_FOUND_BODY),
@@ -1285,7 +1480,7 @@ fn send_image_storage_error(
         _ => (StatusCode::INTERNAL_SERVER_ERROR, STORAGE_ERROR_BODY),
     };
     if error.kind() != StoreErrorKind::NotFound {
-        eprintln!("storage {operation} failed for key {key:?}: {error}");
+        log::error!("storage {operation} failed for key {key:?}: {error}");
     }
     send_object_error_response(respond, status, is_head, None, body)
 }
@@ -1293,7 +1488,7 @@ fn send_image_storage_error(
 async fn send_reduced_image_response(
     image: ReducedImage,
     is_head: bool,
-    mut respond: h2::server::SendResponse<Bytes>,
+    mut respond: TrackedRespond,
 ) -> Result<(), ServiceError> {
     let response = Response::builder()
         .version(Version::HTTP_2)
@@ -1311,7 +1506,7 @@ async fn send_reduced_image_response(
 }
 
 async fn send_json_response(
-    mut respond: h2::server::SendResponse<Bytes>,
+    mut respond: TrackedRespond,
     payload: Bytes,
 ) -> Result<(), ServiceError> {
     let response = Response::builder()
@@ -1325,7 +1520,7 @@ async fn send_json_response(
 }
 
 fn send_text_response(
-    mut respond: h2::server::SendResponse<Bytes>,
+    mut respond: TrackedRespond,
     status: StatusCode,
     allow: Option<&'static str>,
     body: &'static [u8],
@@ -1345,7 +1540,7 @@ fn send_text_response(
 }
 
 fn send_range_unsatisfiable(
-    mut respond: h2::server::SendResponse<Bytes>,
+    mut respond: TrackedRespond,
     complete_length: u64,
 ) -> Result<(), ServiceError> {
     let response = Response::builder()
@@ -1382,13 +1577,15 @@ async fn send_payload(
     Ok(())
 }
 
-async fn send_object_reader<O: ObjectInterface>(
+async fn send_object_reader<O: ObjectInterface, F: FnMut(u64) + Send>(
     stream: &mut h2::SendStream<Bytes>,
     reader: &mut O,
     content_length: u64,
     key: &str,
-) -> Result<(), ServiceError> {
+    mut on_bytes_handed_to_transport: F,
+) -> Result<u64, ServiceError> {
     let mut remaining = content_length;
+    let mut bytes_handed_to_transport: u64 = 0;
     let mut buffer = BytesMut::new();
     while remaining > 0 {
         let requested = remaining.min(MAX_DATA_SEGMENT_SIZE as u64) as usize;
@@ -1404,28 +1601,32 @@ async fn send_object_reader<O: ObjectInterface>(
         let count = match reader.read(&mut buffer).await {
             Ok(count) if count > 0 && count <= requested => count,
             Ok(0) => {
-                eprintln!("storage GET reader reached EOF before declared length for key {key:?}");
+                log::error!("storage GET reader reached EOF before declared length for key {key:?}");
                 stream.send_reset(h2::Reason::INTERNAL_ERROR);
-                return Ok(());
+                return Err(ServiceError::ReaderFailure("reader reached EOF before declared length".to_owned()));
             }
             Ok(count) => {
-                eprintln!(
+                log::error!(
                     "storage GET reader returned {count} bytes for a {requested}-byte buffer for key {key:?}"
                 );
                 stream.send_reset(h2::Reason::INTERNAL_ERROR);
-                return Ok(());
+                return Err(ServiceError::ReaderFailure(format!(
+                    "reader returned {count} bytes for a {requested}-byte buffer"
+                )));
             }
             Err(error) => {
-                eprintln!("storage GET read failed for key {key:?}: {error}");
+                log::error!("storage GET read failed for key {key:?}: {error}");
                 stream.send_reset(h2::Reason::INTERNAL_ERROR);
-                return Ok(());
+                return Err(ServiceError::ReaderFailure(error.to_string()));
             }
         };
         let chunk = Bytes::copy_from_slice(&buffer[..count]);
         remaining -= count as u64;
         stream.send_data(chunk, remaining == 0)?;
+        bytes_handed_to_transport = bytes_handed_to_transport.saturating_add(count as u64);
+        on_bytes_handed_to_transport(count as u64);
     }
-    Ok(())
+    Ok(bytes_handed_to_transport)
 }
 
 fn poll_send_capacity(

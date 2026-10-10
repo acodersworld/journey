@@ -116,7 +116,7 @@ pub async fn serve<S: StorageClient>(
             biased;
             result = handle(stream, &database, &storage) => {
                 if let Err(error) = result {
-                    eprintln!("site control request failed: {error}");
+                    log::error!("site control request failed: {error}");
                 }
             }
             result = shutdown::requested(&mut shutdown) => {

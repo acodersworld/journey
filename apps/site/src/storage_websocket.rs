@@ -46,7 +46,7 @@ pub async fn serve(
                 let mut session_shutdown = shutdown.clone();
                 sessions.spawn(async move {
                     let Ok(permit) = active_session.try_acquire_owned() else {
-                        eprintln!("rejected additional storage WebSocket session from {peer}");
+                        log::error!("rejected additional storage WebSocket session from {peer}");
                         return;
                     };
                     let expected_secret = secret.into_bytes();
@@ -54,7 +54,7 @@ pub async fn serve(
                         biased;
                         signal = shutdown::requested(&mut session_shutdown) => {
                             if let Err(error) = signal {
-                                eprintln!("storage WebSocket shutdown signal failed: {error}");
+                                log::error!("storage WebSocket shutdown signal failed: {error}");
                             }
                             return;
                         }
@@ -86,17 +86,17 @@ pub async fn serve(
                     let websocket = match handshake {
                         Ok(Ok(websocket)) => websocket,
                         Ok(Err(error)) => {
-                            eprintln!("storage WebSocket handshake from {peer} failed: {error}");
+                            log::error!("storage WebSocket handshake from {peer} failed: {error}");
                             return;
                         }
                         Err(_) => {
-                            eprintln!("storage WebSocket handshake from {peer} timed out");
+                            log::error!("storage WebSocket handshake from {peer} timed out");
                             return;
                         }
                     };
-                    println!("storage WebSocket session accepted from {peer}");
+                    log::info!("storage_websocket_session_accepted peer={peer}");
                     if let Err(error) = storage.serve_connection(websocket, session_shutdown).await {
-                        eprintln!("storage WebSocket session from {peer} ended: {error}");
+                        log::error!("storage WebSocket session from {peer} ended: {error}");
                     }
                     drop(permit);
                 });

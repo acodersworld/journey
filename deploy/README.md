@@ -71,6 +71,53 @@ and streams large upload and download bodies without buffering them to disk.
 Inner HTTP/2 stream and connection windows are configured to 32 MiB and 64 MiB
 on both ends of the session.
 
+## Read and tune logs
+
+Follow the application logs from the site host:
+
+    docker compose -f site-compose.yml logs --follow --tail=200 site nginx
+
+Follow the storage service on its host:
+
+    docker compose -f storage-compose.yml logs --follow --tail=200 storage
+
+Use `--since=10m` to narrow the time window. The site and storage services
+write UTC, single-line events to stderr. Site requests use safe route templates
+and include the response status and handler time. Nginx access records include
+only time, method, status, and request time; they omit paths and query strings.
+Nginx error logging is disabled because some errors include the original
+request line. Use the site's safe route and status events for request
+diagnostics. Application events do not log request URLs, credentials, cookies,
+authorization headers, request bodies, or share secrets.
+
+Both TOML files accept the same optional settings:
+
+    [logging]
+    level = "info"
+
+The level accepts `off`, `error`, `warn`, `info`, `debug`, or `trace`.
+Existing configurations use these defaults. Changing the level takes effect
+after a service restart. The previous `queue_capacity` and
+`slow_enqueue_warning_ms` settings remain accepted for existing TOML files but
+are ignored. Each log call writes directly to stderr and can block its calling
+thread while output is slow.
+
+Storage also accepts
+`storage.range_get_summary_interval_seconds`, defaulting to 10. Each
+`storage_range_get_summary` reports interval counts for started, completed,
+cancelled, and failed range requests. `requests_total` is the running total for
+the current activity burst, repeated while that group's activity is reported.
+Groups are removed once a summary finds no active requests, so a later burst
+on the same key starts its total again. `bytes_handed_to_transport` counts
+object bytes passed to the HTTP/2 response stream, and `active_requests` is
+the number still running at the summary time. Groups combine viewers and byte
+ranges by object key and representation. Individual range events are available
+at DEBUG.
+
+The Compose files retain at most two 2 MiB JSON log files per container. A
+graceful stop emits the final ranged GET summary; abrupt termination can omit
+range counts that have not yet reached a summary interval.
+
 ## Start the storage host
 
 Copy `storage-compose.yml`, `storage.env.example`, and

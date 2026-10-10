@@ -154,7 +154,7 @@ pub(super) async fn share_link_preview<S: StorageClient>(
         Ok(Some(preview)) => preview,
         Ok(None) => return share_not_found(),
         Err(error) => {
-            eprintln!("website WhatsApp share preview lookup failed: {error}");
+            log::error!("website WhatsApp share preview lookup failed: {error}");
             return no_store(StatusCode::INTERNAL_SERVER_ERROR.into_response());
         }
     };
@@ -169,7 +169,7 @@ pub(super) async fn share_link_preview<S: StorageClient>(
                 share_link_expires_at,
                 state.security.whatsapp_preview.image_lifetime,
             ) else {
-                eprintln!("website WhatsApp image capability expiry is out of range");
+                log::error!("website WhatsApp image capability expiry is out of range");
                 return no_store(StatusCode::INTERNAL_SERVER_ERROR.into_response());
             };
             state.preview_image_authorizations.insert(
@@ -218,7 +218,7 @@ pub(super) async fn image<S: StorageClient>(
         Ok(Some(media)) => media,
         Ok(None) => return share_not_found(),
         Err(error) => {
-            eprintln!("website WhatsApp preview image lookup failed: {error}");
+            log::error!("website WhatsApp preview image lookup failed: {error}");
             return no_store(StatusCode::INTERNAL_SERVER_ERROR.into_response());
         }
     };
@@ -235,7 +235,7 @@ pub(super) async fn image<S: StorageClient>(
     ).await {
         Ok(stored) if stored.status == StatusCode::OK => stored,
         Ok(stored) => {
-            eprintln!(
+            log::error!(
                 "website WhatsApp preview image storage returned an unexpected status: share_link_id={share_link_id} storage_key={:?} source_content_type={:?} status={} response_content_type={:?} response_content_length={:?}",
                 media.storage_key,
                 media.content_type,
@@ -246,7 +246,7 @@ pub(super) async fn image<S: StorageClient>(
             return no_store(StatusCode::BAD_GATEWAY.into_response());
         }
         Err(error) => {
-            eprintln!(
+            log::error!(
                 "website WhatsApp preview image storage request failed: share_link_id={share_link_id} storage_key={:?} source_content_type={:?}: {error}",
                 media.storage_key,
                 media.content_type,
@@ -259,7 +259,7 @@ pub(super) async fn image<S: StorageClient>(
         .and_then(|value| value.split(';').next())
         .map(str::trim);
     if content_type != Some("image/jpeg") {
-        eprintln!(
+        log::error!(
             "website WhatsApp preview image storage returned an unexpected content type: share_link_id={share_link_id} storage_key={:?} source_content_type={:?} response_content_type={:?} response_content_length={:?}",
             media.storage_key,
             media.content_type,
@@ -272,7 +272,7 @@ pub(super) async fn image<S: StorageClient>(
         Some(value) => match value.to_str().ok().and_then(|value| value.parse::<u64>().ok()) {
             Some(length) if (1..=WHATSAPP_PREVIEW_IMAGE_MAX_BYTES).contains(&length) => length,
             _ => {
-                eprintln!(
+                log::error!(
                     "website WhatsApp preview image storage returned an invalid content length: share_link_id={share_link_id} storage_key={:?} source_content_type={:?} response_content_length={:?} maximum={WHATSAPP_PREVIEW_IMAGE_MAX_BYTES}",
                     media.storage_key,
                     media.content_type,
@@ -282,7 +282,7 @@ pub(super) async fn image<S: StorageClient>(
             }
         },
         None => {
-            eprintln!(
+            log::error!(
                 "website WhatsApp preview image storage omitted content length: share_link_id={share_link_id} storage_key={:?} source_content_type={:?} response_content_type={:?} maximum={WHATSAPP_PREVIEW_IMAGE_MAX_BYTES}",
                 media.storage_key,
                 media.content_type,
@@ -305,7 +305,7 @@ pub(super) async fn image<S: StorageClient>(
             Ok(bytes) => {
                 streamed_bytes = streamed_bytes.saturating_add(bytes.len() as u64);
                 if streamed_bytes > WHATSAPP_PREVIEW_IMAGE_MAX_BYTES {
-                    eprintln!(
+                    log::error!(
                         "website WhatsApp preview image stream exceeded its byte limit: share_link_id={body_share_link_id} bytes={streamed_bytes} maximum={WHATSAPP_PREVIEW_IMAGE_MAX_BYTES}"
                     );
                     Err(io::Error::other("reduced preview image exceeded its byte limit"))
@@ -314,7 +314,7 @@ pub(super) async fn image<S: StorageClient>(
                 }
             }
             Err(error) => {
-                eprintln!(
+                log::error!(
                     "website WhatsApp preview image stream failed: share_link_id={body_share_link_id}: {error}"
                 );
                 Err(error)

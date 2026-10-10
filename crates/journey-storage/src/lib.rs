@@ -10,6 +10,7 @@ mod storage_thumbnail;
 mod storage_image_reduction;
 mod http2_storage_service;
 mod storage_web_interface;
+mod range_get_logging;
 
 pub use storage_interface::{
     ContentType, ContentTypeError, GetResult, ImageFit, ImageOutputFormat, ImageReductionRequest,
@@ -26,3 +27,6 @@ pub use storage_filesystem::{
 };
 pub use http2_storage_service::{Service, ServiceError};
 pub use storage_web_interface::{serve_web_interface, WebCredentials, WebCredentialsError};
+pub use range_get_logging::{
+    start_range_get_aggregator, RangeGetAggregator, RangeGetOutcome, RangeGetTask,
+};

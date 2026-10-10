@@ -3,14 +3,15 @@ use std::{
     net::SocketAddr,
     path::PathBuf,
     sync::Arc,
+    time::Duration,
 };
 
 use bytes::Bytes;
 use clap::Parser;
 use h2::server;
 use journey_storage::{
-    serve_web_interface, ContentType, FilesystemStore, FilesystemStoreConfig, Key, Object,
-    Service, Store, StoreInterface, WebCredentials,
+    serve_web_interface, start_range_get_aggregator, ContentType, FilesystemStore,
+    FilesystemStoreConfig, Key, Object, Service, Store, StoreInterface, WebCredentials,
 };
 use http::HeaderValue;
 use tokio::{
@@ -46,6 +47,12 @@ struct Options {
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
     let options = Options::parse();
+    let mut logging = journey_logging::LoggingSettings::default();
+    logging.level = "info".to_owned();
+    journey_logging::initialize(
+        "journey-storage-example",
+        &logging,
+    )?;
     match options.storage_dir {
         Some(root) => {
             let store = FilesystemStore::open(FilesystemStoreConfig::new(&root)).await?;
@@ -117,13 +124,18 @@ async fn run_server<S: StoreInterface + Sync + Send>(
     })?;
     let bound_address = listener.local_addr()?;
     let web_store = Arc::clone(&store);
-    let service = Arc::new(Service::new(store));
+    let (range_get_aggregator, _range_get_task) =
+        start_range_get_aggregator(Duration::from_secs(10))?;
+    let service = Arc::new(Service::with_range_get_aggregator(store, range_get_aggregator));
 
     let web_listener = TcpListener::bind(web_address).await.map_err(|error| {
         std::io::Error::new(error.kind(), format!("failed to bind web listener at {web_address}: {error}"))
     })?;
     let web_bound_address = web_listener.local_addr()?;
     let web_credentials = WebCredentials::new("user", "pass")?;
+    log::info!(
+        "storage_example_started http2_address={bound_address} management_address={web_bound_address} seeded_fixtures={seeded_fixtures}"
+    );
     let mut web_server = tokio::spawn(async move {
         serve_web_interface(web_listener, web_store, web_credentials).await
     });
@@ -173,18 +185,19 @@ async fn run_server<S: StoreInterface + Sync + Send>(
             }
             accepted = listener.accept() => match accepted {
                 Ok((stream, peer)) => {
+                    log::info!("storage_example_connection_accepted peer={peer}");
                     let service = Arc::clone(&service);
                     connections.spawn(async move {
                         if let Err(error) = serve_connection(stream, service, initial_connection_window_size).await {
-                            eprintln!("HTTP/2 connection from {peer} failed: {error}");
+                            log::error!("storage_example_connection_failed peer={peer} error={error}");
                         }
                     });
                 }
-                Err(error) => eprintln!("TCP accept failed: {error}"),
+                Err(error) => log::error!("storage_example_accept_failed error={error}"),
             },
             result = connections.join_next(), if !connections.is_empty() => {
                 if let Some(Err(error)) = result {
-                    eprintln!("HTTP/2 connection task failed: {error}");
+                    log::error!("storage_example_connection_task_failed error={error}");
                 }
             }
         }
@@ -227,20 +240,20 @@ async fn serve_connection<S: StoreInterface + Sync + Send>(
                     requests.spawn(async move {
                         if let Err(error) = service.handle(request, respond).await {
                             if !error.is_peer_cancelled_get() {
-                                eprintln!("HTTP/2 request failed: {error}");
+                                log::error!("storage_example_request_failed error={error}");
                             }
                         }
                     });
                 }
                 Some(Err(error)) => {
-                    eprintln!("HTTP/2 request stream failed: {error}");
+                    log::error!("storage_example_request_stream_failed error={error}");
                     break;
                 }
                 None => break,
             },
             result = requests.join_next(), if !requests.is_empty() => {
                 if let Some(Err(error)) = result {
-                    eprintln!("HTTP/2 request task failed: {error}");
+                    log::error!("storage_example_request_task_failed error={error}");
                 }
             }
         }
@@ -248,7 +261,7 @@ async fn serve_connection<S: StoreInterface + Sync + Send>(
 
     while let Some(result) = requests.join_next().await {
         if let Err(error) = result {
-            eprintln!("HTTP/2 request task failed: {error}");
+            log::error!("storage_example_request_task_failed error={error}");
         }
     }
     Ok(())

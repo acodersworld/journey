@@ -13,7 +13,9 @@ futures-util = "0.3"
 h2 = "0.4"
 http = "1"
 journey-websocket = { path = "../../crates/journey-websocket" }
+journey-logging = { path = "../../crates/journey-logging" }
 jiff = "0.2"
+log = "0.4"
 libc = "0.2"
 rand = "0.8"
 rusqlite = { version = "0.32", features = ["bundled"] }

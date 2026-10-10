@@ -2,12 +2,15 @@ use std::{
     fmt,
     num::NonZeroUsize,
     str::FromStr,
-    sync::Arc,
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc,
+    },
 };
 
 use axum::{
     body::Body,
-    extract::{RawQuery, State},
+    extract::{Extension, RawQuery, State},
     http::{
         header, uri::Authority, HeaderMap, HeaderValue, Request, StatusCode, Uri,
     },
@@ -23,6 +26,11 @@ use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use subtle::ConstantTimeEq;
 use tokio::net::TcpListener;
+
+static NEXT_MANAGEMENT_REQUEST_ID: AtomicU64 = AtomicU64::new(1);
+
+#[derive(Clone, Copy)]
+struct ManagementRequestId(u64);
 
 use crate::storage_interface::{
     validate_generated_prefix, ContentType, GetResult, Key, ListCursor, ListRequest,
@@ -133,7 +141,32 @@ fn web_router<S: StoreInterface>(state: Arc<WebState<S>>) -> Router {
             Arc::clone(&state),
             authenticate::<S>,
         ))
+        .layer(middleware::from_fn(log_management_request))
         .with_state(state)
+}
+
+async fn log_management_request(mut request: Request<Body>, next: Next) -> Response {
+    let request_id = NEXT_MANAGEMENT_REQUEST_ID.fetch_add(1, Ordering::Relaxed);
+    let method = request.method().clone();
+    let route = match (method.as_str(), request.uri().path()) {
+        ("GET", "/") => "management_index",
+        ("GET", "/api/entries") => "storage_list",
+        ("GET", "/api/metadata") => "storage_head",
+        ("GET", "/api/download") => "storage_get",
+        ("PUT", "/api/object") => "storage_put",
+        ("DELETE", "/api/object") => "storage_delete",
+        _ => "management_unknown",
+    };
+    request.extensions_mut().insert(ManagementRequestId(request_id));
+    let started = std::time::Instant::now();
+    log::info!("storage_management_request_started request_id={request_id} method={method} route={route}");
+    let response = next.run(request).await;
+    log::info!(
+        "storage_management_request_finished request_id={request_id} method={method} route={route} status={} duration_ms={}",
+        response.status().as_u16(),
+        started.elapsed().as_millis(),
+    );
+    response
 }
 
 async fn index() -> Html<&'static str> {
@@ -248,6 +281,7 @@ struct UploadResponse {
 
 async fn entries<S: StoreInterface>(
     State(state): State<Arc<WebState<S>>>,
+    Extension(request_id): Extension<ManagementRequestId>,
     RawQuery(raw_query): RawQuery,
 ) -> Response {
     let query = match parse_query::<EntriesQuery>(raw_query.as_deref()) {
@@ -258,6 +292,7 @@ async fn entries<S: StoreInterface>(
     if prefix.len() > 1_024 || (!prefix.is_empty() && !prefix.ends_with('/')) {
         return text_response(StatusCode::BAD_REQUEST, BAD_REQUEST_BODY);
     }
+    log::info!("storage_list_started request_id={} prefix={prefix:?}", request_id.0);
     let mut seek_key = match query.cursor {
         Some(token) => match decode_cursor(&token, &prefix) {
             Ok(key) => Some(key),
@@ -337,6 +372,11 @@ async fn entries<S: StoreInterface>(
         }
     }
 
+    let entry_count = entries.len();
+    log::info!(
+        "storage_list_completed request_id={} prefix={prefix:?} status=200 entries={entry_count}",
+        request_id.0
+    );
     Json(EntriesResponse { entries, next_cursor }).into_response()
 }
 
@@ -362,6 +402,7 @@ fn decode_cursor(token: &str, prefix: &str) -> Result<Key, ()> {
 
 async fn metadata<S: StoreInterface>(
     State(state): State<Arc<WebState<S>>>,
+    Extension(request_id): Extension<ManagementRequestId>,
     RawQuery(raw_query): RawQuery,
 ) -> Response {
     let query = match parse_query::<KeyQuery>(raw_query.as_deref()) {
@@ -372,9 +413,23 @@ async fn metadata<S: StoreInterface>(
         Ok(key) => key,
         Err(_) => return text_response(StatusCode::BAD_REQUEST, BAD_REQUEST_BODY),
     };
+    log::info!("storage_head_started request_id={} key={:?} representation=original", request_id.0, key.as_str());
+    let started = std::time::Instant::now();
     match state.store.stat(&key).await {
-        Ok(metadata) => Json(metadata_response(&metadata)).into_response(),
-        Err(error) => store_error_response("STAT", error),
+        Ok(metadata) => {
+            log::info!(
+                "storage_head_completed request_id={} key={:?} representation=original status=200 duration_ms={}",
+                request_id.0,
+                key.as_str(),
+                started.elapsed().as_millis(),
+            );
+            Json(metadata_response(&metadata)).into_response()
+        }
+        Err(error) => {
+            let status = store_error_status(&error);
+            log::warn!("storage_head_failed request_id={} key={:?} status={} error={error}", request_id.0, key.as_str(), status.as_u16());
+            store_error_response("STAT", error)
+        }
     }
 }
 
@@ -415,6 +470,7 @@ fn attachment_disposition(filename: &str) -> HeaderValue {
 
 async fn download<S: StoreInterface>(
     State(state): State<Arc<WebState<S>>>,
+    Extension(request_id): Extension<ManagementRequestId>,
     RawQuery(raw_query): RawQuery,
 ) -> Response {
     let query = match parse_query::<KeyQuery>(raw_query.as_deref()) {
@@ -425,8 +481,16 @@ async fn download<S: StoreInterface>(
         Ok(key) => key,
         Err(_) => return text_response(StatusCode::BAD_REQUEST, BAD_REQUEST_BODY),
     };
+    log::info!("storage_get_started request_id={} key={:?} representation=original", request_id.0, key.as_str());
+    let started = std::time::Instant::now();
     match state.store.get(&key, None).await {
         Ok(GetResult::Found(object)) => {
+            log::info!(
+                "storage_get_response_ready request_id={} key={:?} representation=original status=200 duration_ms={}",
+                request_id.0,
+                key.as_str(),
+                started.elapsed().as_millis(),
+            );
             let filename = key
                 .as_str()
                 .rsplit('/')
@@ -450,8 +514,15 @@ async fn download<S: StoreInterface>(
             );
             response
         }
-        Ok(GetResult::Unsatisfiable { .. }) => text_response(StatusCode::INTERNAL_SERVER_ERROR, STORAGE_ERROR_BODY),
-        Err(error) => store_error_response("GET", error),
+        Ok(GetResult::Unsatisfiable { .. }) => {
+            log::error!("storage_get_failed request_id={} key={:?} status=500 reason=unexpected_unsatisfiable", request_id.0, key.as_str());
+            text_response(StatusCode::INTERNAL_SERVER_ERROR, STORAGE_ERROR_BODY)
+        }
+        Err(error) => {
+            let status = store_error_status(&error);
+            log::warn!("storage_get_failed request_id={} key={:?} status={} error={error}", request_id.0, key.as_str(), status.as_u16());
+            store_error_response("GET", error)
+        }
     }
 }
 
@@ -471,7 +542,7 @@ fn object_stream<O: ObjectInterface>(
             Ok(count) if count > 0 && count <= requested => count,
             Ok(0) => {
                 let error = StoreError::new(StoreErrorKind::Corrupt, "Object reader reached EOF before declared length");
-                eprintln!("storage web GET read failed for key {key:?}: {error}");
+                log::error!("storage web GET read failed for key {key:?}: {error}");
                 return Err(error);
             }
             Ok(count) => {
@@ -479,11 +550,11 @@ fn object_stream<O: ObjectInterface>(
                     StoreErrorKind::Corrupt,
                     format!("Object reader returned {count} bytes for a {requested}-byte buffer"),
                 );
-                eprintln!("storage web GET read failed for key {key:?}: {error}");
+                log::error!("storage web GET read failed for key {key:?}: {error}");
                 return Err(error);
             }
             Err(error) => {
-                eprintln!("storage web GET read failed for key {key:?}: {error}");
+                log::error!("storage web GET read failed for key {key:?}: {error}");
                 return Err(error);
             }
         };
@@ -495,6 +566,7 @@ fn object_stream<O: ObjectInterface>(
 
 async fn upload<S: StoreInterface>(
     State(state): State<Arc<WebState<S>>>,
+    Extension(request_id): Extension<ManagementRequestId>,
     request: Request<Body>,
 ) -> Response {
     if !same_http_origin(request.headers(), request.uri()) {
@@ -518,6 +590,12 @@ async fn upload<S: StoreInterface>(
         }
         _ => return text_response(StatusCode::BAD_REQUEST, BAD_REQUEST_BODY),
     };
+    let requested_key = match &target {
+        UploadTarget::WithKey(key) => Some(key.as_str().to_owned()),
+        UploadTarget::Generated { prefix } => Some(prefix.clone()),
+    };
+    log::info!("storage_put_started request_id={} key={:?}", request_id.0, requested_key.as_deref().unwrap_or(""));
+    let operation_started = std::time::Instant::now();
     let condition = match parse_put_condition(request.headers()) {
         Ok(condition) => condition,
         Err(()) => return text_response(StatusCode::BAD_REQUEST, BAD_REQUEST_BODY),
@@ -560,7 +638,7 @@ async fn upload<S: StoreInterface>(
         let chunk = match chunk {
             Ok(chunk) => chunk,
             Err(error) => {
-                eprintln!("storage web PUT body read failed: {error}");
+                log::error!("storage web PUT body read failed: {error}");
                 return text_response(StatusCode::BAD_REQUEST, BAD_REQUEST_BODY);
             }
         };
@@ -570,16 +648,37 @@ async fn upload<S: StoreInterface>(
     }
     match context {
         UploadContext::WithKey { context } => match state.store.put_with_key(context).await {
-            Ok(()) => StatusCode::NO_CONTENT.into_response(),
-            Err(error) => store_error_response("PUT commit", error),
+            Ok(()) => {
+                log::info!(
+                    "storage_put_completed request_id={} key={:?} generated=false status=204 duration_ms={}",
+                    request_id.0,
+                    requested_key.as_deref().unwrap_or(""),
+                    operation_started.elapsed().as_millis(),
+                );
+                StatusCode::NO_CONTENT.into_response()
+            }
+            Err(error) => {
+                let status = store_error_status(&error);
+                log::warn!("storage_put_failed request_id={} key={:?} generated=false status={} error={error}", request_id.0, requested_key.as_deref().unwrap_or(""), status.as_u16());
+                store_error_response("PUT commit", error)
+            }
         },
         UploadContext::Generated { prefix, context } => {
             match state.store.put_with_generated_name(context).await {
                 Ok(name) => {
                     let key = format!("{prefix}{name}");
+                    log::info!(
+                        "storage_put_completed request_id={} key={key:?} generated=true status=200 duration_ms={}",
+                        request_id.0,
+                        operation_started.elapsed().as_millis(),
+                    );
                     Json(UploadResponse { key }).into_response()
                 }
-                Err(error) => store_error_response("PUT commit", error),
+                Err(error) => {
+                    let status = store_error_status(&error);
+                    log::warn!("storage_put_failed request_id={} key={prefix:?} generated=true status={} error={error}", request_id.0, status.as_u16());
+                    store_error_response("PUT commit", error)
+                }
             }
         }
     }
@@ -602,6 +701,7 @@ fn parse_generated_key_mode(headers: &HeaderMap) -> Result<bool, ()> {
 
 async fn delete_object<S: StoreInterface>(
     State(state): State<Arc<WebState<S>>>,
+    Extension(request_id): Extension<ManagementRequestId>,
     request: Request<Body>,
 ) -> Response {
     if !same_http_origin(request.headers(), request.uri()) {
@@ -615,9 +715,23 @@ async fn delete_object<S: StoreInterface>(
         Ok(key) => key,
         Err(_) => return text_response(StatusCode::BAD_REQUEST, BAD_REQUEST_BODY),
     };
+    log::info!("storage_delete_started request_id={} key={:?}", request_id.0, key.as_str());
+    let started = std::time::Instant::now();
     match state.store.delete(&key).await {
-        Ok(()) => StatusCode::NO_CONTENT.into_response(),
-        Err(error) => store_error_response("DELETE", error),
+        Ok(()) => {
+            log::info!(
+                "storage_delete_completed request_id={} key={:?} status=204 duration_ms={}",
+                request_id.0,
+                key.as_str(),
+                started.elapsed().as_millis(),
+            );
+            StatusCode::NO_CONTENT.into_response()
+        }
+        Err(error) => {
+            let status = store_error_status(&error);
+            log::warn!("storage_delete_failed request_id={} key={:?} status={} error={error}", request_id.0, key.as_str(), status.as_u16());
+            store_error_response("DELETE", error)
+        }
     }
 }
 
@@ -712,9 +826,22 @@ fn store_error_response(operation: &str, error: StoreError) -> Response {
         }
     };
     if status.is_server_error() {
-        eprintln!("storage web {operation} failed: {error}");
+        log::error!("storage web {operation} failed: {error}");
     }
     text_response(status, body)
+}
+
+fn store_error_status(error: &StoreError) -> StatusCode {
+    match error.kind() {
+        StoreErrorKind::NotFound => StatusCode::NOT_FOUND,
+        StoreErrorKind::InvalidRequest => StatusCode::BAD_REQUEST,
+        StoreErrorKind::UnsupportedMediaType => StatusCode::UNSUPPORTED_MEDIA_TYPE,
+        StoreErrorKind::PreconditionFailed => StatusCode::PRECONDITION_FAILED,
+        StoreErrorKind::Conflict => StatusCode::CONFLICT,
+        StoreErrorKind::Capacity | StoreErrorKind::Corrupt | StoreErrorKind::Unavailable | StoreErrorKind::Internal => {
+            StatusCode::INTERNAL_SERVER_ERROR
+        }
+    }
 }
 
 fn text_response(status: StatusCode, body: &'static str) -> Response {

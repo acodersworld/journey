@@ -12,7 +12,8 @@ use std::{
 
 use config::AppConfig;
 use journey_storage::{
-    serve_web_interface, FilesystemStore, FilesystemStoreConfig, Service, WebCredentials,
+    serve_web_interface, start_range_get_aggregator, FilesystemStore, FilesystemStoreConfig,
+    Service, WebCredentials,
 };
 use journey_websocket::{
     connect_websocket, server_session, tungstenite::ClientRequestBuilder, Config, ServerSession,
@@ -32,6 +33,7 @@ async fn main() -> AppResult<()> {
     };
     println!("journey-storage-service {}", env!("JOURNEY_BINARY_VERSION"));
     let config = AppConfig::load(Some(config_path))?;
+    journey_logging::initialize("journey-storage", &config.logging)?;
     let mut shutdown = shutdown::listen();
 
     let management_bind = &config.management.bind;
@@ -55,6 +57,7 @@ async fn main() -> AppResult<()> {
         "storage.initial_connection_window_size",
         config.storage.initial_connection_window_size,
     )?;
+    config.storage.validate_range_get_summary_interval()?;
     let credentials = WebCredentials::new(
         config.management.username.clone(),
         config.management.password.clone(),
@@ -90,8 +93,12 @@ async fn main() -> AppResult<()> {
     management_tasks.spawn(async move {
         serve_web_interface(management_listener, management_store, credentials).await
     });
-    let service = Service::new(store);
-    println!("journey-storage management UI on {management_bind}");
+    let (range_get_aggregator, range_get_task) = start_range_get_aggregator(
+        Duration::from_secs(config.storage.range_get_summary_interval_seconds),
+    )?;
+    let service = Service::with_range_get_aggregator(store, range_get_aggregator);
+    log::info!("storage_service_started object_dir={object_dir_display:?}");
+    log::info!("listener_started listener=management_ui address={management_bind}");
 
     let mut result: AppResult<()> = loop {
         let request = ClientRequestBuilder::new(websocket_uri.clone())
@@ -108,7 +115,7 @@ async fn main() -> AppResult<()> {
         };
         match connection {
             Ok(Ok((websocket, _))) => {
-                println!("connected to journey-site storage listener");
+                log::info!("storage_connection_established");
                 let session = tokio::select! {
                     biased;
                     signal = shutdown::requested(&mut shutdown) => {
@@ -121,22 +128,39 @@ async fn main() -> AppResult<()> {
                 };
                 match session {
                     Ok(session) => {
+                        let session_shutdown = shutdown.clone();
+                        let mut storage_session = tokio::spawn(run_storage_session(
+                            session,
+                            service.clone(),
+                            session_shutdown,
+                        ));
                         tokio::select! {
                             biased;
                             signal = shutdown::requested(&mut shutdown) => {
+                                if let Err(error) = storage_session.await {
+                                    log::error!("storage_session_task_failed error={error}");
+                                }
+                                log::info!("storage_connection_closed reason=shutdown");
                                 break shutdown_result(signal);
                             }
                             Some(task_result) = management_tasks.join_next(), if !management_tasks.is_empty() => {
+                                storage_session.abort();
+                                let _ = storage_session.await;
                                 break Err(management_ui_task_failure(task_result));
                             }
-                            _ = run_storage_session(session, service.clone()) => {}
+                            result = &mut storage_session => {
+                                if let Err(error) = result {
+                                    log::error!("storage_session_task_failed error={error}");
+                                }
+                                log::info!("storage_connection_closed");
+                            }
                         }
                     }
-                    Err(error) => eprintln!("storage HTTP/2 session failed: {error}"),
+                    Err(error) => log::error!("storage_http2_session_failed error={error}"),
                 }
             }
-            Ok(Err(error)) => eprintln!("storage WebSocket connection to {websocket_url} failed: {error}"),
-            Err(_) => eprintln!("storage WebSocket connection timed out"),
+            Ok(Err(error)) => log::error!("storage_websocket_connection_failed error={error}"),
+            Err(_) => log::warn!("storage_websocket_connection_timed_out"),
         }
         tokio::select! {
             biased;
@@ -166,6 +190,8 @@ async fn main() -> AppResult<()> {
             _ => {}
         }
     }
+    range_get_task.shutdown().await;
+    log::info!("storage_service_stopped");
     result
 }
 
@@ -234,40 +260,54 @@ fn validate_window(name: &str, size: u32) -> AppResult<()> {
 async fn run_storage_session<S: journey_storage::StoreInterface>(
     mut session: ServerSession,
     service: Service<S>,
+    mut shutdown: shutdown::Receiver,
 ) {
     let mut handlers = JoinSet::new();
+    let mut stopping = false;
     loop {
         tokio::select! {
+            biased;
+            signal = shutdown::requested(&mut shutdown) => {
+                if let Err(error) = signal {
+                    log::error!("storage_shutdown_signal_failed error={error}");
+                }
+                stopping = true;
+                break;
+            }
             accepted = session.accept() => match accepted {
                 Ok(Some((request, respond))) => {
                     let service = service.clone();
                     handlers.spawn(async move {
                         if let Err(error) = service.handle(request, respond).await {
                             if !error.is_peer_cancelled_get() {
-                                eprintln!("storage request failed: {error}");
+                                log::error!("storage_request_failed error={error}");
                             }
                         }
                     });
                 }
                 Ok(None) => break,
                 Err(error) => {
-                    eprintln!("storage HTTP/2 session failed: {error}");
+                    log::error!("storage_http2_session_failed error={error}");
                     break;
                 }
             },
             Some(result) = handlers.join_next(), if !handlers.is_empty() => {
                 if let Err(error) = result {
-                    eprintln!("storage request task failed: {error}");
+                    log::error!("storage_request_task_failed error={error}");
                 }
             }
         }
     }
     while let Some(result) = handlers.join_next().await {
         if let Err(error) = result {
-            eprintln!("storage request task failed: {error}");
+            log::error!("storage_request_task_failed error={error}");
         }
     }
+    if stopping {
+        drop(session);
+        return;
+    }
     if let Err(error) = session.wait().await {
-        eprintln!("storage WebSocket session ended: {error}");
+        log::warn!("storage_websocket_session_ended error={error}");
     }
 }

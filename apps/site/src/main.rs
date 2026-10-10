@@ -131,6 +131,7 @@ async fn main() -> AppResult<()> {
     }
 
     let config = config::AppConfig::load(config_path)?;
+    journey_logging::initialize("journey-site", &config.logging)?;
     let database = Database::new(config.site.database_path.clone());
     match command {
         Commands::Import(options) => {
@@ -373,7 +374,10 @@ async fn main() -> AppResult<()> {
                 }
             };
             if let Some(listener) = &websocket_listener {
-                println!("journey-site storage WebSocket listener on {}", listener.local_addr()?);
+                log::info!(
+                    "listener_started listener=storage_websocket address={}",
+                    listener.local_addr()?
+                );
             }
             let listener = TcpListener::bind(&bind)
                 .await
@@ -383,8 +387,8 @@ async fn main() -> AppResult<()> {
                 .await
                 .map_err(|error| format!("could not bind private import control socket: {error}"))?;
             let mut control_socket = control::BoundSocketPath::new(config.site.control_socket.clone());
-            println!("journey-site import control socket ready");
-            println!("journey-site HTTP listener on {listener_address}");
+            log::info!("listener_started listener=control_socket");
+            log::info!("site_started listener=http address={listener_address}");
 
             let mut listener_tasks = JoinSet::new();
             if let Some(websocket_listener) = websocket_listener {
@@ -479,6 +483,7 @@ async fn main() -> AppResult<()> {
                 }
             }
             shutdown_storage.close().await;
+            log::info!("site_stopped");
             if let Err(error) = control_socket.remove().await {
                 if result.is_ok() {
                     result = Err(format!("could not remove site control socket: {error}").into());

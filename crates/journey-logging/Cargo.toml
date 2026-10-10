@@ -1,0 +1,9 @@
+[package]
+name = "journey-logging"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+jiff = "0.2"
+log = { version = "0.4", features = ["std"] }
+serde = { version = "1", features = ["derive"] }

@@ -7,11 +7,12 @@ use axum::{
     routing::{delete, get, post, put},
     Json, Router,
 };
-use futures_util::StreamExt;
+use futures_util::{StreamExt, TryStreamExt};
 use serde::{Deserialize, Serialize};
 use std::{
     io,
     net::{IpAddr, SocketAddr},
+    sync::atomic::{AtomicU64, Ordering},
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
@@ -26,6 +27,8 @@ const MAX_FEED_LIMIT: usize = 100;
 pub const DEFAULT_MAX_MEDIA_UPLOAD_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 
 pub(crate) mod whatsapp_preview;
+
+static NEXT_REQUEST_ID: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Clone)]
 pub struct AppState<S: StorageClient> {
@@ -295,7 +298,96 @@ pub fn router<S: StorageClient>(state: AppState<S>) -> Router {
             get(shared_media::<S>).head(shared_media::<S>),
         )
         .merge(content_routes)
+        .layer(middleware::from_fn(log_request))
         .with_state(state)
+}
+
+async fn log_request(request: Request, next: Next) -> Response {
+    let request_id = NEXT_REQUEST_ID.fetch_add(1, Ordering::Relaxed);
+    let method = request.method().clone();
+    let route = safe_route_template(request.uri().path());
+    let static_or_media = is_static_or_media(route, &method);
+    let started = std::time::Instant::now();
+    if static_or_media {
+        log::debug!("request_arrival request_id={request_id} method={method} route={route}");
+    } else {
+        log::info!("request_arrival request_id={request_id} method={method} route={route}");
+    }
+    let response = next.run(request).await;
+    let status = response.status();
+    let elapsed_ms = started.elapsed().as_millis();
+    if static_or_media && status.is_success() {
+        log::debug!(
+            "response_ready request_id={request_id} method={method} route={route} status={} handler_duration_ms={elapsed_ms}",
+            status.as_u16()
+        );
+    } else {
+        log::info!(
+            "response_ready request_id={request_id} method={method} route={route} status={} handler_duration_ms={elapsed_ms}",
+            status.as_u16()
+        );
+    }
+    let (parts, body) = response.into_parts();
+    let body = Body::from_stream(body.into_data_stream().map_err(move |error| {
+        log::error!(
+            "response_stream_failed request_id={request_id} method={method} route={route} error={error}"
+        );
+        error
+    }));
+    Response::from_parts(parts, body)
+}
+
+fn safe_route_template(path: &str) -> &'static str {
+    match path {
+        "/" => "/",
+        "/login" => "/login",
+        "/logout" => "/logout",
+        "/site.css" => "/site.css",
+        "/site.js" => "/site.js",
+        "/api/auth/login" => "/api/auth/login",
+        "/api/auth/current" => "/api/auth/current",
+        "/api/auth/logout" => "/api/auth/logout",
+        "/api/posts" => "/api/posts",
+        "/api/drafts" => "/api/drafts",
+        "/tags" => "/tags",
+        "/posts/new" => "/posts/new",
+        _ => {
+            let segments = path.split('/').filter(|segment| !segment.is_empty()).collect::<Vec<_>>();
+            match segments.as_slice() {
+                ["share", _, "whatsapp-preview-image", _] => {
+                    "/share/{share_link_id}/whatsapp-preview-image/{random_name}"
+                }
+                ["share", _, "posts", _, "blocks", _, "media"] => {
+                    "/share/{share_link_id}/posts/{post_id}/blocks/{block_id}/media"
+                }
+                ["share", _, "posts", _] => "/share/{share_link_id}/posts/{post_id}",
+                ["share", _, _] => "/share/{share_link_id}/{secret}",
+                ["posts", _, "blocks", _, "media"] => "/posts/{post_id}/blocks/{block_id}/media",
+                ["posts", _, "fragment"] => "/posts/{id}/fragment",
+                ["posts", _, "edit"] => "/posts/{id}/edit",
+                ["posts", _, "share-preview"] => "/posts/{id}/share-preview",
+                ["posts", _] => "/posts/{id}",
+                ["archive", _] => "/archive/{month}",
+                ["api", "posts", _, "text"] => "/api/posts/{id}/text",
+                ["api", "posts", _, "publish"] => "/api/posts/{id}/publish",
+                ["api", "posts", _, "share-links"] => "/api/posts/{id}/share-links",
+                ["api", "posts", _] => "/api/posts/{id}",
+                ["api", "share-links", _] => "/api/share-links/{id}",
+                _ => "unmatched",
+            }
+        }
+    }
+}
+
+fn is_static_or_media(route: &str, method: &Method) -> bool {
+    matches!(*method, Method::GET | Method::HEAD)
+        && matches!(
+            route,
+            "/site.css"
+                | "/site.js"
+                | "/posts/{post_id}/blocks/{block_id}/media"
+                | "/share/{share_link_id}/posts/{post_id}/blocks/{block_id}/media"
+        )
 }
 
 async fn authenticate<S: StorageClient>(
@@ -311,7 +403,7 @@ async fn authenticate<S: StorageClient>(
         Ok(Some(account)) => account,
         Ok(None) => return unauthenticated_response(&request),
         Err(error) => {
-            eprintln!("website session lookup failed: {error}");
+            log::error!("website session lookup failed: {error}");
             return no_store(StatusCode::INTERNAL_SERVER_ERROR.into_response());
         }
     };
@@ -349,6 +441,7 @@ async fn open_share_link<S: StorageClient>(
         .await
     {
         Ok(Some((post_id, expires_at))) => {
+            log::info!("share_link_accessed share_link_id={share_link_id} post_id={post_id}");
             let mut response = redirect_to(&format!("/share/{share_link_id}/posts/{post_id}"));
             set_share_cookie(
                 &mut response,
@@ -359,9 +452,12 @@ async fn open_share_link<S: StorageClient>(
             );
             no_store(response)
         }
-        Ok(None) => share_not_found(),
+        Ok(None) => {
+            log::warn!("share_link_rejected share_link_id={share_link_id} reason=invalid_or_expired");
+            share_not_found()
+        }
         Err(error) => {
-            eprintln!("website share-link session creation failed: {error}");
+            log::error!("website share-link session creation failed: {error}");
             no_store(StatusCode::INTERNAL_SERVER_ERROR.into_response())
         }
     }
@@ -391,7 +487,7 @@ async fn shared_post_page<S: StorageClient>(
         }
         Ok(None) => share_not_found(),
         Err(error) => {
-            eprintln!("website shared-post lookup failed: {error}");
+            log::error!("website shared-post lookup failed: {error}");
             no_store(StatusCode::INTERNAL_SERVER_ERROR.into_response())
         }
     }
@@ -421,7 +517,7 @@ async fn shared_media<S: StorageClient>(
         Ok(Some(media)) => media,
         Ok(None) => return share_not_found(),
         Err(error) => {
-            eprintln!("website shared-media lookup failed: {error}");
+            log::error!("website shared-media lookup failed: {error}");
             return no_store(StatusCode::INTERNAL_SERVER_ERROR.into_response());
         }
     };
@@ -450,7 +546,7 @@ async fn share_preview<S: StorageClient>(
         }
         Ok(_) => no_store(StatusCode::NOT_FOUND.into_response()),
         Err(error) => {
-            eprintln!("website share preview lookup failed: {error}");
+            log::error!("website share preview lookup failed: {error}");
             no_store(StatusCode::INTERNAL_SERVER_ERROR.into_response())
         }
     }
@@ -482,17 +578,22 @@ async fn create_share_link<S: StorageClient>(
         )
         .await
     {
-        Ok(Some(link)) => no_store(
-            Json(CreatedShareLinkResponse {
+        Ok(Some(link)) => {
+            log::info!(
+                "share_link_created actor={:?} post_id={post_id} share_link_id={}",
+                principal.username,
+                link.id
+            );
+            no_store(Json(CreatedShareLinkResponse {
                 url: format!("{}/share/{}/{}", origin.key, link.id, secret),
                 id: link.id,
                 expires_at_unix: link.expires_at_unix,
             })
-            .into_response(),
-        ),
+            .into_response())
+        }
         Ok(None) => no_store(StatusCode::NOT_FOUND.into_response()),
         Err(error) => {
-            eprintln!("website share-link creation failed: {error}");
+            log::error!("website share-link creation failed: {error}");
             no_store(StatusCode::INTERNAL_SERVER_ERROR.into_response())
         }
     }
@@ -513,11 +614,14 @@ async fn revoke_share_link<S: StorageClient>(
     if !valid_share_link_id(&id) {
         return no_store(StatusCode::NOT_FOUND.into_response());
     }
-    match state.database.revoke_share_link(id, unix_time(), access).await {
-        Ok(true) => no_store(StatusCode::NO_CONTENT.into_response()),
+    match state.database.revoke_share_link(id.clone(), unix_time(), access).await {
+        Ok(true) => {
+            log::info!("share_link_revoked actor={:?} share_link_id={id}", principal.username);
+            no_store(StatusCode::NO_CONTENT.into_response())
+        }
         Ok(false) => no_store(StatusCode::NOT_FOUND.into_response()),
         Err(error) => {
-            eprintln!("website share-link revocation failed: {error}");
+            log::error!("website share-link revocation failed: {error}");
             no_store(StatusCode::INTERNAL_SERVER_ERROR.into_response())
         }
     }
@@ -584,7 +688,7 @@ async fn login_page<S: StorageClient>(
             Ok(Some(_)) => return redirect_to(&return_to),
             Ok(None) => {}
             Err(error) => {
-                eprintln!("website login-page session lookup failed: {error}");
+                log::error!("website login-page session lookup failed: {error}");
                 return no_store(StatusCode::INTERNAL_SERVER_ERROR.into_response());
             }
         }
@@ -641,11 +745,13 @@ async fn authenticate_and_issue_session<S: StorageClient>(
     password: String,
 ) -> Result<(crate::db::LoginAccount, String), Response> {
     if !origin_allowed(headers, &state.security) {
+        log::warn!("login_rejected peer_ip={} reason=origin_not_allowed", peer_address.ip());
         return Err(no_store(
             (StatusCode::FORBIDDEN, "origin not allowed\n").into_response(),
         ));
     }
     if username.len() > 64 || password.len() > 1024 {
+        log::warn!("login_rejected peer_ip={} reason=credential_length", peer_address.ip());
         return Err(login_failure());
     }
     let username_throttle_key = auth::username_throttle_key(&username);
@@ -661,9 +767,12 @@ async fn authenticate_and_issue_session<S: StorageClient>(
             .await
         {
             Ok(true) => {}
-            Ok(false) => return Err(login_failure()),
+            Ok(false) => {
+                log::warn!("login_throttled username={username:?} peer_ip={}", peer_address.ip());
+                return Err(login_failure());
+            }
             Err(error) => {
-                eprintln!("website login throttle failed: {error}");
+                log::error!("website login throttle failed: {error}");
                 return Err(no_store(StatusCode::INTERNAL_SERVER_ERROR.into_response()));
             }
         }
@@ -672,7 +781,7 @@ async fn authenticate_and_issue_session<S: StorageClient>(
     let account = match state.database.login_account(username.clone()).await {
         Ok(account) => account,
         Err(error) => {
-            eprintln!("website account lookup failed: {error}");
+            log::error!("website account lookup failed: {error}");
             return Err(no_store(StatusCode::INTERNAL_SERVER_ERROR.into_response()));
         }
     };
@@ -688,12 +797,13 @@ async fn authenticate_and_issue_session<S: StorageClient>(
         }
     };
     if !authenticated {
+        log::warn!("login_rejected username={username:?} peer_ip={}", peer_address.ip());
         return Err(login_failure());
     }
     let account = account.expect("successful authentication has an account");
     for key in [username_throttle_key, address_throttle_key] {
         if let Err(error) = state.database.clear_login_attempts(key).await {
-            eprintln!("website login throttle reset failed: {error}");
+            log::error!("website login throttle reset failed: {error}");
             return Err(no_store(StatusCode::INTERNAL_SERVER_ERROR.into_response()));
         }
     }
@@ -711,9 +821,14 @@ async fn authenticate_and_issue_session<S: StorageClient>(
         )
         .await
     {
-        eprintln!("website session creation failed: {error}");
+        log::error!("website session creation failed: {error}");
         return Err(no_store(StatusCode::INTERNAL_SERVER_ERROR.into_response()));
     }
+    log::info!(
+        "login_succeeded user_id={} username={username:?} peer_ip={}",
+        account.id,
+        peer_address.ip()
+    );
     Ok((account, token))
 }
 
@@ -731,7 +846,7 @@ async fn current_account<S: StorageClient>(
         }).into_response()),
         Ok(None) => no_store(StatusCode::UNAUTHORIZED.into_response()),
         Err(error) => {
-            eprintln!("website current-account lookup failed: {error}");
+            log::error!("website current-account lookup failed: {error}");
             no_store(StatusCode::INTERNAL_SERVER_ERROR.into_response())
         }
     }
@@ -745,6 +860,7 @@ async fn logout<S: StorageClient>(
         return response;
     }
     let mut response = StatusCode::NO_CONTENT.into_response();
+    log::info!("logout_completed");
     expire_session_cookie(&mut response, &state.security);
     no_store(response)
 }
@@ -757,6 +873,7 @@ async fn logout_form<S: StorageClient>(
         return response;
     }
     let mut response = redirect_to("/login");
+    log::info!("logout_completed");
     expire_session_cookie(&mut response, &state.security);
     no_store(response)
 }
@@ -776,7 +893,7 @@ async fn revoke_current_session<S: StorageClient>(
             .revoke_session(auth::session_token_digest(&token))
             .await
         {
-            eprintln!("website logout failed: {error}");
+            log::error!("website logout failed: {error}");
             return Err(no_store(StatusCode::INTERNAL_SERVER_ERROR.into_response()));
         }
     }
@@ -1106,7 +1223,7 @@ async fn feed<S: StorageClient>(
     ).await {
         Ok(page) => Json(page).into_response(),
         Err(error) => {
-            eprintln!("website feed query failed: {error}");
+            log::error!("website feed query failed: {error}");
             StatusCode::INTERNAL_SERVER_ERROR.into_response()
         }
     }
@@ -1124,7 +1241,7 @@ async fn drafts<S: StorageClient>(
     match state.database.drafts(author_username).await {
         Ok(posts) => no_store(Json(posts).into_response()),
         Err(error) => {
-            eprintln!("website draft list query failed: {error}");
+            log::error!("website draft list query failed: {error}");
             no_store(StatusCode::INTERNAL_SERVER_ERROR.into_response())
         }
     }
@@ -1153,7 +1270,7 @@ async fn new_post_page<S: StorageClient>(
     let sidebar = match sidebar_data_for_principal(&state.database, &principal).await {
         Ok(sidebar) => sidebar,
         Err(error) => {
-            eprintln!("website sidebar query failed: {error}");
+            log::error!("website sidebar query failed: {error}");
             return no_store(StatusCode::INTERNAL_SERVER_ERROR.into_response());
         }
     };
@@ -1188,11 +1305,12 @@ async fn create_draft<S: StorageClient>(
         .await
     {
         Ok(id) => {
+            log::info!("draft_created actor={:?} post_id={id}", principal.username);
             let post = match state.database.post_with_access(id, principal.post_access()).await {
                 Ok(Some(post)) => post,
                 Ok(None) => return no_store(StatusCode::INTERNAL_SERVER_ERROR.into_response()),
                 Err(error) => {
-                    eprintln!("website created-draft query failed: {error}");
+                    log::error!("website created-draft query failed: {error}");
                     return no_store(StatusCode::INTERNAL_SERVER_ERROR.into_response());
                 }
             };
@@ -1204,7 +1322,7 @@ async fn create_draft<S: StorageClient>(
             no_store(response)
         }
         Err(error) => {
-            eprintln!("website draft creation failed: {error}");
+            log::error!("website draft creation failed: {error}");
             no_store(StatusCode::INTERNAL_SERVER_ERROR.into_response())
         }
     }
@@ -1261,7 +1379,10 @@ async fn save_draft<S: StorageClient>(
         request.tags,
         request.blocks.into_iter().map(create_draft_block).collect(),
     ).await {
-        Ok(SaveDraftResult::Saved(post)) => no_store(Json(post).into_response()),
+        Ok(SaveDraftResult::Saved(post)) => {
+            log::info!("draft_saved actor={:?} post_id={id}", principal.username);
+            no_store(Json(post).into_response())
+        }
         Ok(SaveDraftResult::NotFound) => no_store(StatusCode::NOT_FOUND.into_response()),
         Ok(SaveDraftResult::Conflict) => no_store((StatusCode::CONFLICT, "draft revision conflict; reload before saving\n").into_response()),
         Ok(SaveDraftResult::Published) => no_store((StatusCode::CONFLICT, "published posts are read-only\n").into_response()),
@@ -1272,7 +1393,7 @@ async fn save_draft<S: StorageClient>(
             {
                 return no_store((StatusCode::BAD_REQUEST, "invalid draft block tree or media reference\n").into_response());
             }
-            eprintln!("website draft save failed: {error}");
+            log::error!("website draft save failed: {error}");
             no_store(StatusCode::INTERNAL_SERVER_ERROR.into_response())
         }
     }
@@ -1302,7 +1423,7 @@ async fn save_published_text<S: StorageClient>(
     }).collect();
     match state.database.save_published_text(
         id,
-        principal.username,
+        principal.username.clone(),
         principal.role == AccountRole::Admin,
         request.revision,
         request.title,
@@ -1310,14 +1431,17 @@ async fn save_published_text<S: StorageClient>(
         request.tags,
         blocks,
     ).await {
-        Ok(SavePublishedTextResult::Saved(post)) => no_store(Json(post).into_response()),
+        Ok(SavePublishedTextResult::Saved(post)) => {
+            log::info!("published_post_edited actor={:?} post_id={id}", principal.username);
+            no_store(Json(post).into_response())
+        }
         Ok(SavePublishedTextResult::NotFound) => no_store(StatusCode::NOT_FOUND.into_response()),
         Ok(SavePublishedTextResult::Conflict) => no_store((StatusCode::CONFLICT, "published post revision conflict; reload before saving again\n").into_response()),
         Ok(SavePublishedTextResult::Unpublished) => no_store((StatusCode::CONFLICT, "draft text must be edited in the draft editor\n").into_response()),
         Ok(SavePublishedTextResult::MissingTitle) => no_store((StatusCode::BAD_REQUEST, "a published post needs a nonblank title\n").into_response()),
         Ok(SavePublishedTextResult::InvalidBlocks) => no_store((StatusCode::BAD_REQUEST, "published text must include each existing block ID exactly once\n").into_response()),
         Err(error) => {
-            eprintln!("website published-post text save failed: {error}");
+            log::error!("website published-post text save failed: {error}");
             no_store(StatusCode::INTERNAL_SERVER_ERROR.into_response())
         }
     }
@@ -1354,13 +1478,13 @@ async fn upload_media<S: StorageClient>(
     match state.database.draft_root_exists(
         post_id,
         block_id,
-        principal.username,
+        principal.username.clone(),
         principal.role == AccountRole::Admin,
     ).await {
         Ok(true) => {}
         Ok(false) => return no_store(StatusCode::NOT_FOUND.into_response()),
         Err(error) => {
-            eprintln!("website upload authorization query failed: {error}");
+            log::error!("website upload authorization query failed: {error}");
             return no_store(StatusCode::INTERNAL_SERVER_ERROR.into_response());
         }
     }
@@ -1375,14 +1499,22 @@ async fn upload_media<S: StorageClient>(
     ).await {
         Ok((storage_key, size_bytes)) => {
             if let Err(error) = state.database.record_media_asset(storage_key.clone(), content_type.clone(), size_bytes).await {
-                eprintln!("website media metadata registration failed: {error}");
+                log::error!("website media metadata registration failed: {error}");
                 return no_store(StatusCode::INTERNAL_SERVER_ERROR.into_response());
             }
+            log::info!(
+                "media_upload_succeeded actor={:?} post_id={post_id} block_id={block_id} size_bytes={size_bytes}",
+                principal.username
+            );
             no_store(Json(UploadedMediaResponse { storage_key, content_type, size_bytes }).into_response())
         }
-        Err(error) if error == UPLOAD_LIMIT_ERROR => no_store(StatusCode::PAYLOAD_TOO_LARGE.into_response()),
+        Err(error) if error == UPLOAD_LIMIT_ERROR => {
+            log::warn!("media_upload_rejected actor={:?} post_id={post_id} block_id={block_id} reason=size_limit", principal.username);
+            no_store(StatusCode::PAYLOAD_TOO_LARGE.into_response())
+        }
         Err(error) => {
-            eprintln!("website media upload failed: {error}");
+            log::error!("website media upload failed: {error}");
+            log::warn!("media_upload_failed actor={:?} post_id={post_id} block_id={block_id}", principal.username);
             no_store(StatusCode::BAD_GATEWAY.into_response())
         }
     }
@@ -1417,13 +1549,14 @@ async fn publish_post<S: StorageClient>(
         .database
         .publish_draft(
             id,
-            principal.username,
+            principal.username.clone(),
             principal.role == AccountRole::Admin,
             request.published_at,
         )
         .await
     {
         Ok(crate::db::PublishPostResult::Published) => {
+            log::info!("post_published actor={:?} post_id={id}", principal.username);
             no_store(StatusCode::NO_CONTENT.into_response())
         }
         Ok(crate::db::PublishPostResult::NotFound) => {
@@ -1445,7 +1578,7 @@ async fn publish_post<S: StorageClient>(
             "published_at is outside the supported timestamp range\n",
         ).into_response()),
         Err(error) => {
-            eprintln!("website post publishing failed: {error}");
+            log::error!("website post publishing failed: {error}");
             no_store(StatusCode::INTERNAL_SERVER_ERROR.into_response())
         }
     }
@@ -1461,7 +1594,7 @@ async fn home<S: StorageClient>(
                 Some(summary) => match state.database.post(summary.id).await {
                     Ok(post) => post,
                     Err(error) => {
-                        eprintln!("website home post query failed: {error}");
+                        log::error!("website home post query failed: {error}");
                         return StatusCode::INTERNAL_SERVER_ERROR.into_response();
                     }
                 },
@@ -1473,7 +1606,7 @@ async fn home<S: StorageClient>(
             let sidebar = match sidebar_data_for_principal(&state.database, &principal).await {
                 Ok(sidebar) => sidebar,
                 Err(error) => {
-                    eprintln!("website sidebar query failed: {error}");
+                    log::error!("website sidebar query failed: {error}");
                     return StatusCode::INTERNAL_SERVER_ERROR.into_response();
                 }
             };
@@ -1488,7 +1621,7 @@ async fn home<S: StorageClient>(
             .into_response()
         }
         Err(error) => {
-            eprintln!("website home query failed: {error}");
+            log::error!("website home query failed: {error}");
             StatusCode::INTERNAL_SERVER_ERROR.into_response()
         }
     }
@@ -1505,7 +1638,7 @@ async fn tag_page<S: StorageClient>(
                 Some(summary) => match state.database.post(summary.id).await {
                     Ok(post) => post,
                     Err(error) => {
-                        eprintln!("website tag post query failed: {error}");
+                        log::error!("website tag post query failed: {error}");
                         return StatusCode::INTERNAL_SERVER_ERROR.into_response();
                     }
                 },
@@ -1517,7 +1650,7 @@ async fn tag_page<S: StorageClient>(
             let sidebar = match sidebar_data_for_principal(&state.database, &principal).await {
                 Ok(sidebar) => sidebar,
                 Err(error) => {
-                    eprintln!("website sidebar query failed: {error}");
+                    log::error!("website sidebar query failed: {error}");
                     return StatusCode::INTERNAL_SERVER_ERROR.into_response();
                 }
             };
@@ -1533,7 +1666,7 @@ async fn tag_page<S: StorageClient>(
                 .into_response()
         }
         Err(error) => {
-            eprintln!("website tag feed query failed: {error}");
+            log::error!("website tag feed query failed: {error}");
             StatusCode::INTERNAL_SERVER_ERROR.into_response()
         }
     }
@@ -1556,7 +1689,7 @@ async fn archive_page<S: StorageClient>(
     ).await {
         Ok(page) => page,
         Err(error) => {
-            eprintln!("website archive query failed: {error}");
+            log::error!("website archive query failed: {error}");
             return StatusCode::INTERNAL_SERVER_ERROR.into_response();
         }
     };
@@ -1564,7 +1697,7 @@ async fn archive_page<S: StorageClient>(
         Some(summary) => match state.database.post(summary.id).await {
             Ok(post) => post,
             Err(error) => {
-                eprintln!("website archive post query failed: {error}");
+                log::error!("website archive post query failed: {error}");
                 return StatusCode::INTERNAL_SERVER_ERROR.into_response();
             }
         },
@@ -1576,7 +1709,7 @@ async fn archive_page<S: StorageClient>(
     let sidebar = match sidebar_data_for_principal(&state.database, &principal).await {
         Ok(sidebar) => sidebar,
         Err(error) => {
-            eprintln!("website sidebar query failed: {error}");
+            log::error!("website sidebar query failed: {error}");
             return StatusCode::INTERNAL_SERVER_ERROR.into_response();
         }
     };
@@ -1601,7 +1734,7 @@ async fn api_full_post<S: StorageClient>(
         Ok(Some(post)) => Json(post).into_response(),
         Ok(None) => StatusCode::NOT_FOUND.into_response(),
         Err(error) => {
-            eprintln!("website post query failed: {error}");
+            log::error!("website post query failed: {error}");
             StatusCode::INTERNAL_SERVER_ERROR.into_response()
         }
     }
@@ -1618,7 +1751,7 @@ async fn post_page<S: StorageClient>(
             let sidebar = match sidebar_data_for_principal(&state.database, &principal).await {
                 Ok(sidebar) => sidebar,
                 Err(error) => {
-                    eprintln!("website sidebar query failed: {error}");
+                    log::error!("website sidebar query failed: {error}");
                     return StatusCode::INTERNAL_SERVER_ERROR.into_response();
                 }
             };
@@ -1643,7 +1776,7 @@ async fn post_page<S: StorageClient>(
         }
         Ok(None) => StatusCode::NOT_FOUND.into_response(),
         Err(error) => {
-            eprintln!("website post page query failed: {error}");
+            log::error!("website post page query failed: {error}");
             StatusCode::INTERNAL_SERVER_ERROR.into_response()
         }
     }
@@ -1664,14 +1797,14 @@ async fn edit_published_post_page<S: StorageClient>(
                     || post.author_username.eq_ignore_ascii_case(&principal.username)) => post,
         Ok(_) => return no_store(StatusCode::NOT_FOUND.into_response()),
         Err(error) => {
-            eprintln!("website published-post edit query failed: {error}");
+            log::error!("website published-post edit query failed: {error}");
             return no_store(StatusCode::INTERNAL_SERVER_ERROR.into_response());
         }
     };
     let sidebar = match sidebar_data_for_principal(&state.database, &principal).await {
         Ok(sidebar) => sidebar,
         Err(error) => {
-            eprintln!("website sidebar query failed: {error}");
+            log::error!("website sidebar query failed: {error}");
             return no_store(StatusCode::INTERNAL_SERVER_ERROR.into_response());
         }
     };
@@ -1697,7 +1830,7 @@ async fn post_fragment<S: StorageClient>(
         .into_response(),
         Ok(None) => StatusCode::NOT_FOUND.into_response(),
         Err(error) => {
-            eprintln!("website post fragment query failed: {error}");
+            log::error!("website post fragment query failed: {error}");
             StatusCode::INTERNAL_SERVER_ERROR.into_response()
         }
     }
@@ -2667,7 +2800,7 @@ async fn media<S: StorageClient>(
         Ok(Some(media)) => media,
         Ok(None) => return StatusCode::NOT_FOUND.into_response(),
         Err(error) => {
-            eprintln!("website media lookup failed: {error}");
+            log::error!("website media lookup failed: {error}");
             return StatusCode::INTERNAL_SERVER_ERROR.into_response();
         }
     };
@@ -2723,7 +2856,7 @@ async fn proxy_media<S: StorageClient>(
     let stored = match storage.get(&media.storage_key, range, head, thumbnail).await {
         Ok(stored) => stored,
         Err(error) => {
-            eprintln!("website storage request failed: {error}");
+            log::error!("website storage request failed: {error}");
             return StatusCode::BAD_GATEWAY.into_response();
         }
     };
@@ -2811,7 +2944,7 @@ mod tests {
     use rusqlite::Connection;
 
     use super::{
-        escape_html, feed, home, parse_cursor, render_full_post, router, state,
+        escape_html, feed, home, parse_cursor, render_full_post, router, safe_route_template, state,
         valid_return_target, AuthPrincipal, FeedQuery,
     };
     use crate::{
@@ -3872,6 +4005,15 @@ mod tests {
         assert!(html.contains("id=\"load-more\""));
 
         std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn share_routes_are_logged_as_templates_without_secrets() {
+        let secret = "sensitive-share-secret";
+        let path = format!("/share/link-id/{secret}");
+        let route = safe_route_template(&path);
+        assert_eq!(route, "/share/{share_link_id}/{secret}");
+        assert!(!route.contains(secret));
     }
 
     #[test]

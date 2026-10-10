@@ -5,6 +5,7 @@ members = [
     "apps/home",
     "apps/site",
     "apps/storage",
+    "crates/journey-logging",
     "crates/journey-websocket",
     "crates/journey-storage",
 ]
@@ -19,4 +20,5 @@ edition = "2024"
 bytes = "1"
 h2 = "0.4"
 http = "1"
+log = "0.4"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "io-util"] }
