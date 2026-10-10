@@ -380,10 +380,11 @@ if (publishDialog) {
   });
 }
 
-const draftForm = document.querySelector('#draft-form');
+const draftForm = document.querySelector('#draft-form, #published-text-form');
 const newPostEditorDialog = document.querySelector('#new-post-editor-dialog');
 
 if (draftForm) {
+  const publishedEdit = draftForm.id === 'published-text-form';
   const rootBlockList = document.querySelector('#draft-root-blocks');
   const titleInput = document.querySelector('#draft-title');
   const summaryInput = document.querySelector('#draft-summary');
@@ -421,6 +422,7 @@ if (draftForm) {
   }
 
   function updatePublishButton() {
+    if (publishedEdit) return;
     publishButton.hidden = !postId;
     publishButton.dataset.publishPost = postId ? String(postId) : '';
     const titleIsBlank = !titleInput.value.trim();
@@ -473,14 +475,16 @@ if (draftForm) {
     legend.textContent = 'Block';
     block.append(legend);
 
-    const actions = document.createElement('div');
-    actions.className = 'draft-block-actions';
-    actions.append(
-      makeActionButton('Move up', 'move-up'),
-      makeActionButton('Move down', 'move-down'),
-      makeActionButton('Remove block', 'remove', 'draft-remove-button'),
-    );
-    block.append(actions);
+    if (!publishedEdit) {
+      const actions = document.createElement('div');
+      actions.className = 'draft-block-actions';
+      actions.append(
+        makeActionButton('Move up', 'move-up'),
+        makeActionButton('Move down', 'move-down'),
+        makeActionButton('Remove block', 'remove', 'draft-remove-button'),
+      );
+      block.append(actions);
+    }
 
     const fields = document.createElement('div');
     fields.className = 'draft-block-fields';
@@ -491,20 +495,23 @@ if (draftForm) {
     const gallery = document.createElement('section');
     gallery.className = 'draft-gallery';
     const galleryHeading = document.createElement('h3');
-    galleryHeading.textContent = 'Gallery';
+    galleryHeading.textContent = publishedEdit ? 'Media text' : 'Gallery';
     const galleryList = document.createElement('div');
     galleryList.className = 'draft-gallery-list';
     galleryList.dataset.galleryList = '';
-    const fileInput = document.createElement('input');
-    fileInput.className = 'draft-file-input';
-    fileInput.type = 'file';
-    fileInput.multiple = true;
-    fileInput.accept = 'image/jpeg,image/png,image/webp,image/gif,image/heic,image/heif,video/mp4,video/quicktime,.jpg,.jpeg,.png,.webp,.gif,.heic,.heif,.mp4,.mov';
-    const addMedia = makeActionButton('Add media', 'select-media');
-    const dropHelp = document.createElement('p');
-    dropHelp.className = 'draft-drop-help';
-    dropHelp.textContent = 'Drop files here or choose several. Drag a thumbnail to move it between blocks.';
-    gallery.append(galleryHeading, galleryList, fileInput, addMedia, dropHelp);
+    gallery.append(galleryHeading, galleryList);
+    if (!publishedEdit) {
+      const fileInput = document.createElement('input');
+      fileInput.className = 'draft-file-input';
+      fileInput.type = 'file';
+      fileInput.multiple = true;
+      fileInput.accept = 'image/jpeg,image/png,image/webp,image/gif,image/heic,image/heif,video/mp4,video/quicktime,.jpg,.jpeg,.png,.webp,.gif,.heic,.heif,.mp4,.mov';
+      const addMedia = makeActionButton('Add media', 'select-media');
+      const dropHelp = document.createElement('p');
+      dropHelp.className = 'draft-drop-help';
+      dropHelp.textContent = 'Drop files here or choose several. Drag a thumbnail to move it between blocks.';
+      gallery.append(fileInput, addMedia, dropHelp);
+    }
     block.append(gallery);
 
     return block;
@@ -520,7 +527,7 @@ if (draftForm) {
     const item = document.createElement('article');
     item.className = 'draft-media-item';
     item.dataset.draftMedia = '';
-    item.draggable = !pendingFileName;
+    item.draggable = !pendingFileName && !publishedEdit;
     if (pendingFileName) item.dataset.uploadPending = '';
     if (media.id) item.dataset.blockId = String(media.id);
     if (media.storage_key) item.dataset.storageKey = media.storage_key;
@@ -593,12 +600,14 @@ if (draftForm) {
 
     const actions = document.createElement('div');
     actions.className = 'draft-media-actions';
-    actions.append(
-      makeMediaActionButton('Duplicate', 'duplicate-media'),
-      makeMediaActionButton('Remove media', 'remove-media', 'draft-remove-button'),
-    );
-    if (pendingFileName) {
-      actions.querySelectorAll('button').forEach(button => { button.disabled = true; });
+    if (!publishedEdit) {
+      actions.append(
+        makeMediaActionButton('Duplicate', 'duplicate-media'),
+        makeMediaActionButton('Remove media', 'remove-media', 'draft-remove-button'),
+      );
+      if (pendingFileName) {
+        actions.querySelectorAll('button').forEach(button => { button.disabled = true; });
+      }
     }
     if (postId && media.id) {
       const download = document.createElement('a');
@@ -616,9 +625,10 @@ if (draftForm) {
       const blocks = Array.from(list.children).filter(child => child.matches('[data-draft-block]'));
       blocks.forEach((block, index) => {
         const legend = block.querySelector(':scope > legend');
-        const actions = block.querySelector(':scope > .draft-block-actions');
         const label = `Block ${index + 1}`;
         legend.textContent = label;
+        if (publishedEdit) return;
+        const actions = block.querySelector(':scope > .draft-block-actions');
         const moveUp = actions.querySelector('[data-block-action="move-up"]');
         const moveDown = actions.querySelector('[data-block-action="move-down"]');
         moveUp.disabled = index === 0;
@@ -669,9 +679,23 @@ if (draftForm) {
 
   function snapshotEditor() {
     const rootNodes = Array.from(rootBlockList.children).filter(block => block.matches('[data-draft-block]'));
-    const blocks = rootNodes.map(serializeBlock);
     const mediaNodes = rootNodes.map(root => Array.from(root.querySelector('[data-gallery-list]').children)
       .filter(child => child.matches('[data-draft-media]') && !child.hasAttribute('data-upload-pending')));
+    const blocks = publishedEdit
+      ? rootNodes.flatMap((root, index) => [
+        {
+          id: blockId(root),
+          header: blockFieldValue(root, 'header'),
+          body: blockFieldValue(root, 'body'),
+        },
+        ...mediaNodes[index].map(item => ({
+          id: blockId(item),
+          header: blockFieldValue(item, 'header'),
+          body: blockFieldValue(item, 'body'),
+          alt: blockFieldValue(item, 'alt'),
+        })),
+      ])
+      : rootNodes.map(serializeBlock);
     return {
       version: editVersion,
       rootNodes,
@@ -732,11 +756,13 @@ if (draftForm) {
     clearDraftError();
     const snapshot = snapshotEditor();
     const payload = { ...snapshot.payload };
-    const url = postId ? `/api/posts/${encodeURIComponent(postId)}` : '/api/posts';
+    const url = publishedEdit
+      ? `/api/posts/${encodeURIComponent(postId)}/text`
+      : postId ? `/api/posts/${encodeURIComponent(postId)}` : '/api/posts';
     const method = postId ? 'PUT' : 'POST';
     if (postId) payload.revision = revision;
     submitButton.disabled = true;
-    submitButton.textContent = 'Saving…';
+    submitButton.textContent = publishedEdit ? 'Saving changes…' : 'Saving…';
     draftForm.setAttribute('aria-busy', 'true');
     updateStatus('Saving…');
     try {
@@ -746,13 +772,27 @@ if (draftForm) {
         body: JSON.stringify(payload),
       });
       if (response.status === 409) {
-        throw new Error('This draft changed in another session. Reload the page before saving again.');
+        throw new Error(publishedEdit
+          ? 'This published post changed in another session. Reload the page before saving again.'
+          : 'This draft changed in another session. Reload the page before saving again.');
       }
       if (!response.ok) {
         if (response.status === 401) throw new Error('Your session is no longer active. Sign in again before retrying.');
-        if (response.status === 403) throw new Error('This account is not allowed to edit this draft.');
-        if (response.status === 404) throw new Error('This draft is no longer available.');
-        throw new Error('Could not save the draft. Your entries are still here; please try again.');
+        if (response.status === 403) throw new Error(publishedEdit
+          ? 'This account is not allowed to edit this post.'
+          : 'This account is not allowed to edit this draft.');
+        if (response.status === 404) throw new Error(publishedEdit
+          ? 'This published post is no longer available to edit.'
+          : 'This draft is no longer available.');
+        if (publishedEdit && response.status === 400) {
+          const returnedError = (await response.text()).trim();
+          throw new Error(returnedError.includes('title')
+            ? 'Add a title before saving changes.'
+            : 'The post text or block list is invalid. Your entries are still here; please retry.');
+        }
+        throw new Error(publishedEdit
+          ? 'Could not save the changes. Your entries are still here; please try again.'
+          : 'Could not save the draft. Your entries are still here; please try again.');
       }
       const saved = await response.json();
       if (!saved || !Number.isInteger(saved.id) || !Number.isInteger(saved.revision)) {
@@ -762,6 +802,12 @@ if (draftForm) {
       postId = saved.id;
       revision = saved.revision;
       draftForm.dataset.draftPostId = String(postId);
+      if (publishedEdit) {
+        dirty = false;
+        updateStatus('Changes saved. Returning to the post…');
+        window.location.assign(`/posts/${encodeURIComponent(postId)}`);
+        return true;
+      }
       if (wasNew && (!newPostEditorDialog || newPostEditorDialog.open)) {
         window.history.replaceState(window.history.state, '', `/posts/${encodeURIComponent(postId)}`);
       }
@@ -782,12 +828,13 @@ if (draftForm) {
       throw error;
     } finally {
       submitButton.disabled = false;
-      submitButton.textContent = 'Save draft';
+      submitButton.textContent = publishedEdit ? 'Save changes' : 'Save draft';
       draftForm.removeAttribute('aria-busy');
     }
   }
 
   function scheduleSave() {
+    if (publishedEdit) return;
     if (saveTimer) window.clearTimeout(saveTimer);
     saveTimer = window.setTimeout(() => {
       saveTimer = null;
@@ -989,13 +1036,17 @@ if (draftForm) {
       updateStatus('Not saved yet.');
       return;
     }
-    updateStatus('Loading draft…');
+    updateStatus(publishedEdit ? 'Loading post…' : 'Loading draft…');
     rootBlockList.setAttribute('aria-busy', 'true');
     const controls = Array.from(draftForm.querySelectorAll('input, textarea, button'));
     controls.forEach(control => { control.disabled = true; });
     try {
       const response = await fetch(`/api/posts/${encodeURIComponent(postId)}`);
-      if (!response.ok) throw new Error('Could not load this draft. Reload the page or check your access.');
+      if (!response.ok) {
+        throw new Error(publishedEdit
+          ? 'Could not load this published post. Reload the page or check your access.'
+          : 'Could not load this draft. Reload the page or check your access.');
+      }
       const post = await response.json();
       revision = post.revision;
       titleInput.value = post.title || '';
@@ -1010,8 +1061,10 @@ if (draftForm) {
       updatePublishButton();
       updateStatus('All changes saved');
     } catch (error) {
-      showDraftError(error instanceof Error ? error.message : 'Could not load this draft.');
-      updateStatus('Draft could not be loaded');
+      showDraftError(error instanceof Error
+        ? error.message
+        : publishedEdit ? 'Could not load this published post.' : 'Could not load this draft.');
+      updateStatus(publishedEdit ? 'Post could not be loaded' : 'Draft could not be loaded');
     } finally {
       controls.forEach(control => { control.disabled = false; });
       rootBlockList.removeAttribute('aria-busy');
@@ -1093,6 +1146,7 @@ if (draftForm) {
   });
 
   draftForm.addEventListener('change', event => {
+    if (publishedEdit) return;
     if (!(event.target instanceof HTMLInputElement) || event.target.type !== 'file') return;
     const root = event.target.closest('[data-draft-block]');
     const files = Array.from(event.target.files || []);
@@ -1111,12 +1165,14 @@ if (draftForm) {
   rootBlockList.addEventListener('dragend', () => { draggedMedia = null; });
 
   rootBlockList.addEventListener('dragover', event => {
+    if (publishedEdit) return;
     const list = event.target instanceof Element ? event.target.closest('[data-gallery-list]') : null;
     if (!list) return;
     if (event.dataTransfer.files.length > 0 || draggedMedia) event.preventDefault();
   });
 
   rootBlockList.addEventListener('drop', event => {
+    if (publishedEdit) return;
     const list = event.target instanceof Element ? event.target.closest('[data-gallery-list]') : null;
     if (!list) return;
     if (event.dataTransfer.files.length > 0) {
@@ -1141,11 +1197,13 @@ if (draftForm) {
     queueOperation(() => saveDraftNow(true)).catch(() => {});
   });
 
-  window.journeySaveDraft = () => {
-    if (saveTimer) window.clearTimeout(saveTimer);
-    saveTimer = null;
-    return queueOperation(() => saveDraftNow());
-  };
+  if (!publishedEdit) {
+    window.journeySaveDraft = () => {
+      if (saveTimer) window.clearTimeout(saveTimer);
+      saveTimer = null;
+      return queueOperation(() => saveDraftNow());
+    };
+  }
 
   const newPostLink = document.querySelector('.new-post-float');
   const mobileNewPostLayout = window.matchMedia(

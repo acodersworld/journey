@@ -329,6 +329,24 @@ pub enum SaveDraftResult {
 }
 
 #[derive(Clone, Debug)]
+pub enum SavePublishedTextResult {
+    Saved(Post),
+    NotFound,
+    Conflict,
+    Unpublished,
+    MissingTitle,
+    InvalidBlocks,
+}
+
+#[derive(Clone, Debug)]
+pub struct PublishedTextBlock {
+    pub id: i64,
+    pub header: Option<String>,
+    pub body: Option<String>,
+    pub alt: Option<String>,
+}
+
+#[derive(Clone, Debug)]
 pub struct ShareLinkCreated {
     pub id: String,
     pub expires_at_unix: i64,
@@ -654,6 +672,95 @@ impl Database {
                 .ok_or(rusqlite::Error::QueryReturnedNoRows)?;
             transaction.commit()?;
             Ok(SaveDraftResult::Saved(saved_post))
+        }).await
+    }
+
+    pub async fn save_published_text(
+        &self,
+        id: i64,
+        author_username: String,
+        is_admin: bool,
+        expected_revision: i64,
+        title: String,
+        summary: String,
+        tags: Vec<String>,
+        blocks: Vec<PublishedTextBlock>,
+    ) -> Result<SavePublishedTextResult, String> {
+        self.initialize().await?;
+        let tags = serde_json::to_string(&tags).map_err(|error| error.to_string())?;
+        self.run(move |connection| {
+            let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let post = transaction.query_row(
+                "SELECT p.revision, p.published, u.username FROM posts AS p \
+                 JOIN users AS u ON u.id = p.author_id WHERE p.id = ?1",
+                [id],
+                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, bool>(1)?, row.get::<_, String>(2)?)),
+            ).optional()?;
+            let Some((revision, published, owner)) = post else {
+                return Ok(SavePublishedTextResult::NotFound);
+            };
+            if !is_admin && !owner.eq_ignore_ascii_case(&author_username) {
+                return Ok(SavePublishedTextResult::NotFound);
+            }
+            if !published {
+                return Ok(SavePublishedTextResult::Unpublished);
+            }
+            if revision != expected_revision {
+                return Ok(SavePublishedTextResult::Conflict);
+            }
+            if title.trim().is_empty() {
+                return Ok(SavePublishedTextResult::MissingTitle);
+            }
+
+            let existing_parent_by_id = {
+                let mut statement = transaction.prepare(
+                    "SELECT id, parent_id FROM post_blocks WHERE post_id = ?1",
+                )?;
+                let rows = statement.query_map([id], |row| {
+                    Ok((row.get::<_, i64>(0)?, row.get::<_, Option<i64>>(1)?))
+                })?;
+                rows.collect::<rusqlite::Result<HashMap<_, _>>>()?
+            };
+            let existing_ids = existing_parent_by_id.keys().copied().collect::<std::collections::HashSet<_>>();
+            let mut requested_ids = std::collections::HashSet::new();
+            if blocks.len() != existing_ids.len()
+                || blocks.iter().any(|block| !requested_ids.insert(block.id))
+                || blocks.iter().any(|block| {
+                    existing_parent_by_id
+                        .get(&block.id)
+                        .is_some_and(|parent_id| parent_id.is_none() && block.alt.is_some())
+                })
+                || requested_ids != existing_ids
+            {
+                return Ok(SavePublishedTextResult::InvalidBlocks);
+            }
+
+            let next_revision = revision.checked_add(1)
+                .ok_or(rusqlite::Error::IntegralValueOutOfRange(0, revision))?;
+            transaction.execute(
+                "UPDATE posts SET title = ?2, summary = ?3, tags = ?4, revision = ?5 WHERE id = ?1",
+                params![id, title, summary, tags, next_revision],
+            )?;
+            {
+                let mut update_root = transaction.prepare(
+                    "UPDATE post_blocks SET header = ?2, body = ?3 WHERE id = ?1 AND post_id = ?4",
+                )?;
+                let mut update_media_text = transaction.prepare(
+                    "UPDATE post_blocks SET header = ?2, body = ?3, alt_text = ?4 \
+                     WHERE id = ?1 AND post_id = ?5",
+                )?;
+                for block in blocks {
+                    if existing_parent_by_id.get(&block.id).is_some_and(Option::is_some) {
+                        update_media_text.execute(params![block.id, block.header, block.body, block.alt, id])?;
+                    } else {
+                        update_root.execute(params![block.id, block.header, block.body, id])?;
+                    }
+                }
+            }
+            let saved_post = load_post(&transaction, id, PostAccess::Admin)?
+                .ok_or(rusqlite::Error::QueryReturnedNoRows)?;
+            transaction.commit()?;
+            Ok(SavePublishedTextResult::Saved(saved_post))
         }).await
     }
 

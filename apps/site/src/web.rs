@@ -4,7 +4,7 @@ use axum::{
     http::{header, HeaderMap, HeaderValue, Method, StatusCode, Uri},
     middleware::{self, Next},
     response::{Html, IntoResponse, Response},
-    routing::{delete, get, post},
+    routing::{delete, get, post, put},
     Json, Router,
 };
 use futures_util::StreamExt;
@@ -17,7 +17,7 @@ use std::{
 
 use crate::{
     auth,
-    db::{AccountRole, AuthenticatedAccount, Database, FeedCursor, MediaReference, NewBlock, Post, PostAccess, SaveDraftResult, ShareAccess, SidebarData},
+    db::{AccountRole, AuthenticatedAccount, Database, FeedCursor, MediaReference, NewBlock, Post, PostAccess, PublishedTextBlock, SaveDraftResult, SavePublishedTextResult, ShareAccess, SidebarData},
     storage::{StorageBody, StorageClient, UPLOAD_LIMIT_ERROR},
 };
 
@@ -152,6 +152,31 @@ struct SaveDraftRequest {
     blocks: Vec<CreateDraftBlock>,
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SavePublishedTextRequest {
+    revision: i64,
+    title: String,
+    #[serde(default)]
+    summary: String,
+    #[serde(default)]
+    tags: Vec<String>,
+    #[serde(default)]
+    blocks: Vec<SavePublishedTextBlock>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SavePublishedTextBlock {
+    id: i64,
+    #[serde(default)]
+    header: Option<String>,
+    #[serde(default)]
+    body: Option<String>,
+    #[serde(default)]
+    alt: Option<String>,
+}
+
 #[derive(Serialize)]
 struct UploadedMediaResponse {
     storage_key: String,
@@ -237,10 +262,12 @@ pub fn router<S: StorageClient>(state: AppState<S>) -> Router {
         .route("/api/posts", get(feed::<S>).post(create_draft::<S>))
         .route("/api/drafts", get(drafts::<S>))
         .route("/api/posts/{id}", get(api_full_post::<S>).put(save_draft::<S>))
+        .route("/api/posts/{id}/text", put(save_published_text::<S>))
         .route("/api/posts/{id}/publish", post(publish_post::<S>))
         .route("/api/posts/{id}/share-links", post(create_share_link::<S>))
         .route("/api/share-links/{id}", delete(revoke_share_link::<S>))
         .route("/posts/{id}/fragment", get(post_fragment::<S>))
+        .route("/posts/{id}/edit", get(edit_published_post_page::<S>))
         .route("/posts/{id}/share-preview", get(share_preview::<S>))
         .route("/posts/{id}", get(post_page::<S>))
         .route(
@@ -1013,6 +1040,7 @@ fn is_content_page_path(path: &str) -> bool {
             .strip_prefix("/archive/")
             .is_some_and(|month| valid_archive_month(month, "UTC"))
         || path.strip_prefix("/posts/").is_some_and(|id| {
+            let id = id.strip_suffix("/edit").unwrap_or(id);
             id.bytes().all(|byte| byte.is_ascii_digit())
                 && id.parse::<i64>().is_ok_and(|parsed_id| {
                     parsed_id > 0 && parsed_id.to_string() == id
@@ -1245,6 +1273,51 @@ async fn save_draft<S: StorageClient>(
                 return no_store((StatusCode::BAD_REQUEST, "invalid draft block tree or media reference\n").into_response());
             }
             eprintln!("website draft save failed: {error}");
+            no_store(StatusCode::INTERNAL_SERVER_ERROR.into_response())
+        }
+    }
+}
+
+async fn save_published_text<S: StorageClient>(
+    State(state): State<AppState<S>>,
+    Path(id): Path<i64>,
+    Extension(principal): Extension<AuthPrincipal>,
+    headers: HeaderMap,
+    Json(request): Json<SavePublishedTextRequest>,
+) -> Response {
+    if !matches!(principal.role, AccountRole::Write | AccountRole::Admin) {
+        return no_store(StatusCode::FORBIDDEN.into_response());
+    }
+    if !origin_allowed(&headers, &state.security) {
+        return no_store((StatusCode::FORBIDDEN, "origin not allowed\n").into_response());
+    }
+    if request.revision < 1 || request.blocks.iter().any(|block| block.id < 1) {
+        return no_store((StatusCode::BAD_REQUEST, "invalid published post revision or block IDs\n").into_response());
+    }
+    let blocks = request.blocks.into_iter().map(|block| PublishedTextBlock {
+        id: block.id,
+        header: block.header,
+        body: block.body,
+        alt: block.alt,
+    }).collect();
+    match state.database.save_published_text(
+        id,
+        principal.username,
+        principal.role == AccountRole::Admin,
+        request.revision,
+        request.title,
+        request.summary,
+        request.tags,
+        blocks,
+    ).await {
+        Ok(SavePublishedTextResult::Saved(post)) => no_store(Json(post).into_response()),
+        Ok(SavePublishedTextResult::NotFound) => no_store(StatusCode::NOT_FOUND.into_response()),
+        Ok(SavePublishedTextResult::Conflict) => no_store((StatusCode::CONFLICT, "published post revision conflict; reload before saving again\n").into_response()),
+        Ok(SavePublishedTextResult::Unpublished) => no_store((StatusCode::CONFLICT, "draft text must be edited in the draft editor\n").into_response()),
+        Ok(SavePublishedTextResult::MissingTitle) => no_store((StatusCode::BAD_REQUEST, "a published post needs a nonblank title\n").into_response()),
+        Ok(SavePublishedTextResult::InvalidBlocks) => no_store((StatusCode::BAD_REQUEST, "published text must include each existing block ID exactly once\n").into_response()),
+        Err(error) => {
+            eprintln!("website published-post text save failed: {error}");
             no_store(StatusCode::INTERNAL_SERVER_ERROR.into_response())
         }
     }
@@ -1576,6 +1649,40 @@ async fn post_page<S: StorageClient>(
     }
 }
 
+async fn edit_published_post_page<S: StorageClient>(
+    State(state): State<AppState<S>>,
+    Path(id): Path<i64>,
+    Extension(principal): Extension<AuthPrincipal>,
+) -> Response {
+    if !matches!(principal.role, AccountRole::Write | AccountRole::Admin) {
+        return no_store(StatusCode::FORBIDDEN.into_response());
+    }
+    let post = match state.database.post_with_access(id, principal.post_access()).await {
+        Ok(Some(post))
+            if post.published
+                && (principal.role == AccountRole::Admin
+                    || post.author_username.eq_ignore_ascii_case(&principal.username)) => post,
+        Ok(_) => return no_store(StatusCode::NOT_FOUND.into_response()),
+        Err(error) => {
+            eprintln!("website published-post edit query failed: {error}");
+            return no_store(StatusCode::INTERNAL_SERVER_ERROR.into_response());
+        }
+    };
+    let sidebar = match sidebar_data_for_principal(&state.database, &principal).await {
+        Ok(sidebar) => sidebar,
+        Err(error) => {
+            eprintln!("website sidebar query failed: {error}");
+            return no_store(StatusCode::INTERNAL_SERVER_ERROR.into_response());
+        }
+    };
+    Html(render_published_text_editor(
+        &sidebar,
+        &post,
+        &principal.username,
+        principal.role,
+    )).into_response()
+}
+
 async fn post_fragment<S: StorageClient>(
     State(state): State<AppState<S>>,
     Path(id): Path<i64>,
@@ -1760,6 +1867,24 @@ fn render_draft_editor_page(
     render_draft_editor(sidebar, Some(post), username, role, created)
 }
 
+fn render_published_text_editor(
+    sidebar: &SidebarData,
+    post: &Post,
+    username: &str,
+    role: AccountRole,
+) -> String {
+    let content = render_draft_editor_content(Some(post), false, false, true);
+    render_site_page(
+        "Edit published post",
+        sidebar,
+        &content,
+        false,
+        username,
+        role,
+        false,
+    )
+}
+
 fn render_draft_editor(
     sidebar: &SidebarData,
     post: Option<&Post>,
@@ -1767,7 +1892,7 @@ fn render_draft_editor(
     role: AccountRole,
     created: bool,
 ) -> String {
-    let content = render_draft_editor_content(post, created, false);
+    let content = render_draft_editor_content(post, created, false, false);
     render_site_page(
         if post.is_some() { "Edit draft" } else { "New draft" },
         sidebar,
@@ -1779,18 +1904,26 @@ fn render_draft_editor(
     )
 }
 
-fn render_draft_editor_content(post: Option<&Post>, created: bool, overlay: bool) -> String {
+fn render_draft_editor_content(post: Option<&Post>, created: bool, overlay: bool, published_edit: bool) -> String {
     let post_id = post.map(|post| post.summary.id.to_string()).unwrap_or_default();
-    let heading = if post.is_some() { "Edit draft" } else { "New draft" };
+    let heading = if published_edit {
+        "Edit published post"
+    } else if post.is_some() {
+        "Edit draft"
+    } else {
+        "New draft"
+    };
     let confirmation = if created {
         "<p class=\"creation-confirmation\" data-created-confirmation role=\"status\">Draft created. Continue editing it here.</p>"
     } else {
         ""
     };
     let back_link = if overlay {
-        ""
+        String::new()
+    } else if published_edit {
+        format!("<p class=\"back-link\"><a href=\"/posts/{post_id}\">Cancel editing</a></p>")
     } else {
-        "<p class=\"back-link\"><a href=\"/\">All posts</a></p>"
+        "<p class=\"back-link\"><a href=\"/\">All posts</a></p>".to_owned()
     };
     let main_class = if overlay {
         "site site-new-post new-post-editor-content"
@@ -1801,25 +1934,42 @@ fn render_draft_editor_content(post: Option<&Post>, created: bool, overlay: bool
         "<main class=\"{main_class}\"><header class=\"new-post-heading\">{back_link}<h1 id=\"new-post-editor-heading\" data-editor-heading>{}</h1></header>{confirmation}",
         escape_html(heading),
     );
-    content.push_str("<form class=\"draft-form\" id=\"draft-form\" data-draft-post-id=\"");
+    content.push_str(if published_edit {
+        "<form class=\"draft-form published-text-form\" id=\"published-text-form\" data-draft-post-id=\""
+    } else {
+        "<form class=\"draft-form\" id=\"draft-form\" data-draft-post-id=\""
+    });
     content.push_str(&escape_html(&post_id));
-    content.push_str(concat!(
-        "\" novalidate>",
-        "<div class=\"draft-field\"><label for=\"draft-title\">Title <span class=\"draft-optional\">Required before publishing</span></label><input id=\"draft-title\" name=\"title\" type=\"text\" autocomplete=\"off\" aria-describedby=\"draft-title-help\"><p class=\"draft-field-help\" id=\"draft-title-help\">You can save an untitled draft and add a title later.</p></div>",
-        "<div class=\"draft-field\"><label for=\"draft-summary\">Summary <span class=\"draft-optional\">Optional</span></label><textarea id=\"draft-summary\" name=\"summary\" rows=\"4\"></textarea></div>",
-        "<div class=\"draft-field\"><label for=\"draft-tags\">Tags <span class=\"draft-optional\">Optional</span></label><input id=\"draft-tags\" name=\"tags\" type=\"text\" autocomplete=\"off\" aria-describedby=\"draft-tags-help\"><p class=\"draft-field-help\" id=\"draft-tags-help\">Separate tags with commas.</p></div>",
-        "<section class=\"draft-block-editor\" aria-labelledby=\"draft-blocks-heading\"><div class=\"draft-block-heading\"><div><h2 id=\"draft-blocks-heading\">Blocks</h2><p>Each block has its own text and an optional ordered media gallery.</p></div></div><div class=\"draft-root-blocks\" id=\"draft-root-blocks\" data-block-list=\"root\"></div><div class=\"draft-block-add-area\"><button class=\"draft-secondary-button\" type=\"button\" data-block-action=\"add-root\">Add block</button></div></section>",
-        "<p class=\"draft-form-error\" id=\"draft-form-error\" role=\"alert\" hidden></p>",
-        "<div class=\"draft-submit-area\"><p id=\"draft-status\" role=\"status\" aria-live=\"polite\">Not saved yet.</p><div class=\"draft-submit-actions\"><div class=\"draft-action-group\"><button class=\"draft-submit-button\" id=\"draft-submit\" type=\"submit\">Save draft</button><div class=\"draft-publish-control\"><button class=\"post-publish-button\" id=\"draft-publish\" type=\"button\" data-publish-post=\"\" aria-describedby=\"draft-publish-help\" hidden>Publish</button><p class=\"draft-publish-help\" id=\"draft-publish-help\" hidden>Add a title before publishing.</p></div></div></div></div>",
-        "</form></main>",
-    ));
+    content.push_str("\" novalidate>");
+    if published_edit {
+        content.push_str(concat!(
+            "<div class=\"draft-field\"><label for=\"draft-title\">Title <span class=\"draft-optional\">Required</span></label><input id=\"draft-title\" name=\"title\" type=\"text\" autocomplete=\"off\" aria-describedby=\"draft-title-help\"><p class=\"draft-field-help\" id=\"draft-title-help\">A published post must have a title.</p></div>",
+            "<div class=\"draft-field\"><label for=\"draft-summary\">Summary <span class=\"draft-optional\">Optional</span></label><textarea id=\"draft-summary\" name=\"summary\" rows=\"4\"></textarea></div>",
+            "<div class=\"draft-field\"><label for=\"draft-tags\">Tags <span class=\"draft-optional\">Optional</span></label><input id=\"draft-tags\" name=\"tags\" type=\"text\" autocomplete=\"off\" aria-describedby=\"draft-tags-help\"><p class=\"draft-field-help\" id=\"draft-tags-help\">Separate tags with commas.</p></div>",
+            "<section class=\"draft-block-editor\" aria-labelledby=\"draft-blocks-heading\"><div class=\"draft-block-heading\"><div><h2 id=\"draft-blocks-heading\">Blocks and media text</h2><p>Edit headings, body text, captions, labels, and alt text. Media and block order stay as published.</p></div></div><div class=\"draft-root-blocks\" id=\"draft-root-blocks\" data-block-list=\"root\"></div></section>",
+            "<p class=\"draft-form-error\" id=\"draft-form-error\" role=\"alert\" hidden></p>",
+        ));
+        content.push_str(&format!(
+            "<div class=\"draft-submit-area\"><p id=\"draft-status\" role=\"status\" aria-live=\"polite\">Loading post…</p><div class=\"draft-submit-actions\"><div class=\"draft-action-group\"><a class=\"draft-cancel-button\" href=\"/posts/{post_id}\">Cancel</a><button class=\"draft-submit-button\" id=\"draft-submit\" type=\"submit\">Save changes</button></div></div></div></form></main>"
+        ));
+    } else {
+        content.push_str(concat!(
+            "<div class=\"draft-field\"><label for=\"draft-title\">Title <span class=\"draft-optional\">Required before publishing</span></label><input id=\"draft-title\" name=\"title\" type=\"text\" autocomplete=\"off\" aria-describedby=\"draft-title-help\"><p class=\"draft-field-help\" id=\"draft-title-help\">You can save an untitled draft and add a title later.</p></div>",
+            "<div class=\"draft-field\"><label for=\"draft-summary\">Summary <span class=\"draft-optional\">Optional</span></label><textarea id=\"draft-summary\" name=\"summary\" rows=\"4\"></textarea></div>",
+            "<div class=\"draft-field\"><label for=\"draft-tags\">Tags <span class=\"draft-optional\">Optional</span></label><input id=\"draft-tags\" name=\"tags\" type=\"text\" autocomplete=\"off\" aria-describedby=\"draft-tags-help\"><p class=\"draft-field-help\" id=\"draft-tags-help\">Separate tags with commas.</p></div>",
+            "<section class=\"draft-block-editor\" aria-labelledby=\"draft-blocks-heading\"><div class=\"draft-block-heading\"><div><h2 id=\"draft-blocks-heading\">Blocks</h2><p>Each block has its own text and an optional ordered media gallery.</p></div></div><div class=\"draft-root-blocks\" id=\"draft-root-blocks\" data-block-list=\"root\"></div><div class=\"draft-block-add-area\"><button class=\"draft-secondary-button\" type=\"button\" data-block-action=\"add-root\">Add block</button></div></section>",
+            "<p class=\"draft-form-error\" id=\"draft-form-error\" role=\"alert\" hidden></p>",
+            "<div class=\"draft-submit-area\"><p id=\"draft-status\" role=\"status\" aria-live=\"polite\">Not saved yet.</p><div class=\"draft-submit-actions\"><div class=\"draft-action-group\"><button class=\"draft-submit-button\" id=\"draft-submit\" type=\"submit\">Save draft</button><div class=\"draft-publish-control\"><button class=\"post-publish-button\" id=\"draft-publish\" type=\"button\" data-publish-post=\"\" aria-describedby=\"draft-publish-help\" hidden>Publish</button><p class=\"draft-publish-help\" id=\"draft-publish-help\" hidden>Add a title before publishing.</p></div></div></div></div>",
+            "</form></main>",
+        ));
+    }
     content
 }
 
 fn render_new_post_overlay() -> String {
     format!(
         "<dialog id=\"new-post-editor-dialog\" class=\"new-post-editor-dialog\" aria-labelledby=\"new-post-editor-heading\"><button class=\"new-post-editor-close\" type=\"button\" aria-label=\"Close new post editor\">×</button>{}<input class=\"new-post-photo-input\" id=\"new-post-overlay-photo-input\" type=\"file\" accept=\"image/jpeg,image/png,image/webp,image/gif,image/heic,image/heif,.jpg,.jpeg,.png,.webp,.gif,.heic,.heif\" multiple></dialog>",
-        render_draft_editor_content(None, false, true),
+        render_draft_editor_content(None, false, true, false),
     )
 }
 
@@ -2044,6 +2194,14 @@ fn render_post_with_media_prefix(
     } else {
         String::new()
     };
+    let edit_control = if can_manage_shares && post.published {
+        format!(
+            "<a class=\"post-edit-button\" href=\"/posts/{}/edit\">Edit</a>",
+            post.summary.id,
+        )
+    } else {
+        String::new()
+    };
     let published_at = render_time_element(post.summary.published_at.as_ref());
     let byline = if published_at.is_empty() {
         format!(
@@ -2057,10 +2215,11 @@ fn render_post_with_media_prefix(
         )
     };
     format!(
-        "<article class=\"post\" data-post-id=\"{}\"><header class=\"post-header\"><h1>{}</h1><div class=\"post-date-row\">{}{}</div><p class=\"summary\">{}</p></header>{}{}</article>",
+        "<article class=\"post\" data-post-id=\"{}\"><header class=\"post-header\"><h1>{}</h1><div class=\"post-date-row\">{}{}{}</div><p class=\"summary\">{}</p></header>{}{}</article>",
         post.summary.id,
         escape_html(&post.summary.title),
         byline,
+        edit_control,
         share_control,
         escape_html(&post.summary.summary),
         render_tags_html(&post.tags, media_prefix.is_some()),
@@ -2829,6 +2988,27 @@ mod tests {
         let draft_html = super::render_post(&post, true, false);
         assert!(draft_html.contains("<p class=\"post-byline\">By writer-one</p>"));
         assert!(!draft_html.contains("<time"));
+        let draft_save = request(
+            &app,
+            "PUT",
+            "/api/posts/2",
+            &writer_cookie,
+            Some(&serde_json::json!({
+                "revision": post.revision,
+                "title": "My draft",
+                "summary": "Short intro",
+                "tags": ["road", "field-notes"],
+                "blocks": [
+                    { "id": post.blocks[0].id, "header": "First updated", "body": "Child", "children": [] },
+                    { "id": post.blocks[1].id, "body": "Second", "children": [] },
+                ],
+            }).to_string()),
+        ).await;
+        assert_eq!(draft_save.status(), StatusCode::OK);
+        let body = to_bytes(draft_save.into_body(), usize::MAX).await.unwrap();
+        let saved_draft: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(saved_draft["revision"], post.revision + 1);
+        assert_eq!(saved_draft["blocks"][0]["header"], "First updated");
 
         let writer_creation_page = request(&app, "GET", "/posts/new", &writer_cookie, None).await;
         assert_eq!(writer_creation_page.status(), StatusCode::OK);
@@ -2973,9 +3153,23 @@ mod tests {
                 "INSERT INTO posts (author_id, title, published_at, summary, published, tags) \
                  VALUES ((SELECT id FROM users WHERE username = 'writer-one'), 'Writer published', 1767225600, '', 1, '[]'); \
                  INSERT INTO posts (author_id, title, published_at, summary, published, tags) \
-                 VALUES ((SELECT id FROM users WHERE username = 'writer-two'), 'Other published', 1767312000, '', 1, '[]');",
+                 VALUES ((SELECT id FROM users WHERE username = 'writer-two'), 'Other published', 1767312000, '', 1, '[]'); \
+                 INSERT INTO media_assets (storage_key, content_type, size_bytes) \
+                 VALUES ('published-image-key', 'image/jpeg', 42); \
+                 INSERT INTO post_blocks (post_id, parent_id, position, header, body) \
+                 VALUES (4, NULL, 0, 'Original heading', 'Original body'); \
+                 INSERT INTO post_blocks (post_id, parent_id, position, header, body, storage_key, alt_text) \
+                 VALUES (4, (SELECT id FROM post_blocks WHERE post_id = 4 AND parent_id IS NULL), 0, 'Original label', 'Original caption', 'published-image-key', 'Original alt');",
             )
             .unwrap();
+        drop(connection);
+        let connection = Connection::open(&path).unwrap();
+        let (root_block_id, media_block_id): (i64, i64) = connection.query_row(
+            "SELECT root.id, (SELECT child.id FROM post_blocks AS child WHERE child.post_id = 4 AND child.parent_id = root.id) \
+             FROM post_blocks AS root WHERE root.post_id = 4 AND root.parent_id IS NULL",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        ).unwrap();
         drop(connection);
         let writer_link = request(
             &app,
@@ -2989,6 +3183,232 @@ mod tests {
         let body = to_bytes(writer_link.into_body(), usize::MAX).await.unwrap();
         let writer_link: serde_json::Value = serde_json::from_slice(&body).unwrap();
         let writer_link_id = writer_link["id"].as_str().unwrap();
+        let writer_edit_page = request(&app, "GET", "/posts/4/edit", &writer_cookie, None).await;
+        assert_eq!(writer_edit_page.status(), StatusCode::OK);
+        let body = to_bytes(writer_edit_page.into_body(), usize::MAX).await.unwrap();
+        let writer_edit_html = String::from_utf8(body.to_vec()).unwrap();
+        assert!(writer_edit_html.contains("id=\"published-text-form\""));
+        assert!(writer_edit_html.contains("Save changes"));
+        assert!(writer_edit_html.contains("class=\"draft-cancel-button\""));
+        assert!(!writer_edit_html.contains("data-block-action="));
+        assert!(!writer_edit_html.contains("data-media-action="));
+        assert_eq!(
+            request(&app, "GET", "/posts/4/edit", &reader_cookie, None).await.status(),
+            StatusCode::FORBIDDEN,
+        );
+        assert_eq!(
+            request(&app, "GET", "/posts/5/edit", &writer_cookie, None).await.status(),
+            StatusCode::NOT_FOUND,
+        );
+        assert_eq!(
+            request(&app, "GET", "/posts/5/edit", &admin_cookie, None).await.status(),
+            StatusCode::OK,
+        );
+        let admin_text_update = request(
+            &app,
+            "PUT",
+            "/api/posts/5/text",
+            &admin_cookie,
+            Some(r#"{"revision":1,"title":"Other published","summary":"","tags":[],"blocks":[]}"#),
+        ).await;
+        assert_eq!(admin_text_update.status(), StatusCode::OK);
+        let owner_post_view = request(&app, "GET", "/posts/4", &writer_cookie, None).await;
+        let body = to_bytes(owner_post_view.into_body(), usize::MAX).await.unwrap();
+        assert!(String::from_utf8(body.to_vec()).unwrap().contains("href=\"/posts/4/edit\""));
+        assert_eq!(
+            request(
+                &app,
+                "PUT",
+                "/api/posts/4/text",
+                &reader_cookie,
+                Some(&serde_json::json!({
+                    "revision": 1,
+                    "title": "Reader edit",
+                    "blocks": [
+                        { "id": root_block_id },
+                        { "id": media_block_id },
+                    ],
+                }).to_string()),
+            ).await.status(),
+            StatusCode::FORBIDDEN,
+        );
+        assert_eq!(
+            request(
+                &app,
+                "PUT",
+                "/api/posts/5/text",
+                &writer_cookie,
+                Some(r#"{"revision":1,"title":"Other edit","blocks":[]}"#),
+            ).await.status(),
+            StatusCode::NOT_FOUND,
+        );
+        let bad_origin = app.clone().oneshot(
+            Request::builder()
+                .method("PUT")
+                .uri("/api/posts/4/text")
+                .header(header::COOKIE, &writer_cookie)
+                .header(header::ORIGIN, "https://untrusted.example")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(serde_json::json!({
+                    "revision": 1,
+                    "title": "Bad origin",
+                    "blocks": [],
+                }).to_string()))
+                .unwrap(),
+        ).await.unwrap();
+        assert_eq!(bad_origin.status(), StatusCode::FORBIDDEN);
+        let blank_title = request(
+            &app,
+            "PUT",
+            "/api/posts/4/text",
+            &writer_cookie,
+            Some(&serde_json::json!({
+                "revision": 1,
+                "title": "  ",
+                "summary": "Changed summary",
+                "tags": ["new"],
+                "blocks": [
+                    { "id": root_block_id },
+                    { "id": media_block_id },
+                ],
+            }).to_string()),
+        ).await;
+        assert_eq!(blank_title.status(), StatusCode::BAD_REQUEST);
+        let duplicate_ids = request(
+            &app,
+            "PUT",
+            "/api/posts/4/text",
+            &writer_cookie,
+            Some(&serde_json::json!({
+                "revision": 1,
+                "title": "Updated title",
+                "blocks": [
+                    { "id": root_block_id },
+                    { "id": root_block_id },
+                ],
+            }).to_string()),
+        ).await;
+        assert_eq!(duplicate_ids.status(), StatusCode::BAD_REQUEST);
+        let root_alt_text = request(
+            &app,
+            "PUT",
+            "/api/posts/4/text",
+            &writer_cookie,
+            Some(&serde_json::json!({
+                "revision": 1,
+                "title": "Updated title",
+                "blocks": [
+                    { "id": root_block_id, "alt": "not a media block" },
+                    { "id": media_block_id },
+                ],
+            }).to_string()),
+        ).await;
+        assert_eq!(root_alt_text.status(), StatusCode::BAD_REQUEST);
+        let invalid_id = request(
+            &app,
+            "PUT",
+            "/api/posts/4/text",
+            &writer_cookie,
+            Some(&serde_json::json!({
+                "revision": 1,
+                "title": "Updated title",
+                "blocks": [
+                    { "id": root_block_id },
+                    { "id": 999_999 },
+                ],
+            }).to_string()),
+        ).await;
+        assert_eq!(invalid_id.status(), StatusCode::BAD_REQUEST);
+        let post_before_text_edit = database
+            .post_with_access(4, PostAccess::Author("writer-one".to_owned()))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(post_before_text_edit.revision, 1);
+        assert_eq!(post_before_text_edit.summary.title, "Writer published");
+        assert_eq!(post_before_text_edit.summary.summary, "");
+        assert!(post_before_text_edit.tags.is_empty());
+        assert_eq!(post_before_text_edit.blocks[0].header.as_deref(), Some("Original heading"));
+        assert_eq!(post_before_text_edit.blocks[0].children[0].body.as_deref(), Some("Original caption"));
+        let text_update = request(
+            &app,
+            "PUT",
+            "/api/posts/4/text",
+            &writer_cookie,
+            Some(&serde_json::json!({
+                "revision": post_before_text_edit.revision,
+                "title": "Updated published text",
+                "summary": "Updated summary",
+                "tags": ["road", "corrected"],
+                "blocks": [
+                    { "id": media_block_id, "header": "Updated label", "body": "Updated caption", "alt": "Updated alt" },
+                    { "id": root_block_id, "header": "Updated heading", "body": "Updated body" },
+                ],
+            }).to_string()),
+        ).await;
+        assert_eq!(text_update.status(), StatusCode::OK);
+        let body = to_bytes(text_update.into_body(), usize::MAX).await.unwrap();
+        let updated_json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(updated_json["revision"], post_before_text_edit.revision + 1);
+        assert_eq!(updated_json["published_at"], 1767225600);
+        assert_eq!(updated_json["title"], "Updated published text");
+        let post_after_text_edit = database
+            .post_with_access(4, PostAccess::Author("writer-one".to_owned()))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(post_after_text_edit.author_username, post_before_text_edit.author_username);
+        assert_eq!(post_after_text_edit.summary.published_at, post_before_text_edit.summary.published_at);
+        assert_eq!(post_after_text_edit.blocks[0].id, root_block_id);
+        assert_eq!(post_after_text_edit.blocks[0].position, post_before_text_edit.blocks[0].position);
+        assert_eq!(post_after_text_edit.blocks[0].header.as_deref(), Some("Updated heading"));
+        assert_eq!(post_after_text_edit.blocks[0].children[0].id, media_block_id);
+        assert_eq!(post_after_text_edit.blocks[0].children[0].position, 0);
+        assert_eq!(post_after_text_edit.blocks[0].children[0].storage_key.as_deref(), Some("published-image-key"));
+        assert_eq!(post_after_text_edit.blocks[0].children[0].body.as_deref(), Some("Updated caption"));
+        assert_eq!(post_after_text_edit.blocks[0].children[0].alt.as_deref(), Some("Updated alt"));
+        let stale_revision = request(
+            &app,
+            "PUT",
+            "/api/posts/4/text",
+            &writer_cookie,
+            Some(&serde_json::json!({
+                "revision": post_before_text_edit.revision,
+                "title": "Stale update",
+                "blocks": [
+                    { "id": root_block_id },
+                    { "id": media_block_id },
+                ],
+            }).to_string()),
+        ).await;
+        assert_eq!(stale_revision.status(), StatusCode::CONFLICT);
+        let reader_post = request(&app, "GET", "/posts/4", &reader_cookie, None).await;
+        let body = to_bytes(reader_post.into_body(), usize::MAX).await.unwrap();
+        let reader_post_html = String::from_utf8(body.to_vec()).unwrap();
+        assert!(reader_post_html.contains("Updated published text"));
+        assert!(reader_post_html.contains("Updated heading"));
+        assert!(!reader_post_html.contains("post-edit-button"));
+        let secret = writer_link["url"].as_str().unwrap().rsplit('/').next().unwrap().to_owned();
+        let guest_token = auth::new_session_token();
+        database.issue_share_session(
+            writer_link_id.to_owned(),
+            auth::session_token_digest(&secret),
+            auth::session_token_digest(&guest_token),
+            super::unix_time(),
+        ).await.unwrap().unwrap();
+        let guest_post = request(
+            &app,
+            "GET",
+            &format!("/share/{writer_link_id}/posts/4"),
+            &format!("journey_share_{writer_link_id}={guest_token}"),
+            None,
+        ).await;
+        assert_eq!(guest_post.status(), StatusCode::OK);
+        let body = to_bytes(guest_post.into_body(), usize::MAX).await.unwrap();
+        let guest_post_html = String::from_utf8(body.to_vec()).unwrap();
+        assert!(guest_post_html.contains("Updated published text"));
+        assert!(guest_post_html.contains("Updated caption"));
+        assert!(!guest_post_html.contains("post-edit-button"));
         assert_eq!(
             request(
                 &app,
@@ -3588,6 +4008,7 @@ mod tests {
             Some("/archive/2026-09".to_owned())
         );
         assert_eq!(valid_return_target("/posts/42"), Some("/posts/42".to_owned()));
+        assert_eq!(valid_return_target("/posts/42/edit"), Some("/posts/42/edit".to_owned()));
         assert_eq!(valid_return_target("/posts/new"), Some("/posts/new".to_owned()));
         assert!(valid_return_target("https://example.com/").is_none());
         assert!(valid_return_target("//example.com/").is_none());

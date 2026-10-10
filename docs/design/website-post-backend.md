@@ -1,7 +1,7 @@
 # Website post backend
 
 **Status:** Implemented local backend and authenticated website UI
-**Updated:** 1 October 2026
+**Updated:** 10 October 2026
 
 ## Runtime data
 
@@ -106,6 +106,15 @@ revision returns `409`. `GET /api/drafts` lists draft summaries by descending
 post ID; writers see only their own, while admins see all. A read account
 receives `403`. Draft summaries serialize `published_at` as `null`.
 
+`PUT /api/posts/{id}/text` corrects a published post's title, summary, tags,
+and block text in one immediate transaction. The request includes the current
+revision and one flat entry for every existing block ID, with optional header,
+body, and alt text. The server rejects a stale revision, blank title, missing,
+unknown, or duplicate block IDs, and unauthorized authors. It updates no block
+order, media reference, author, or publication time, then increments the
+revision. The endpoint requires the same-origin check used by other write
+requests. It does not change the schema.
+
 `POST /posts/{post_id}/blocks/{block_id}/media` streams one original file from
 the browser through the website to storage, with backpressure and no full-file
 buffer. The route requires an editable draft root, checks the origin and
@@ -129,8 +138,15 @@ transaction. Success is `204 No Content`.
 
 `GET /posts/new` serves the empty editor to authenticated `write` and `admin`
 accounts. An existing editable draft opens the same editor prefilled with its
-saved tree; published posts remain read-only. Root blocks have optional header
-and body text and a media gallery. Authors can reorder roots, select or drop
+saved tree. `GET /posts/{id}/edit` serves a text-only editor for a published
+post to its `write` author or an `admin`; readers, other writers, and share-link
+guests cannot edit. The post page shows an Edit link only to its author and
+admins. Published edits use an explicit **Save changes** action and **Cancel**;
+they do not autosave, and a failed save leaves the entered text in the form.
+The editor includes post title, summary, tags, root block headings and bodies,
+and media labels, captions, and alt text. It hides block and media add, remove,
+reorder, duplicate, and upload controls. Root blocks have optional header and
+body text and a media gallery. Draft authors can reorder roots, select or drop
 multiple files in order, drag placements within or between galleries, duplicate
 a placement, and edit each placement's label, caption, and alt text. Save plus
 autosave send the entire tree with its revision. The editor serializes saves
@@ -283,7 +299,10 @@ published post. Guest share links remain limited to published posts. Feeds,
 tags, archives, and sidebar data remain published-only for every account.
 Draft edit and media upload operations require the author to have `write`
 permission or the account to have `admin`; author credit alone gives a `read`
-account no write permission. Published posts cannot be edited.
+account no write permission. Published text edits require the credited author
+to have `write` permission or the account to have `admin`. They preserve the
+published post's identity, media, structure, author, publication time, and
+share-link credentials.
 
 The website is live as of 9 October 2026. Future schema changes must be
 backwards compatible with the deployed schema or include a tested, versioned
