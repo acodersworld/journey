@@ -25,6 +25,8 @@ struct ControlRequest {
     manifest_path: Option<PathBuf>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     performance: Option<performance::Request>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    performance_urls: Option<bool>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -33,7 +35,15 @@ struct ControlResponse {
     result: Option<ImportResult>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     performance: Option<performance::Result>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    performance_urls: Option<PerformanceUrls>,
     error: Option<String>,
+}
+
+#[derive(Serialize, Deserialize)]
+pub struct PerformanceUrls {
+    pub site: String,
+    pub storage: String,
 }
 
 #[derive(Clone)]
@@ -42,6 +52,22 @@ pub struct PerformanceSettings {
     pub transport: String,
     pub initial_stream_window_size: u32,
     pub initial_connection_window_size: u32,
+    pub token: Option<String>,
+    pub origin: String,
+}
+
+impl PerformanceSettings {
+    fn urls(&self) -> Result<PerformanceUrls, &'static str> {
+        if !self.enabled {
+            return Err("performance diagnostics are disabled");
+        }
+        let token = self.token.as_deref().ok_or("performance diagnostics are disabled")?;
+        let origin = self.origin.trim_end_matches('/');
+        Ok(PerformanceUrls {
+            site: format!("{origin}/perftest/{token}/site"),
+            storage: format!("{origin}/perftest/{token}/storage"),
+        })
+    }
 }
 
 pub async fn bind(socket_path: &Path) -> AppResult<UnixListener> {
@@ -152,6 +178,7 @@ pub async fn request_import(manifest_path: &Path, socket_path: &Path) -> AppResu
     let request = serde_json::to_vec(&ControlRequest {
         manifest_path: Some(manifest_path.to_path_buf()),
         performance: None,
+        performance_urls: None,
     })?;
     stream.write_all(&request).await?;
     stream.write_all(b"\n").await?;
@@ -174,7 +201,7 @@ pub async fn request_performance(
 ) -> AppResult<performance::Result> {
     let mut stream = UnixStream::connect(socket_path).await?;
     stream.write_all(&serde_json::to_vec(&ControlRequest {
-        manifest_path: None, performance: Some(request),
+        manifest_path: None, performance: Some(request), performance_urls: None,
     })?).await?;
     stream.write_all(b"\n").await?;
     let mut line = String::new();
@@ -190,6 +217,25 @@ pub async fn request_performance(
     }
 }
 
+pub async fn request_performance_urls(socket_path: &Path) -> AppResult<PerformanceUrls> {
+    let mut stream = UnixStream::connect(socket_path).await?;
+    stream.write_all(&serde_json::to_vec(&ControlRequest {
+        manifest_path: None, performance: None, performance_urls: Some(true),
+    })?).await?;
+    stream.write_all(b"\n").await?;
+    let mut line = String::new();
+    BufReader::new(stream).read_line(&mut line).await?;
+    if line.is_empty() {
+        return Err("running site closed the control connection without a result".into());
+    }
+    let response: ControlResponse = serde_json::from_str(&line)?;
+    match (response.performance_urls, response.error) {
+        (Some(urls), None) => Ok(urls),
+        (None, Some(error)) => Err(error.into()),
+        _ => Err("running site returned an invalid performance URL response".into()),
+    }
+}
+
 async fn handle<S: StorageClient>(
     stream: UnixStream,
     database: &Database,
@@ -201,6 +247,13 @@ async fn handle<S: StorageClient>(
     reader.read_line(&mut request_line).await?;
     let result: AppResult<ControlResponse> = async {
         let request = serde_json::from_str::<ControlRequest>(&request_line)?;
+        if request.performance_urls == Some(true) {
+            if request.manifest_path.is_some() || request.performance.is_some() {
+                return Err("control request must select one command".into());
+            }
+            let urls = performance_settings.urls()?;
+            return Ok(ControlResponse { result: None, performance: None, performance_urls: Some(urls), error: None });
+        }
         if let Some(performance_request) = request.performance {
             if request.manifest_path.is_some() {
                 return Err("control request must select one command".into());
@@ -212,7 +265,7 @@ async fn handle<S: StorageClient>(
                 performance_settings.transport.clone(),
                 performance_settings.initial_stream_window_size,
                 performance_settings.initial_connection_window_size).await?;
-            return Ok(ControlResponse { result: None, performance: Some(result), error: None });
+            return Ok(ControlResponse { result: None, performance: Some(result), performance_urls: None, error: None });
         }
         let manifest_path = request.manifest_path.ok_or("control request is missing a command")?;
         if !manifest_path.is_absolute() {
@@ -220,12 +273,12 @@ async fn handle<S: StorageClient>(
         }
         let prepared = import::prepare_manifest(&manifest_path).await?;
         let result = import::apply_import(prepared, database, storage).await?;
-        Ok(ControlResponse { result: Some(result), performance: None, error: None })
+        Ok(ControlResponse { result: Some(result), performance: None, performance_urls: None, error: None })
     }
     .await;
     let response = match result {
         Ok(result) => result,
-        Err(error) => ControlResponse { result: None, performance: None, error: Some(error.to_string()) },
+        Err(error) => ControlResponse { result: None, performance: None, performance_urls: None, error: Some(error.to_string()) },
     };
     let mut stream = reader.into_inner();
     stream.write_all(&serde_json::to_vec(&response)?).await?;
@@ -256,7 +309,20 @@ mod tests {
         let request: ControlRequest = serde_json::from_str(r#"{"manifest_path":"/tmp/import.json"}"#).unwrap();
         assert_eq!(request.manifest_path.as_deref(), Some(Path::new("/tmp/import.json")));
         assert!(request.performance.is_none());
-        let request = ControlRequest { manifest_path: Some(PathBuf::from("/tmp/import.json")), performance: None };
+        let request = ControlRequest { manifest_path: Some(PathBuf::from("/tmp/import.json")), performance: None, performance_urls: None };
         assert_eq!(serde_json::to_string(&request).unwrap(), r#"{"manifest_path":"/tmp/import.json"}"#);
+    }
+
+    #[test]
+    fn capability_urls_require_enabled_diagnostics() {
+        let mut settings = PerformanceSettings {
+            enabled: false, transport: "websocket".to_owned(),
+            initial_stream_window_size: 1, initial_connection_window_size: 1,
+            token: None, origin: "https://example.test".to_owned(),
+        };
+        assert!(settings.urls().is_err());
+        settings.enabled = true;
+        settings.token = Some("random-token".to_owned());
+        assert_eq!(settings.urls().unwrap().site, "https://example.test/perftest/random-token/site");
     }
 }

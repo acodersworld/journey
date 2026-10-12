@@ -1,11 +1,12 @@
 use axum::{
     body::Body,
-    extract::{Extension, State},
+    extract::{Extension, Path, State},
     http::{header, HeaderMap, HeaderValue, Method, StatusCode, Uri},
     response::{IntoResponse, Response},
 };
 use futures_util::{stream, StreamExt};
 use journey_performance::{CHUNK_BYTES, DEFAULT_TRANSFER_BYTES};
+use subtle::ConstantTimeEq;
 
 use super::{AccountRole, AppState, AuthPrincipal, StorageClient};
 use crate::storage::StorageBody;
@@ -81,6 +82,19 @@ fn allowed<S: StorageClient>(state: &AppState<S>, principal: &AuthPrincipal) -> 
     Ok(())
 }
 
+fn capability_allowed<S: StorageClient>(state: &AppState<S>, token: &str) -> Result<(), Response> {
+    if state.performance.is_none() {
+        return Err(StatusCode::NOT_FOUND.into_response());
+    }
+    let Some(expected) = state.performance_token.as_deref() else {
+        return Err(StatusCode::NOT_FOUND.into_response());
+    };
+    if !bool::from(token.as_bytes().ct_eq(expected.as_bytes())) {
+        return Err(StatusCode::NOT_FOUND.into_response());
+    }
+    Ok(())
+}
+
 fn headers(bytes: u64) -> HeaderMap {
     let mut headers = HeaderMap::new();
     headers.insert(header::CONTENT_TYPE, HeaderValue::from_static("application/octet-stream"));
@@ -96,6 +110,20 @@ pub(super) async fn site<S: StorageClient>(
     uri: Uri,
 ) -> Response {
     if let Err(response) = allowed(&state, &principal) { return response; }
+    site_download(state, method, uri).await
+}
+
+pub(super) async fn site_capability<S: StorageClient>(
+    State(state): State<AppState<S>>,
+    Path(token): Path<String>,
+    method: Method,
+    uri: Uri,
+) -> Response {
+    if let Err(response) = capability_allowed(&state, &token) { return super::no_store(response); }
+    super::no_store(site_download(state, method, uri).await)
+}
+
+async fn site_download<S: StorageClient>(state: AppState<S>, method: Method, uri: Uri) -> Response {
     let bytes = match requested_bytes(&uri) { Ok(bytes) => bytes, Err(response) => return response };
     let sample = state.performance.as_ref().unwrap();
     log::info!("site_performance_preparation bytes={bytes}");
@@ -146,6 +174,20 @@ pub(super) async fn storage<S: StorageClient>(
     uri: Uri,
 ) -> Response {
     if let Err(response) = allowed(&state, &principal) { return response; }
+    storage_download(state, method, uri).await
+}
+
+pub(super) async fn storage_capability<S: StorageClient>(
+    State(state): State<AppState<S>>,
+    Path(token): Path<String>,
+    method: Method,
+    uri: Uri,
+) -> Response {
+    if let Err(response) = capability_allowed(&state, &token) { return super::no_store(response); }
+    super::no_store(storage_download(state, method, uri).await)
+}
+
+async fn storage_download<S: StorageClient>(state: AppState<S>, method: Method, uri: Uri) -> Response {
     let bytes = match requested_bytes(&uri) { Ok(bytes) => bytes, Err(response) => return response };
     log::info!("site_storage_performance_started bytes={bytes} method={method}");
     let response = match state.storage.performance(bytes, method == Method::HEAD).await {
@@ -201,6 +243,14 @@ mod tests {
         }
     }
 
+    #[test]
+    fn capability_paths_are_redacted_from_request_logs() {
+        assert_eq!(super::super::safe_route_template("/perftest/secret/site"), "/perftest/{token}/site");
+        let malformed: Uri = "/perftest/secret/extra".parse().unwrap();
+        assert_eq!(super::super::unmatched_request_path_field(&malformed, "unmatched"),
+            " path=\"/perftest/[redacted]\"");
+    }
+
     #[tokio::test]
     async fn endpoints_require_enabled_admin_session_before_preparation() {
         let nonce = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
@@ -230,15 +280,31 @@ mod tests {
         };
         assert_eq!(disabled.clone().oneshot(request(Some(&cookies[0]))).await.unwrap().status(), StatusCode::NOT_FOUND);
         let enabled = super::super::router(super::super::state(database.clone(), storage)
-            .with_performance(Arc::new(journey_performance::Sample::default())));
+            .with_performance(Arc::new(journey_performance::Sample::default()), "test-token".to_owned()));
         assert_eq!(enabled.clone().oneshot(request(None)).await.unwrap().status(), StatusCode::UNAUTHORIZED);
         assert_eq!(enabled.clone().oneshot(request(Some(&cookies[1]))).await.unwrap().status(), StatusCode::FORBIDDEN);
+        let capability_request = |token: &str| Request::builder()
+            .uri(format!("/perftest/{token}/storage?bytes=1"))
+            .body(Body::empty()).unwrap();
+        assert_eq!(enabled.clone().oneshot(capability_request("wrong")).await.unwrap().status(), StatusCode::NOT_FOUND);
         assert_eq!(calls.load(Ordering::Relaxed), 0);
+        let response = enabled.clone().oneshot(capability_request("test-token")).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.headers()[header::CACHE_CONTROL], "private, no-store, no-transform");
+        assert_eq!(to_bytes(response.into_body(), 2).await.unwrap().as_ref(), b"x");
+        let site_head = Request::builder().method("HEAD")
+            .uri("/perftest/test-token/site?bytes=1").body(Body::empty()).unwrap();
+        let response = enabled.clone().oneshot(site_head).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.headers()[header::CONTENT_LENGTH], "1");
+        let rotated = super::super::router(super::super::state(database.clone(), MockStorage(Arc::clone(&calls)))
+            .with_performance(Arc::new(journey_performance::Sample::default()), "new-token".to_owned()));
+        assert_eq!(rotated.oneshot(capability_request("test-token")).await.unwrap().status(), StatusCode::NOT_FOUND);
         let response = enabled.oneshot(request(Some(&cookies[0]))).await.unwrap();
         assert_eq!(response.status(), StatusCode::OK);
         assert_eq!(response.headers()[header::CACHE_CONTROL], "private, no-store, no-transform");
         assert_eq!(to_bytes(response.into_body(), 2).await.unwrap().as_ref(), b"x");
-        assert_eq!(calls.load(Ordering::Relaxed), 1);
+        assert_eq!(calls.load(Ordering::Relaxed), 2);
         let _ = tokio::fs::remove_file(path).await;
     }
 }

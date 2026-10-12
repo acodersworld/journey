@@ -4,8 +4,19 @@ Both applications accept an optional `[diagnostics]` table with `enabled = true`
 The default is `false`. Enable it in both configurations and restart both
 processes to compare all three paths. There is no database change or extra
 listener. Storage serves `GET` and `HEAD /perftest/?bytes=N` through its existing
-HTTP/2 connection; the site exposes authenticated admin endpoints
-`/api/perftest/site` and `/api/perftest/storage`.
+HTTP/2 connection. The site exposes authenticated admin endpoints
+`/api/perftest/site` and `/api/perftest/storage`, plus capability URLs obtained
+through its private control socket.
+
+At each site start with diagnostics enabled, the process generates a new
+256-bit random capability. `journey-site --config site.toml performance urls`
+prints the site and storage-through-site URLs using `site.public_origin` when
+configured, or the local listener address otherwise.
+The URLs permit only GET and HEAD diagnostic downloads, without a login cookie.
+They stop working when the site restarts or diagnostics is disabled. Treat the
+URLs as secrets: anyone holding one can request large transfers while it is
+valid. Site request logs redact the capability path; any proxy in front of the
+site should also avoid logging full request URLs.
 
 The storage crate's `h2c_get_server` example enables `/perftest/` by default
 for both in-memory and filesystem stores. No diagnostics flag or configuration
@@ -37,9 +48,17 @@ with failures exit nonzero. Sizes accept a bare byte count, `B`, binary
 
 ## Curl tests
 
-Create an admin cookie jar before timing. Use the site's configured allowed
-Origin and an admin account; enter credentials locally, without placing them
-in a committed script or benchmark output:
+For a capability URL, run the curl script without a cookie jar:
+
+```sh
+journey-site --config site.toml performance urls
+python3 scripts/performance-curl.py 'https://YOUR_SITE_ORIGIN/perftest/TOKEN/site' --bytes 256MiB --concurrency 1
+```
+
+The existing admin endpoints still accept a cookie jar. Create one before
+timing. Use the site's configured allowed Origin and an admin account; enter
+credentials locally, without placing them in a committed script or benchmark
+output:
 
 ```sh
 curl --fail --silent --show-error \
@@ -61,9 +80,10 @@ python3 scripts/performance-curl.py https://YOUR_SITE_ORIGIN/api/perftest/storag
 python3 scripts/performance-curl.py https://YOUR_SITE_ORIGIN/api/perftest/storage cookies.txt --bytes 256MiB --concurrency 4
 ```
 
-The runner sends one authenticated HEAD request before its timed GETs and
-requires HTTP 200. Every GET uses `--fail --silent --show-error`, the cookie
-jar, identity encoding, and `/dev/null` output. It never follows login
+The runner sends one HEAD request before its timed GETs and requires HTTP 200.
+It sends the cookie jar when supplied for an admin endpoint. Every GET uses
+`--fail --silent --show-error`, identity encoding, and `/dev/null` output.
+It never follows login
 redirects. It requires HTTP 200 and the requested body byte count, retaining
 failed transfer metrics and exiting nonzero. `time_starttransfer` is curl's
 response start time; it includes connection setup and server waiting, so it is

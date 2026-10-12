@@ -38,6 +38,7 @@ pub struct AppState<S: StorageClient> {
     security: SiteSecurity,
     preview_image_authorizations: whatsapp_preview::PreviewImageAuthorizations,
     performance: Option<std::sync::Arc<journey_performance::Sample>>,
+    performance_token: Option<String>,
 }
 
 #[derive(Clone)]
@@ -284,6 +285,8 @@ pub fn router<S: StorageClient>(state: AppState<S>) -> Router {
         .route_layer(middleware::from_fn_with_state(state.clone(), authenticate::<S>));
 
     Router::new()
+        .route("/perftest/{token}/site", get(performance::site_capability::<S>).head(performance::site_capability::<S>))
+        .route("/perftest/{token}/storage", get(performance::storage_capability::<S>).head(performance::storage_capability::<S>))
         .route("/login", get(login_page::<S>).post(login_form::<S>))
         .route("/logout", post(logout_form::<S>))
         .route("/site.css", get(site_css))
@@ -347,7 +350,9 @@ fn unmatched_request_path_field(uri: &http::Uri, route: &str) -> String {
         return String::new();
     }
     let path = uri.path();
-    let path = if is_share_request_path(path) {
+    let path = if path.starts_with("/perftest/") {
+        "/perftest/[redacted]".to_owned()
+    } else if is_share_request_path(path) {
         "/share/[redacted]".to_owned()
     } else {
         let mut characters = path.chars();
@@ -416,6 +421,8 @@ fn safe_route_template(path: &str) -> &'static str {
                     "/share/{share_link_id}/posts/{post_id}/blocks/{block_id}/media"
                 }
                 ["share", _, "posts", _] => "/share/{share_link_id}/posts/{post_id}",
+                ["perftest", _, "site"] => "/perftest/{token}/site",
+                ["perftest", _, "storage"] => "/perftest/{token}/storage",
                 ["share", _, _] => "/share/{share_link_id}/{secret}",
                 ["posts", _, "blocks", _, "media"] => "/posts/{post_id}/blocks/{block_id}/media",
                 ["posts", _, "fragment"] => "/posts/{id}/fragment",
@@ -2974,6 +2981,7 @@ pub fn state<S: StorageClient>(database: Database, storage: S) -> AppState<S> {
         storage,
         preview_image_authorizations: whatsapp_preview::PreviewImageAuthorizations::default(),
         performance: None,
+        performance_token: None,
         security: SiteSecurity {
             public_origin: None,
             secure_cookie: false,
@@ -2995,12 +3003,14 @@ pub fn state_with_security<S: StorageClient>(
         security,
         preview_image_authorizations: whatsapp_preview::PreviewImageAuthorizations::default(),
         performance: None,
+        performance_token: None,
     }
 }
 
 impl<S: StorageClient> AppState<S> {
-    pub fn with_performance(mut self, sample: std::sync::Arc<journey_performance::Sample>) -> Self {
+    pub fn with_performance(mut self, sample: std::sync::Arc<journey_performance::Sample>, token: String) -> Self {
         self.performance = Some(sample);
+        self.performance_token = Some(token);
         self
     }
 }

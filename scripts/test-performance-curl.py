@@ -26,6 +26,11 @@ class FakeProcess:
 
 
 class RunnerTests(unittest.TestCase):
+    def test_capability_url_needs_no_cookie_jar(self):
+        command = runner.curl_command("https://example.test/perftest/TOKEN/site?bytes=1", None)
+        self.assertNotIn("--cookie", command)
+        self.assertIn("Accept-Encoding: identity", command)
+
     def test_size_conventions(self):
         self.assertEqual(runner.parse_size("512K"), 524288)
         self.assertEqual(runner.parse_size("10mb"), 10_000_000)

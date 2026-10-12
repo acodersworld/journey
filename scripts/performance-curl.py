@@ -43,9 +43,11 @@ def positive_int(value):
 
 
 def curl_command(url, cookie_jar, head=False):
-    command = ["curl", "--fail", "--silent", "--show-error", "--cookie", cookie_jar,
-               "--header", "Accept-Encoding: identity", "--output", "/dev/null",
-               "--write-out", WRITE_OUT]
+    command = ["curl", "--fail", "--silent", "--show-error"]
+    if cookie_jar:
+        command.extend(["--cookie", cookie_jar])
+    command.extend(["--header", "Accept-Encoding: identity", "--output", "/dev/null",
+                    "--write-out", WRITE_OUT])
     if head:
         command.append("--head")
     return command + [url]
@@ -108,7 +110,7 @@ def run(args):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("url", help="website diagnostic endpoint URL without a query string")
-    parser.add_argument("cookie_jar", help="existing admin cookie jar")
+    parser.add_argument("cookie_jar", nargs="?", help="existing admin cookie jar for /api/perftest URLs")
     parser.add_argument("--bytes", type=parse_size, default=DEFAULT_BYTES)
     parser.add_argument("--concurrency", type=positive_int, default=1)
     parser.add_argument("--json", action="store_true")

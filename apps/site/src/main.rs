@@ -66,6 +66,7 @@ enum Commands {
 #[derive(Subcommand)]
 enum PerformanceCommands {
     Storage(PerformanceStorageArgs),
+    Urls,
 }
 
 #[derive(Args)]
@@ -161,6 +162,12 @@ async fn main() -> AppResult<()> {
     journey_logging::initialize("journey-site", &config.logging)?;
     let database = Database::new(config.site.database_path.clone());
     match command {
+        Commands::Performance { command: PerformanceCommands::Urls } => {
+            let urls = control::request_performance_urls(&config.site.control_socket).await?;
+            println!("Site: {}", urls.site);
+            println!("Storage through site: {}", urls.storage);
+            Ok(())
+        }
         Commands::Performance { command: PerformanceCommands::Storage(options) } => {
             let request = performance::Request {
                 bytes: if options.key.is_none() { Some(options.bytes.unwrap_or(journey_performance::DEFAULT_TRANSFER_BYTES)) } else { None },
@@ -453,19 +460,31 @@ async fn main() -> AppResult<()> {
             let control_database = database.clone();
             let control_storage = storage.clone();
             let control_shutdown = shutdown.clone();
+            let performance_token = config.diagnostics.enabled.then(auth::new_session_token);
+            let local_origin = if listener_address.ip().is_unspecified() {
+                if listener_address.is_ipv4() {
+                    format!("http://127.0.0.1:{}", listener_address.port())
+                } else {
+                    format!("http://[::1]:{}", listener_address.port())
+                }
+            } else {
+                format!("http://{listener_address}")
+            };
             let performance_settings = control::PerformanceSettings {
                 enabled: config.diagnostics.enabled,
                 transport: config.storage.transport.clone(),
                 initial_stream_window_size: windows.initial_window_size,
                 initial_connection_window_size: windows.initial_connection_window_size,
+                token: performance_token.clone(),
+                origin: config.site.public_origin.clone().unwrap_or(local_origin),
             };
             listener_tasks.spawn(async move {
                 control::serve(control_listener, control_database, control_storage, performance_settings, control_shutdown).await
             });
 
             let mut app_state = web::state_with_security(database, storage.clone(), security);
-            if config.diagnostics.enabled {
-                app_state = app_state.with_performance(std::sync::Arc::new(journey_performance::Sample::default()));
+            if let Some(token) = performance_token {
+                app_state = app_state.with_performance(std::sync::Arc::new(journey_performance::Sample::default()), token);
                 log::info!("site_performance_enabled");
             }
             let cleanup_state = app_state.clone();
