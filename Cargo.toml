@@ -6,6 +6,7 @@ members = [
     "apps/site",
     "apps/storage",
     "crates/journey-logging",
+    "crates/journey-performance",
     "crates/journey-websocket",
     "crates/journey-storage",
 ]

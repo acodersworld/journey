@@ -12,6 +12,7 @@ use tokio::{
 use crate::{
     db::Database,
     import::{self, ImportResult},
+    performance,
     shutdown,
     storage::StorageClient,
 };
@@ -20,13 +21,27 @@ type AppResult<T> = Result<T, Box<dyn Error + Send + Sync>>;
 
 #[derive(Serialize, Deserialize)]
 struct ControlRequest {
-    manifest_path: PathBuf,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    manifest_path: Option<PathBuf>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    performance: Option<performance::Request>,
 }
 
 #[derive(Serialize, Deserialize)]
 struct ControlResponse {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     result: Option<ImportResult>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    performance: Option<performance::Result>,
     error: Option<String>,
+}
+
+#[derive(Clone)]
+pub struct PerformanceSettings {
+    pub enabled: bool,
+    pub transport: String,
+    pub initial_stream_window_size: u32,
+    pub initial_connection_window_size: u32,
 }
 
 pub async fn bind(socket_path: &Path) -> AppResult<UnixListener> {
@@ -103,6 +118,7 @@ pub async fn serve<S: StorageClient>(
     listener: UnixListener,
     database: Database,
     storage: S,
+    performance_settings: PerformanceSettings,
     mut shutdown: shutdown::Receiver,
 ) -> std::io::Result<()> {
     loop {
@@ -114,7 +130,7 @@ pub async fn serve<S: StorageClient>(
         };
         tokio::select! {
             biased;
-            result = handle(stream, &database, &storage) => {
+            result = handle(stream, &database, &storage, &performance_settings) => {
                 if let Err(error) = result {
                     log::error!("site control request failed: {error}");
                 }
@@ -134,7 +150,8 @@ pub async fn request_import(manifest_path: &Path, socket_path: &Path) -> AppResu
         std::io::Error::other(format!("could not connect to running site at {}: {error}", socket_path.display()))
     })?;
     let request = serde_json::to_vec(&ControlRequest {
-        manifest_path: manifest_path.to_path_buf(),
+        manifest_path: Some(manifest_path.to_path_buf()),
+        performance: None,
     })?;
     stream.write_all(&request).await?;
     stream.write_all(b"\n").await?;
@@ -151,26 +168,64 @@ pub async fn request_import(manifest_path: &Path, socket_path: &Path) -> AppResu
     }
 }
 
+pub async fn request_performance(
+    request: performance::Request,
+    socket_path: &Path,
+) -> AppResult<performance::Result> {
+    let mut stream = UnixStream::connect(socket_path).await?;
+    stream.write_all(&serde_json::to_vec(&ControlRequest {
+        manifest_path: None, performance: Some(request),
+    })?).await?;
+    stream.write_all(b"\n").await?;
+    let mut line = String::new();
+    BufReader::new(stream).read_line(&mut line).await?;
+    if line.is_empty() {
+        return Err("running site closed the control connection without a result".into());
+    }
+    let response: ControlResponse = serde_json::from_str(&line)?;
+    match (response.performance, response.error) {
+        (Some(result), None) => Ok(result),
+        (None, Some(error)) => Err(error.into()),
+        _ => Err("running site returned an invalid performance response".into()),
+    }
+}
+
 async fn handle<S: StorageClient>(
     stream: UnixStream,
     database: &Database,
     storage: &S,
+    performance_settings: &PerformanceSettings,
 ) -> AppResult<()> {
     let mut reader = BufReader::new(stream);
     let mut request_line = String::new();
     reader.read_line(&mut request_line).await?;
-    let result: AppResult<ImportResult> = async {
+    let result: AppResult<ControlResponse> = async {
         let request = serde_json::from_str::<ControlRequest>(&request_line)?;
-        if !request.manifest_path.is_absolute() {
+        if let Some(performance_request) = request.performance {
+            if request.manifest_path.is_some() {
+                return Err("control request must select one command".into());
+            }
+            if !performance_settings.enabled {
+                return Err("performance diagnostics are disabled".into());
+            }
+            let result = performance::run(storage.clone(), performance_request,
+                performance_settings.transport.clone(),
+                performance_settings.initial_stream_window_size,
+                performance_settings.initial_connection_window_size).await?;
+            return Ok(ControlResponse { result: None, performance: Some(result), error: None });
+        }
+        let manifest_path = request.manifest_path.ok_or("control request is missing a command")?;
+        if !manifest_path.is_absolute() {
             return Err("manifest path from the control socket must be absolute".into());
         }
-        let prepared = import::prepare_manifest(&request.manifest_path).await?;
-        import::apply_import(prepared, database, storage).await
+        let prepared = import::prepare_manifest(&manifest_path).await?;
+        let result = import::apply_import(prepared, database, storage).await?;
+        Ok(ControlResponse { result: Some(result), performance: None, error: None })
     }
     .await;
     let response = match result {
-        Ok(result) => ControlResponse { result: Some(result), error: None },
-        Err(error) => ControlResponse { result: None, error: Some(error.to_string()) },
+        Ok(result) => result,
+        Err(error) => ControlResponse { result: None, performance: None, error: Some(error.to_string()) },
     };
     let mut stream = reader.into_inner();
     stream.write_all(&serde_json::to_vec(&response)?).await?;
@@ -190,4 +245,18 @@ pub fn default_socket_path() -> PathBuf {
     std::env::temp_dir()
         .join(format!("journey-site-{uid}"))
         .join("control.sock")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn existing_import_request_format_remains_valid() {
+        let request: ControlRequest = serde_json::from_str(r#"{"manifest_path":"/tmp/import.json"}"#).unwrap();
+        assert_eq!(request.manifest_path.as_deref(), Some(Path::new("/tmp/import.json")));
+        assert!(request.performance.is_none());
+        let request = ControlRequest { manifest_path: Some(PathBuf::from("/tmp/import.json")), performance: None };
+        assert_eq!(serde_json::to_string(&request).unwrap(), r#"{"manifest_path":"/tmp/import.json"}"#);
+    }
 }

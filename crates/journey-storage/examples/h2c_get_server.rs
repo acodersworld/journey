@@ -126,7 +126,10 @@ async fn run_server<S: StoreInterface + Sync + Send>(
     let web_store = Arc::clone(&store);
     let (range_get_aggregator, _range_get_task) =
         start_range_get_aggregator(Duration::from_secs(10))?;
-    let service = Arc::new(Service::with_range_get_aggregator(store, range_get_aggregator));
+    let service = Arc::new(
+        Service::with_range_get_aggregator(store, range_get_aggregator)
+            .with_performance(Arc::new(journey_performance::Sample::default())),
+    );
 
     let web_listener = TcpListener::bind(web_address).await.map_err(|error| {
         std::io::Error::new(error.kind(), format!("failed to bind web listener at {web_address}: {error}"))
@@ -143,6 +146,9 @@ async fn run_server<S: StoreInterface + Sync + Send>(
     println!("journey-storage HTTP/2 listening on http://{bound_address}");
     println!("journey-storage web interface listening on http://{web_bound_address}");
     println!("  example web credentials: user / pass");
+    println!("Performance diagnostics (enabled by default):");
+    println!("  curl --http2-prior-knowledge --head http://{bound_address}/perftest/");
+    println!("  curl --http2-prior-knowledge 'http://{bound_address}/perftest/?bytes=268435456' --output /dev/null --write-out '%{{speed_download}} bytes/sec\\n'");
     if seeded_fixtures {
         println!("  http://{bound_address}/objects/image.jpg");
         println!("  http://{bound_address}/objects/video.mp4");

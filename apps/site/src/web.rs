@@ -27,6 +27,7 @@ const MAX_FEED_LIMIT: usize = 100;
 pub const DEFAULT_MAX_MEDIA_UPLOAD_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 
 pub(crate) mod whatsapp_preview;
+pub(crate) mod performance;
 
 static NEXT_REQUEST_ID: AtomicU64 = AtomicU64::new(1);
 
@@ -36,6 +37,7 @@ pub struct AppState<S: StorageClient> {
     storage: S,
     security: SiteSecurity,
     preview_image_authorizations: whatsapp_preview::PreviewImageAuthorizations,
+    performance: Option<std::sync::Arc<journey_performance::Sample>>,
 }
 
 #[derive(Clone)]
@@ -258,6 +260,8 @@ pub fn share_link_origin_with_insecure_lan_http(
 
 pub fn router<S: StorageClient>(state: AppState<S>) -> Router {
     let content_routes = Router::new()
+        .route("/api/perftest/site", get(performance::site::<S>).head(performance::site::<S>))
+        .route("/api/perftest/storage", get(performance::storage::<S>).head(performance::storage::<S>))
         .route("/", get(home::<S>))
         .route("/tags", get(tag_page::<S>))
         .route("/archive/{month}", get(archive_page::<S>))
@@ -396,6 +400,8 @@ fn safe_route_template(path: &str) -> &'static str {
         "/api/auth/login" => "/api/auth/login",
         "/api/auth/current" => "/api/auth/current",
         "/api/auth/logout" => "/api/auth/logout",
+        "/api/perftest/site" => "/api/perftest/site",
+        "/api/perftest/storage" => "/api/perftest/storage",
         "/api/posts" => "/api/posts",
         "/api/drafts" => "/api/drafts",
         "/tags" => "/tags",
@@ -1160,9 +1166,17 @@ fn timezone_from_cookie(headers: &HeaderMap) -> String {
 }
 
 fn no_store(mut response: Response) -> Response {
+    let cache_control = if response.headers().get(header::CACHE_CONTROL)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| value.split(',').any(|directive| directive.trim() == "no-transform"))
+    {
+        HeaderValue::from_static("private, no-store, no-transform")
+    } else {
+        HeaderValue::from_static("private, no-store")
+    };
     response.headers_mut().insert(
         header::CACHE_CONTROL,
-        HeaderValue::from_static("private, no-store"),
+        cache_control,
     );
     response
 }
@@ -2959,6 +2973,7 @@ pub fn state<S: StorageClient>(database: Database, storage: S) -> AppState<S> {
         database,
         storage,
         preview_image_authorizations: whatsapp_preview::PreviewImageAuthorizations::default(),
+        performance: None,
         security: SiteSecurity {
             public_origin: None,
             secure_cookie: false,
@@ -2979,6 +2994,14 @@ pub fn state_with_security<S: StorageClient>(
         storage,
         security,
         preview_image_authorizations: whatsapp_preview::PreviewImageAuthorizations::default(),
+        performance: None,
+    }
+}
+
+impl<S: StorageClient> AppState<S> {
+    pub fn with_performance(mut self, sample: std::sync::Arc<journey_performance::Sample>) -> Self {
+        self.performance = Some(sample);
+        self
     }
 }
 

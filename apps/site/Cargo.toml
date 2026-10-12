@@ -14,6 +14,7 @@ h2 = "0.4"
 http = "1"
 journey-websocket = { path = "../../crates/journey-websocket" }
 journey-logging = { path = "../../crates/journey-logging" }
+journey-performance = { path = "../../crates/journey-performance" }
 jiff = "0.2"
 log = "0.4"
 libc = "0.2"

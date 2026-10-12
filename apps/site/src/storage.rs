@@ -56,6 +56,17 @@ impl ImageReductionOptions {
 }
 
 pub trait StorageClient: Clone + Send + Sync + 'static {
+    fn performance(
+        &self,
+        bytes: u64,
+        head: bool,
+    ) -> impl Future<Output = Result<StorageResponse, String>> + Send {
+        async move {
+            let _ = (bytes, head);
+            Err("storage performance diagnostics are unavailable".to_owned())
+        }
+    }
+
     fn put_file(
         &self,
         content_type: &str,
@@ -383,6 +394,10 @@ impl StorageRequestTransport for WebSocketStorageClient {
 macro_rules! impl_storage_client {
     ($client:ty) => {
         impl StorageClient for $client {
+            async fn performance(&self, bytes: u64, head: bool) -> Result<StorageResponse, String> {
+                performance(self, bytes, head).await
+            }
+
             async fn put_file(&self, content_type: &str, path: &Path) -> Result<String, String> {
                 put_file(self, content_type, path).await
             }
@@ -424,6 +439,13 @@ impl_storage_client!(H2cStorageClient);
 impl_storage_client!(WebSocketStorageClient);
 
 impl StorageClient for SiteStorageClient {
+    async fn performance(&self, bytes: u64, head: bool) -> Result<StorageResponse, String> {
+        match self {
+            Self::H2c(client) => performance(client, bytes, head).await,
+            Self::WebSocket(client) => performance(client, bytes, head).await,
+        }
+    }
+
     async fn put_file(&self, content_type: &str, path: &Path) -> Result<String, String> {
         match self {
             Self::H2c(client) => client.put_file(content_type, path).await,
@@ -596,6 +618,21 @@ async fn get<T: StorageRequestTransport>(
     get_response(transport, request, head).await
 }
 
+async fn performance<T: StorageRequestTransport>(
+    transport: &T,
+    bytes: u64,
+    head: bool,
+) -> Result<StorageResponse, String> {
+    let request = Request::builder()
+        .method(if head { Method::HEAD } else { Method::GET })
+        .version(Version::HTTP_2)
+        .uri(format!("http://storage.internal/perftest/?bytes={bytes}"))
+        .header(header::ACCEPT_ENCODING, "identity")
+        .body(())
+        .map_err(|error| error.to_string())?;
+    get_response(transport, request, head).await
+}
+
 async fn get_reduced_image<T: StorageRequestTransport>(
     transport: &T,
     key: &str,
@@ -757,6 +794,39 @@ mod tests {
 
         assert_eq!(error, "storage WebSocket is unavailable");
         assert!(started.elapsed() < Duration::from_millis(100));
+    }
+
+    #[tokio::test]
+    async fn performance_uses_the_existing_h2c_connection() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut connection = h2::server::handshake(stream).await.unwrap();
+            for method in [Method::HEAD, Method::GET] {
+                let (request, mut respond) = connection.accept().await.unwrap().unwrap();
+                assert_eq!(request.method(), method);
+                assert_eq!(request.uri().path_and_query().unwrap().as_str(), "/perftest/?bytes=4");
+                assert_eq!(request.headers()[header::ACCEPT_ENCODING], "identity");
+                let response = http::Response::builder().status(StatusCode::OK)
+                    .header(header::CONTENT_LENGTH, "4").body(()).unwrap();
+                let mut body = respond.send_response(response, method == Method::HEAD).unwrap();
+                if method == Method::GET {
+                    body.send_data(Bytes::from_static(b"test"), true).unwrap();
+                }
+            }
+            let _ = connection.accept().await;
+        });
+        let client = H2cStorageClient::connect(address, 512 * 1024, 4 * 1024 * 1024).await.unwrap();
+        assert_eq!(client.performance(4, true).await.unwrap().status, StatusCode::OK);
+        let mut response = client.performance(4, false).await.unwrap();
+        let mut received = Vec::new();
+        while let Some(chunk) = response.body.next().await {
+            received.extend_from_slice(&chunk.unwrap());
+        }
+        assert_eq!(received, b"test");
+        client.close().await;
+        server.await.unwrap();
     }
 
     struct ReconnectingStorageServer {

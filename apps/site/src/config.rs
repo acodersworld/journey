@@ -11,11 +11,19 @@ use crate::control;
 #[serde(default, deny_unknown_fields)]
 pub struct AppConfig {
     #[serde(default)]
+    pub diagnostics: DiagnosticsSettings,
+    #[serde(default)]
     pub site: SiteSettings,
     #[serde(default)]
     pub storage: StorageSettings,
     #[serde(default)]
     pub logging: journey_logging::LoggingSettings,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct DiagnosticsSettings {
+    pub enabled: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -45,6 +53,7 @@ pub struct StorageSettings {
 impl Default for AppConfig {
     fn default() -> Self {
         Self {
+            diagnostics: DiagnosticsSettings::default(),
             site: SiteSettings::default(),
             storage: StorageSettings::default(),
             logging: journey_logging::LoggingSettings::default(),
@@ -120,6 +129,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(config.logging.level, "info");
+        assert!(!config.diagnostics.enabled);
         assert_eq!(config.logging.queue_capacity, 65_536);
         assert_eq!(config.logging.slow_enqueue_warning_ms, 100);
     }

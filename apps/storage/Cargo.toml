@@ -7,6 +7,7 @@ edition = "2024"
 journey-storage = { path = "../../crates/journey-storage" }
 journey-websocket = { path = "../../crates/journey-websocket" }
 journey-logging = { path = "../../crates/journey-logging" }
+journey-performance = { path = "../../crates/journey-performance" }
 http = "1"
 log = "0.4"
 serde = { version = "1", features = ["derive"] }

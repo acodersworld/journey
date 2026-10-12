@@ -11,6 +11,7 @@ mod storage_image_reduction;
 mod http2_storage_service;
 mod storage_web_interface;
 mod range_get_logging;
+mod storage_performance;
 
 pub use storage_interface::{
     ContentType, ContentTypeError, GetResult, ImageFit, ImageOutputFormat, ImageReductionRequest,

@@ -915,6 +915,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "journey-performance"
+version = "0.1.0"
+dependencies = [
+ "tokio",
+]
+
+[[package]]
 name = "journey-site"
 version = "0.1.0"
 dependencies = [
@@ -928,6 +935,7 @@ dependencies = [
  "http",
  "jiff",
  "journey-logging",
+ "journey-performance",
  "journey-websocket",
  "libc",
  "log",
@@ -957,6 +965,7 @@ dependencies = [
  "http",
  "http-body-util",
  "journey-logging",
+ "journey-performance",
  "jpeg-decoder",
  "libc",
  "log",
@@ -976,6 +985,7 @@ version = "0.1.0"
 dependencies = [
  "http",
  "journey-logging",
+ "journey-performance",
  "journey-storage",
  "journey-websocket",
  "log",

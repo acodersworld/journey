@@ -96,7 +96,11 @@ async fn main() -> AppResult<()> {
     let (range_get_aggregator, range_get_task) = start_range_get_aggregator(
         Duration::from_secs(config.storage.range_get_summary_interval_seconds),
     )?;
-    let service = Service::with_range_get_aggregator(store, range_get_aggregator);
+    let mut service = Service::with_range_get_aggregator(store, range_get_aggregator);
+    if config.diagnostics.enabled {
+        service = service.with_performance(Arc::new(journey_performance::Sample::default()));
+        log::info!("storage_performance_enabled");
+    }
     log::info!("storage_service_started object_dir={object_dir_display:?}");
     log::info!("listener_started listener=management_ui address={management_bind}");
 

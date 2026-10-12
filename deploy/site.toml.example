@@ -20,5 +20,8 @@ websocket_secret = "replace-with-a-long-random-secret"
 initial_window_size = 33554432
 initial_connection_window_size = 67108864
 
+[diagnostics]
+enabled = false
+
 [logging]
 level = "info"

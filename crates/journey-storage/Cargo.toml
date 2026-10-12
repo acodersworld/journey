@@ -11,6 +11,7 @@ futures-util = "0.3"
 h2 = "0.4"
 http = "1"
 journey-logging = { path = "../journey-logging" }
+journey-performance = { path = "../journey-performance" }
 log = "0.4"
 ffmpeg-next = { version = "9", default-features = false, features = ["codec", "format", "software-scaling"] }
 jpeg-decoder = "0.3"

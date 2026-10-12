@@ -3,6 +3,7 @@ mod config;
 mod control;
 mod db;
 mod import;
+mod performance;
 mod shutdown;
 mod storage;
 mod storage_websocket;
@@ -42,6 +43,10 @@ struct Cli {
 #[derive(Subcommand)]
 enum Commands {
     Import(ImportArgs),
+    Performance {
+        #[command(subcommand)]
+        command: PerformanceCommands,
+    },
     Db {
         #[command(subcommand)]
         command: DbCommands,
@@ -56,6 +61,28 @@ enum Commands {
         command: ShareLinkCommands,
     },
     Serve(ServeArgs),
+}
+
+#[derive(Subcommand)]
+enum PerformanceCommands {
+    Storage(PerformanceStorageArgs),
+}
+
+#[derive(Args)]
+struct PerformanceStorageArgs {
+    #[arg(long, value_name = "SIZE", value_parser = journey_performance::parse_size, conflicts_with = "key")]
+    bytes: Option<u64>,
+    #[arg(long, value_name = "KEY")]
+    key: Option<String>,
+    #[arg(long, default_value_t = 1, value_parser = parse_concurrency)]
+    concurrency: usize,
+    #[arg(long)]
+    json: bool,
+}
+
+fn parse_concurrency(value: &str) -> Result<usize, String> {
+    value.parse::<usize>().ok().filter(|value| *value > 0)
+        .ok_or_else(|| "concurrency must be a positive integer".to_owned())
 }
 
 #[derive(Args)]
@@ -134,6 +161,19 @@ async fn main() -> AppResult<()> {
     journey_logging::initialize("journey-site", &config.logging)?;
     let database = Database::new(config.site.database_path.clone());
     match command {
+        Commands::Performance { command: PerformanceCommands::Storage(options) } => {
+            let request = performance::Request {
+                bytes: if options.key.is_none() { Some(options.bytes.unwrap_or(journey_performance::DEFAULT_TRANSFER_BYTES)) } else { None },
+                key: options.key,
+                concurrency: options.concurrency,
+            };
+            let result = control::request_performance(request, &config.site.control_socket).await?;
+            performance::print(&result, options.json)?;
+            if result.failures > 0 {
+                return Err(format!("{} performance transfers failed", result.failures).into());
+            }
+            Ok(())
+        }
         Commands::Import(options) => {
             if options.via_running_site {
                 let result = control::request_import(&options.manifest, &config.site.control_socket).await?;
@@ -413,11 +453,21 @@ async fn main() -> AppResult<()> {
             let control_database = database.clone();
             let control_storage = storage.clone();
             let control_shutdown = shutdown.clone();
+            let performance_settings = control::PerformanceSettings {
+                enabled: config.diagnostics.enabled,
+                transport: config.storage.transport.clone(),
+                initial_stream_window_size: windows.initial_window_size,
+                initial_connection_window_size: windows.initial_connection_window_size,
+            };
             listener_tasks.spawn(async move {
-                control::serve(control_listener, control_database, control_storage, control_shutdown).await
+                control::serve(control_listener, control_database, control_storage, performance_settings, control_shutdown).await
             });
 
-            let app_state = web::state_with_security(database, storage.clone(), security);
+            let mut app_state = web::state_with_security(database, storage.clone(), security);
+            if config.diagnostics.enabled {
+                app_state = app_state.with_performance(std::sync::Arc::new(journey_performance::Sample::default()));
+                log::info!("site_performance_enabled");
+            }
             let cleanup_state = app_state.clone();
             let mut cleanup_shutdown = shutdown.clone();
             listener_tasks.spawn(async move {

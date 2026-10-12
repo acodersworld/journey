@@ -50,6 +50,7 @@ static NEXT_STORAGE_REQUEST_ID: std::sync::atomic::AtomicU64 = std::sync::atomic
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum Route {
+    Performance,
     Collection,
     Object(String),
     EmptyKey,
@@ -89,7 +90,9 @@ impl<S: StoreInterface> PutContextInterface for HttpPutContext<S> {
 }
 
 fn classify_route(path: &str) -> Route {
-    if path == "/objects" {
+    if path == "/perftest/" {
+        Route::Performance
+    } else if path == "/objects" {
         Route::Collection
     } else if path == "/objects/" {
         Route::EmptyKey
@@ -393,15 +396,16 @@ fn parse_positive_u64(value: &str) -> Result<u64, ()> {
 pub struct Service<S: StoreInterface> {
     store: Arc<S>,
     range_get_aggregator: Option<RangeGetAggregator>,
+    performance: Option<Arc<journey_performance::Sample>>,
 }
 
-struct TrackedRespond {
+pub(super) struct TrackedRespond {
     inner: h2::server::SendResponse<Bytes>,
     status: Arc<AtomicU16>,
 }
 
 impl TrackedRespond {
-    fn send_response(
+    pub(super) fn send_response(
         &mut self,
         response: Response<()>,
         end_of_stream: bool,
@@ -420,6 +424,7 @@ impl<S: StoreInterface> Clone for Service<S> {
         Self {
             store: Arc::clone(&self.store),
             range_get_aggregator: self.range_get_aggregator.clone(),
+            performance: self.performance.clone(),
         }
     }
 }
@@ -427,12 +432,17 @@ impl<S: StoreInterface> Clone for Service<S> {
 impl<S: StoreInterface> Service<S> {
     /// Creates a service backed by the supplied mutable catalogue.
     pub fn new(store: Arc<S>) -> Self {
-        Self { store, range_get_aggregator: None }
+        Self { store, range_get_aggregator: None, performance: None }
     }
 
     /// Creates a service with periodic summaries for ranged object GETs.
     pub fn with_range_get_aggregator(store: Arc<S>, range_get_aggregator: RangeGetAggregator) -> Self {
-        Self { store, range_get_aggregator: Some(range_get_aggregator) }
+        Self { store, range_get_aggregator: Some(range_get_aggregator), performance: None }
+    }
+
+    pub fn with_performance(mut self, sample: Arc<journey_performance::Sample>) -> Self {
+        self.performance = Some(sample);
+        self
     }
 
     /// Handles one accepted HTTP/2 request and sends its complete response.
@@ -457,6 +467,7 @@ impl<S: StoreInterface> Service<S> {
                 })
                 .unwrap_or_else(|_| "object".to_owned()),
             Route::Collection => "collection".to_owned(),
+            Route::Performance => "performance".to_owned(),
             Route::EmptyKey => "empty_key".to_owned(),
             Route::Unknown => "unknown".to_owned(),
         };
@@ -561,6 +572,10 @@ impl<S: StoreInterface> Service<S> {
         let route = classify_route(request.uri().path());
         let method = request.method().clone();
         match route {
+            Route::Performance => match &self.performance {
+                Some(sample) => crate::storage_performance::handle(sample, request, respond).await,
+                None => request_error(respond, method == Method::HEAD, StatusCode::NOT_FOUND, None, NOT_FOUND_BODY),
+            },
             Route::Collection => match method {
                 Method::GET => {
                     let query = match parse_list_query(request.uri().query()) {
@@ -1629,7 +1644,7 @@ async fn send_object_reader<O: ObjectInterface, F: FnMut(u64) + Send>(
     Ok(bytes_handed_to_transport)
 }
 
-fn poll_send_capacity(
+pub(super) fn poll_send_capacity(
     stream: &mut h2::SendStream<Bytes>,
     context: &mut std::task::Context<'_>,
 ) -> Poll<Result<usize, ServiceError>> {
@@ -2148,11 +2163,90 @@ mod tests {
 
     #[test]
     fn route_classification_uses_the_exact_collection_path() {
+        assert_eq!(classify_route("/perftest/"), Route::Performance);
+        assert_eq!(classify_route("/perftest"), Route::Unknown);
         assert_eq!(classify_route("/objects"), Route::Collection);
         assert_eq!(classify_route("/objects/"), Route::EmptyKey);
         assert_eq!(classify_route("/objects/a/b"), Route::Object("a/b".to_owned()));
         assert_eq!(classify_route("/other"), Route::Unknown);
         assert_eq!(classify_route("/objects%2Fkey"), Route::Unknown);
+    }
+
+    #[tokio::test]
+    async fn performance_route_prepares_and_streams_exact_lengths() {
+        let sample = Arc::new(journey_performance::Sample::default());
+        let (client_io, server_io) = duplex(256 * 1024);
+        let (error_sender, _errors) = mpsc::unbounded_channel();
+        let server_task = tokio::spawn(run_test_server(server_io,
+            Service::new(Arc::new(Store::default())).with_performance(Arc::clone(&sample)),
+            error_sender));
+        let (mut sender, connection) = client::Builder::new()
+            .initial_window_size(512 * 1024)
+            .initial_connection_window_size(4 * 1024 * 1024)
+            .handshake::<_, Bytes>(client_io).await.unwrap();
+        let client_task = tokio::spawn(async move { let _ = connection.await; });
+
+        let head = request(&mut sender, Method::HEAD, "/perftest/?bytes=17").await.unwrap();
+        assert_eq!(head.status(), StatusCode::OK);
+        assert_eq!(head.headers()[header::CONTENT_LENGTH], "17");
+        assert!(head.body().is_end_stream());
+        assert!(sample.prepare().await.is_ok());
+        let first_file = sample.prepare().await.unwrap();
+        let second_file = sample.prepare().await.unwrap();
+        assert!(Arc::ptr_eq(&first_file, &second_file));
+
+        for bytes in [17_u64, journey_performance::SAMPLE_BYTES - 1,
+            journey_performance::SAMPLE_BYTES, journey_performance::SAMPLE_BYTES + 17] {
+            let path = format!("/perftest/?bytes={bytes}");
+            let response = request(&mut sender, Method::GET, &path).await.unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            assert_eq!(response.headers()[header::CONTENT_LENGTH], bytes.to_string());
+            let mut body = response.into_body();
+            let mut received = 0_u64;
+            while let Some(chunk) = body.data().await {
+                let chunk = chunk.unwrap();
+                received += chunk.len() as u64;
+                body.flow_control().release_capacity(chunk.len()).unwrap();
+            }
+            assert_eq!(received, bytes);
+        }
+        let invalid = request(&mut sender, Method::GET, "/perftest/?bytes=0").await.unwrap();
+        assert_eq!(invalid.status(), StatusCode::BAD_REQUEST);
+        drop(sender);
+        client_task.abort();
+        server_task.abort();
+    }
+
+    #[tokio::test]
+    async fn disabled_performance_route_is_not_found() {
+        let mut connection = new_connection(Arc::new(Store::default())).await;
+        let response = request(&mut connection.sender, Method::HEAD, "/perftest/?bytes=17").await.unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        close_connection(connection).await;
+    }
+
+    #[tokio::test]
+    async fn cancelled_performance_get_stops_streaming() {
+        let (client_io, server_io) = duplex(256 * 1024);
+        let (error_sender, mut errors) = mpsc::unbounded_channel();
+        let server_task = tokio::spawn(run_test_server(server_io,
+            Service::new(Arc::new(Store::default()))
+                .with_performance(Arc::new(journey_performance::Sample::default())),
+            error_sender));
+        let (mut sender, connection) = client::Builder::new()
+            .initial_window_size(512 * 1024)
+            .initial_connection_window_size(4 * 1024 * 1024)
+            .handshake::<_, Bytes>(client_io).await.unwrap();
+        let client_task = tokio::spawn(async move { let _ = connection.await; });
+        let response = request(&mut sender, Method::GET, "/perftest/?bytes=1073741824").await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        drop(response);
+        let error = tokio::time::timeout(std::time::Duration::from_secs(5), errors.recv())
+            .await.unwrap().unwrap();
+        assert!(matches!(error, ServiceError::Request { method: Method::GET, .. }), "{error:?}");
+        drop(sender);
+        client_task.abort();
+        server_task.abort();
     }
 
     #[test]
