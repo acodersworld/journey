@@ -306,35 +306,84 @@ async fn log_request(request: Request, next: Next) -> Response {
     let request_id = NEXT_REQUEST_ID.fetch_add(1, Ordering::Relaxed);
     let method = request.method().clone();
     let route = safe_route_template(request.uri().path());
+    let path_field = unmatched_request_path_field(request.uri(), route);
     let static_or_media = is_static_or_media(route, &method);
     let started = std::time::Instant::now();
-    if static_or_media {
-        log::debug!("request_arrival request_id={request_id} method={method} route={route}");
+    let arrival_level = if static_or_media {
+        log::Level::Debug
     } else {
-        log::info!("request_arrival request_id={request_id} method={method} route={route}");
-    }
+        log::Level::Info
+    };
+    log::log!(arrival_level, "request_arrival request_id={request_id} method={method} route={route}{path_field}");
     let response = next.run(request).await;
     let status = response.status();
     let elapsed_ms = started.elapsed().as_millis();
-    if static_or_media && status.is_success() {
-        log::debug!(
-            "response_ready request_id={request_id} method={method} route={route} status={} handler_duration_ms={elapsed_ms}",
-            status.as_u16()
-        );
+    let response_level = if static_or_media && status.is_success() {
+        log::Level::Debug
     } else {
-        log::info!(
-            "response_ready request_id={request_id} method={method} route={route} status={} handler_duration_ms={elapsed_ms}",
-            status.as_u16()
-        );
-    }
+        log::Level::Info
+    };
+    log::log!(
+        response_level,
+        "response_ready request_id={request_id} method={method} route={route}{path_field} status={} handler_duration_ms={elapsed_ms}",
+        status.as_u16()
+    );
     let (parts, body) = response.into_parts();
     let body = Body::from_stream(body.into_data_stream().map_err(move |error| {
         log::error!(
-            "response_stream_failed request_id={request_id} method={method} route={route} error={error}"
+            "response_stream_failed request_id={request_id} method={method} route={route}{path_field} error={error}"
         );
         error
     }));
     Response::from_parts(parts, body)
+}
+
+fn unmatched_request_path_field(uri: &http::Uri, route: &str) -> String {
+    if route != "unmatched" {
+        return String::new();
+    }
+    let path = uri.path();
+    let path = if is_share_request_path(path) {
+        "/share/[redacted]".to_owned()
+    } else {
+        let mut characters = path.chars();
+        let mut bounded: String = characters.by_ref().take(2048).collect();
+        if characters.next().is_some() {
+            bounded.push_str("[truncated]");
+        }
+        bounded
+    };
+    format!(" path={path:?}")
+}
+
+fn is_share_request_path(path: &str) -> bool {
+    // Decode only the namespace, including encoded separators, before deciding
+    // whether a malformed share URL could expose a token.
+    let bytes = path.as_bytes();
+    let mut index = 0;
+    let mut namespace = Vec::with_capacity(5);
+    while index < bytes.len() {
+        let (byte, consumed) = if bytes[index] == b'%' {
+            path.get(index + 1..index + 3)
+                .and_then(|hex| u8::from_str_radix(hex, 16).ok())
+                .map(|byte| (byte, 3))
+                .unwrap_or((bytes[index], 1))
+        } else {
+            (bytes[index], 1)
+        };
+        index += consumed;
+        if byte == b'/' {
+            if namespace.is_empty() {
+                continue;
+            }
+            break;
+        }
+        namespace.push(byte);
+        if namespace.len() > 5 {
+            return false;
+        }
+    }
+    namespace == b"share"
 }
 
 fn safe_route_template(path: &str) -> &'static str {
@@ -2945,6 +2994,7 @@ mod tests {
 
     use super::{
         escape_html, feed, home, parse_cursor, render_full_post, router, safe_route_template, state,
+        unmatched_request_path_field,
         valid_return_target, AuthPrincipal, FeedQuery,
     };
     use crate::{
@@ -4014,6 +4064,57 @@ mod tests {
         let route = safe_route_template(&path);
         assert_eq!(route, "/share/{share_link_id}/{secret}");
         assert!(!route.contains(secret));
+    }
+
+    #[test]
+    fn unmatched_request_path_excludes_query_values_and_quotes_the_path() {
+        let uri: http::Uri = "/favicon.ico?secret=private-value".parse().unwrap();
+        assert_eq!(
+            unmatched_request_path_field(&uri, safe_route_template(uri.path())),
+            " path=\"/favicon.ico\"",
+        );
+        let uri: http::Uri = "/missing/\"image\"".parse().unwrap();
+        assert_eq!(
+            unmatched_request_path_field(&uri, "unmatched"),
+            " path=\"/missing/\\\"image\\\"\"",
+        );
+        let uri: http::Uri = "/api/posts?secret=private-value".parse().unwrap();
+        assert!(unmatched_request_path_field(&uri, safe_route_template(uri.path())).is_empty());
+    }
+
+    #[test]
+    fn unmatched_request_path_redacts_malformed_and_encoded_share_urls() {
+        for path in [
+            "/share/link-id/private-secret/extra",
+            "/share/link-id/whatsapp-preview-image/private-token/extra",
+            "//share//link-id//private-secret//extra",
+            "/sh%61re/link-id/private-secret/extra",
+            "/%2fshare%2flink-id%2fprivate-secret%2fextra",
+            "/share%2Flink-id/private-secret/extra",
+            "/share/private-secret",
+        ] {
+            let uri: http::Uri = path.parse().unwrap();
+            assert_eq!(
+                unmatched_request_path_field(&uri, safe_route_template(uri.path())),
+                " path=\"/share/[redacted]\"",
+                "{path}",
+            );
+        }
+        let uri: http::Uri = "/shareholder/missing".parse().unwrap();
+        assert_eq!(
+            unmatched_request_path_field(&uri, "unmatched"),
+            " path=\"/shareholder/missing\"",
+        );
+    }
+
+    #[test]
+    fn unmatched_request_path_bounds_long_paths_after_redaction() {
+        let path = format!("/missing/{}", "x".repeat(3000));
+        let uri: http::Uri = path.parse().unwrap();
+        let field = unmatched_request_path_field(&uri, "unmatched");
+        assert_eq!(field, format!(" path=\"{}[truncated]\"", &path[..2048]));
+        let uri: http::Uri = format!("/share/id/{}/extra", "secret".repeat(600)).parse().unwrap();
+        assert_eq!(unmatched_request_path_field(&uri, "unmatched"), " path=\"/share/[redacted]\"");
     }
 
     #[test]
