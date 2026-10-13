@@ -13,8 +13,16 @@ replaces a single backup object. The same operation is available on demand.
   scheduled one.
 - Use SQLite's Online Backup API to copy the live database into a temporary
   SQLite file. Do not copy the live database file directly, since it can change
-  while the copy is in progress. Perform blocking SQLite and compression work
-  off the async runtime.
+  while the copy is in progress.
+- Run blocking SQLite backup, snapshot validation, and compression work inside
+  `tokio::task::spawn_blocking`. Tokio schedules this work on its dedicated
+  blocking thread pool, within the same site process and on the same machine.
+  The async backup job awaits the task's result, leaving the async worker
+  threads free to serve requests while the blocking work runs. This still
+  consumes the machine's CPU, memory, and disk resources. Upload the completed
+  compressed file asynchronously after the blocking task succeeds. Apply the
+  same approach to blocking decompression and SQLite validation during restore
+  checks.
 - Check the snapshot with SQLite `PRAGMA integrity_check` and
   `PRAGMA foreign_key_check`, and require the current site schema version.
   Compress the validated snapshot with Zstandard into another temporary file.
