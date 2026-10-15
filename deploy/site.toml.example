@@ -23,5 +23,8 @@ initial_connection_window_size = 67108864
 [diagnostics]
 enabled = false
 
+[backup]
+daily_utc = "03:00"
+
 [logging]
 level = "info"

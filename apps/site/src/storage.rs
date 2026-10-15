@@ -73,6 +73,11 @@ pub trait StorageClient: Clone + Send + Sync + 'static {
         path: &Path,
     ) -> impl Future<Output = Result<String, String>> + Send;
 
+    fn put_file_at(&self, key: &str, content_type: &str, path: &Path)
+        -> impl Future<Output = Result<(), String>> + Send {
+        async move { let _ = (key, content_type, path); Err("explicit-key upload unavailable".to_owned()) }
+    }
+
     fn put_stream(
         &self,
         content_type: &str,
@@ -402,6 +407,10 @@ macro_rules! impl_storage_client {
                 put_file(self, content_type, path).await
             }
 
+            async fn put_file_at(&self, key: &str, content_type: &str, path: &Path) -> Result<(), String> {
+                put_file_at(self, key, content_type, path).await
+            }
+
             async fn put_stream(
                 &self,
                 content_type: &str,
@@ -453,6 +462,14 @@ impl StorageClient for SiteStorageClient {
         }
     }
 
+
+    async fn put_file_at(&self, key: &str, content_type: &str, path: &Path) -> Result<(), String> {
+        match self {
+            Self::H2c(client) => client.put_file_at(key, content_type, path).await,
+            Self::WebSocket(client) => client.put_file_at(key, content_type, path).await,
+        }
+    }
+
     async fn put_stream(
         &self,
         content_type: &str,
@@ -498,6 +515,21 @@ async fn put_file<T: StorageRequestTransport>(
     content_type: &str,
     path: &Path,
 ) -> Result<String, String> {
+    put_file_inner(transport, MEDIA_KEY_PREFIX, content_type, path, true).await
+}
+
+async fn put_file_at<T: StorageRequestTransport>(
+    transport: &T, key: &str, content_type: &str, path: &Path,
+) -> Result<(), String> {
+    if key != "backups/site/latest.sqlite3.zst" {
+        return Err("unsupported explicit upload key".to_owned());
+    }
+    put_file_inner(transport, key, content_type, path, false).await.map(|_| ())
+}
+
+async fn put_file_inner<T: StorageRequestTransport>(
+    transport: &T, key: &str, content_type: &str, path: &Path, generate_key: bool,
+) -> Result<String, String> {
     let mut file = File::open(path).await.map_err(|error| error.to_string())?;
     let length = file
         .metadata()
@@ -506,12 +538,12 @@ async fn put_file<T: StorageRequestTransport>(
         .len();
     let request = storage_request(
         Method::PUT,
-        MEDIA_KEY_PREFIX,
+        key,
         None,
         Some(content_type),
         Some(length),
         false,
-        true,
+        generate_key,
         None,
     )?;
     let (response, mut send) = transport.start_request(request, false).await?;
@@ -556,7 +588,7 @@ async fn put_file<T: StorageRequestTransport>(
     if response.status() != StatusCode::OK {
         return Err(format!("storage upload failed with HTTP {}", response.status()));
     }
-    extract_generated_media_key(response.headers())
+    if generate_key { extract_generated_media_key(response.headers()) } else { Ok(key.to_owned()) }
 }
 
 async fn put_stream<T: StorageRequestTransport>(

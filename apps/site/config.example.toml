@@ -14,5 +14,8 @@ websocket_bind = "127.0.0.1:8081"
 initial_window_size = 524288
 initial_connection_window_size = 4194304
 
+[backup]
+daily_utc = "03:00"
+
 [logging]
 level = "info"

@@ -11,7 +11,7 @@ RUN BUILD_COMMIT="$BUILD_COMMIT" cargo build --locked --release -p journey-site
 
 FROM alpine:3.24
 
-RUN apk add --no-cache tzdata
+RUN apk add --no-cache tzdata zstd
 COPY --from=build /src/target/release/journey-site /usr/local/bin/journey-site
 
 USER 65532:65532

@@ -1,4 +1,5 @@
 mod auth;
+mod backup;
 mod config;
 mod control;
 mod db;
@@ -42,6 +43,7 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
+    Backup { #[command(subcommand)] command: BackupCommands },
     Import(ImportArgs),
     Performance {
         #[command(subcommand)]
@@ -61,6 +63,13 @@ enum Commands {
         command: ShareLinkCommands,
     },
     Serve(ServeArgs),
+}
+
+#[derive(Subcommand)]
+enum BackupCommands {
+    Create,
+    RestoreCheck { output_db: PathBuf },
+    VerifyFile { input_zst: PathBuf, output_db: PathBuf },
 }
 
 #[derive(Subcommand)]
@@ -158,10 +167,23 @@ async fn main() -> AppResult<()> {
         println!("journey-site {}", env!("JOURNEY_BINARY_VERSION"));
     }
 
+    if let Commands::Backup { command: BackupCommands::VerifyFile { input_zst, output_db } } = &command {
+        backup::verify_file(input_zst, output_db).await?;
+        println!("validated database: {}", output_db.display());
+        return Ok(());
+    }
     let config = config::AppConfig::load(config_path)?;
     journey_logging::initialize("journey-site", &config.logging)?;
     let database = Database::new(config.site.database_path.clone());
     match command {
+        Commands::Backup { command } => {
+            match command {
+                BackupCommands::Create => control::request_backup_create(&config.site.control_socket).await?,
+                BackupCommands::RestoreCheck { output_db } => control::request_backup_restore(&config.site.control_socket, &output_db).await?,
+                BackupCommands::VerifyFile { .. } => unreachable!(),
+            }
+            Ok(())
+        }
         Commands::Performance { command: PerformanceCommands::Urls } => {
             let urls = control::request_performance_urls(&config.site.control_socket).await?;
             println!("Site: {}", urls.site);
@@ -459,6 +481,8 @@ async fn main() -> AppResult<()> {
             }
             let control_database = database.clone();
             let control_storage = storage.clone();
+            let backup_jobs = backup::Jobs::default();
+            let control_backup_jobs = backup_jobs.clone();
             let control_shutdown = shutdown.clone();
             let performance_token = config.diagnostics.enabled.then(auth::new_session_token);
             let local_origin = if listener_address.ip().is_unspecified() {
@@ -479,7 +503,26 @@ async fn main() -> AppResult<()> {
                 origin: config.site.public_origin.clone().unwrap_or(local_origin),
             };
             listener_tasks.spawn(async move {
-                control::serve(control_listener, control_database, control_storage, performance_settings, control_shutdown).await
+                control::serve(control_listener, control_database, control_storage, control_backup_jobs, performance_settings, control_shutdown).await
+            });
+
+            let backup_storage = storage.clone();
+            let backup_database = config.site.database_path.clone();
+            let backup_daily = backup::parse_daily(&config.backup.daily_utc)? as u64;
+            let mut backup_shutdown = shutdown.clone();
+            listener_tasks.spawn(async move {
+                loop {
+                    let now = SystemTime::now().duration_since(UNIX_EPOCH).map_err(std::io::Error::other)?.as_secs();
+                    let next = backup::next_daily(now, backup_daily);
+                    tokio::select! {
+                        result = shutdown::requested(&mut backup_shutdown) => return result.map_err(std::io::Error::other),
+                        _ = tokio::time::sleep(Duration::from_secs(next - now)) => {
+                            if let Err(error) = backup::create(&backup_jobs, &backup_database, &backup_storage).await {
+                                log::error!("site_backup_failed key={} error={error}", backup::KEY);
+                            }
+                        }
+                    }
+                }
             });
 
             let mut app_state = web::state_with_security(database, storage.clone(), security);

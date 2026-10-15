@@ -71,6 +71,36 @@ and streams large upload and download bodies without buffering them to disk.
 Inner HTTP/2 stream and connection windows are configured to 32 MiB and 64 MiB
 on both ends of the session.
 
+## Database backup and restore
+
+The site creates one SQLite snapshot daily at `[backup] daily_utc = "03:00"`
+(UTC, 24-hour `HH:MM`). It validates and compresses the snapshot before
+uploading it to the private object key `backups/site/latest.sqlite3.zst`.
+Each successful upload replaces the previous backup. The object contains
+account and session data; protect storage access accordingly. The backup is
+compressed, not application-encrypted, and has no history or automatic restore.
+
+Create an additional backup through the running site's private control socket:
+
+    docker compose -f site-compose.yml exec site journey-site backup create
+
+Download and validate the current backup while the site runs. Choose a new,
+absolute path inside the container that the site user can write; the command
+refuses to replace an existing file:
+
+    docker compose -f site-compose.yml exec site journey-site backup restore-check /app/data/restored.sqlite3
+
+Stop the site before installing the validated database. Keep the existing
+database separately, then copy the restored file into the database path with
+the correct ownership and private permissions. Start the site and check its
+logs. Do not run the importer as a restore step.
+
+When the live site cannot start, download `backups/site/latest.sqlite3.zst`
+from home object storage using an operator's storage access, then run
+`journey-site backup verify-file <input.zst> <output-db>` in an environment
+with the site binary and `zstd` installed. This command needs no site
+configuration or live database and creates a validated private output file.
+
 ## Read and tune logs
 
 Follow the application logs from the site host:

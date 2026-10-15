@@ -281,6 +281,19 @@ AWS is the only database writer. The home copy is a backup and must never be tre
 
 ### Initial backup strategy
 
+The implemented first version creates a consistent snapshot with SQLite's
+Online Backup API, validates integrity, foreign keys, and schema version,
+compresses it with Zstandard, and atomically replaces
+`backups/site/latest.sqlite3.zst` in the home object store. It runs daily at a
+configured UTC time or through the private site control socket. Restore checks
+validate a downloaded copy and publish a new private file; installation is
+manual with the site stopped. The object contains account and session data.
+There is no application-level encryption, generation history, or automatic
+restore. Replacing the sole backup loses older states.
+
+The steps below describe a possible later strategy with generations and
+metadata; they are not part of the implemented first version.
+
 The first version deliberately transfers complete compressed snapshots instead of implementing incremental database synchronization:
 
 1. At a scheduled low-traffic time, AWS uses SQLite's Online Backup API to create a consistent temporary snapshot without copying the live database file directly.

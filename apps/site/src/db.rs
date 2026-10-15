@@ -99,7 +99,7 @@ CREATE TABLE IF NOT EXISTS login_throttles (
 );
 ";
 
-const CURRENT_SCHEMA_VERSION: i64 = 10;
+pub(crate) const CURRENT_SCHEMA_VERSION: i64 = 10;
 const REBUILD_DATABASE_MESSAGE: &str = "site database schema is outdated; recreate the SQLite database and run the destructive importer again";
 
 const SHARE_SCHEMA: &str = "\
@@ -362,6 +362,7 @@ pub struct ShareLinkView {
 }
 
 impl Database {
+    pub fn path(&self) -> &std::path::Path { &self.path }
     pub fn new(path: PathBuf) -> Self {
         Self { path: Arc::new(path) }
     }

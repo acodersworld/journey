@@ -10,6 +10,7 @@ use tokio::{
 };
 
 use crate::{
+    backup,
     db::Database,
     import::{self, ImportResult},
     performance,
@@ -22,6 +23,10 @@ type AppResult<T> = Result<T, Box<dyn Error + Send + Sync>>;
 #[derive(Serialize, Deserialize)]
 struct ControlRequest {
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    command: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    output_path: Option<PathBuf>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     manifest_path: Option<PathBuf>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     performance: Option<performance::Request>,
@@ -31,6 +36,8 @@ struct ControlRequest {
 
 #[derive(Serialize, Deserialize)]
 struct ControlResponse {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    backup: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     result: Option<ImportResult>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -144,6 +151,7 @@ pub async fn serve<S: StorageClient>(
     listener: UnixListener,
     database: Database,
     storage: S,
+    backup_jobs: backup::Jobs,
     performance_settings: PerformanceSettings,
     mut shutdown: shutdown::Receiver,
 ) -> std::io::Result<()> {
@@ -156,7 +164,7 @@ pub async fn serve<S: StorageClient>(
         };
         tokio::select! {
             biased;
-            result = handle(stream, &database, &storage, &performance_settings) => {
+            result = handle(stream, &database, &storage, &backup_jobs, &performance_settings) => {
                 if let Err(error) = result {
                     log::error!("site control request failed: {error}");
                 }
@@ -176,6 +184,7 @@ pub async fn request_import(manifest_path: &Path, socket_path: &Path) -> AppResu
         std::io::Error::other(format!("could not connect to running site at {}: {error}", socket_path.display()))
     })?;
     let request = serde_json::to_vec(&ControlRequest {
+        command: Some("import".to_owned()), output_path: None,
         manifest_path: Some(manifest_path.to_path_buf()),
         performance: None,
         performance_urls: None,
@@ -195,12 +204,40 @@ pub async fn request_import(manifest_path: &Path, socket_path: &Path) -> AppResu
     }
 }
 
+pub async fn request_backup_create(socket_path: &Path) -> AppResult<()> {
+    request_backup(socket_path, "backup_create", None).await
+}
+
+pub async fn request_backup_restore(socket_path: &Path, output: &Path) -> AppResult<()> {
+    if !output.is_absolute() { return Err("restore output must be an absolute container-visible path".into()); }
+    request_backup(socket_path, "backup_restore", Some(output)).await
+}
+
+async fn request_backup(socket_path: &Path, command: &str, output: Option<&Path>) -> AppResult<()> {
+    let mut stream = UnixStream::connect(socket_path).await?;
+    stream.write_all(&serde_json::to_vec(&ControlRequest {
+        command: Some(command.to_owned()), output_path: output.map(Path::to_path_buf),
+        manifest_path: None, performance: None, performance_urls: None,
+    })?).await?;
+    stream.write_all(b"\n").await?;
+    let mut line = String::new();
+    BufReader::new(stream).read_line(&mut line).await?;
+    if line.is_empty() { return Err("running site closed the control connection without a result".into()); }
+    let response: ControlResponse = serde_json::from_str(&line)?;
+    match (response.backup, response.error) {
+        (Some(true), None) => Ok(()),
+        (_, Some(error)) => Err(error.into()),
+        _ => Err("running site returned an invalid backup response".into()),
+    }
+}
+
 pub async fn request_performance(
     request: performance::Request,
     socket_path: &Path,
 ) -> AppResult<performance::Result> {
     let mut stream = UnixStream::connect(socket_path).await?;
     stream.write_all(&serde_json::to_vec(&ControlRequest {
+        command: Some("performance".to_owned()), output_path: None,
         manifest_path: None, performance: Some(request), performance_urls: None,
     })?).await?;
     stream.write_all(b"\n").await?;
@@ -220,6 +257,7 @@ pub async fn request_performance(
 pub async fn request_performance_urls(socket_path: &Path) -> AppResult<PerformanceUrls> {
     let mut stream = UnixStream::connect(socket_path).await?;
     stream.write_all(&serde_json::to_vec(&ControlRequest {
+        command: Some("performance_urls".to_owned()), output_path: None,
         manifest_path: None, performance: None, performance_urls: Some(true),
     })?).await?;
     stream.write_all(b"\n").await?;
@@ -240,6 +278,7 @@ async fn handle<S: StorageClient>(
     stream: UnixStream,
     database: &Database,
     storage: &S,
+    backup_jobs: &backup::Jobs,
     performance_settings: &PerformanceSettings,
 ) -> AppResult<()> {
     let mut reader = BufReader::new(stream);
@@ -247,12 +286,29 @@ async fn handle<S: StorageClient>(
     reader.read_line(&mut request_line).await?;
     let result: AppResult<ControlResponse> = async {
         let request = serde_json::from_str::<ControlRequest>(&request_line)?;
+        if let Some(command) = request.command.as_deref() {
+            match command {
+                "backup_create" => {
+                    if request.output_path.is_some() || request.manifest_path.is_some() || request.performance.is_some() || request.performance_urls.is_some() { return Err("invalid backup request".into()); }
+                    backup::create(backup_jobs, database.path(), storage).await.map_err(|error| format!("backup create key={} failed: {error}", backup::KEY))?;
+                    return Ok(ControlResponse { backup: Some(true), result: None, performance: None, performance_urls: None, error: None });
+                }
+                "backup_restore" => {
+                    let output = request.output_path.as_deref().ok_or("missing restore output path")?;
+                    if request.manifest_path.is_some() || request.performance.is_some() || request.performance_urls.is_some() { return Err("invalid backup request".into()); }
+                    backup::restore_check(backup_jobs, storage, output).await.map_err(|error| format!("backup restore-check key={} failed: {error}", backup::KEY))?;
+                    return Ok(ControlResponse { backup: Some(true), result: None, performance: None, performance_urls: None, error: None });
+                }
+                "import" | "performance" | "performance_urls" => {}
+                _ => return Err("unknown control command".into()),
+            }
+        }
         if request.performance_urls == Some(true) {
             if request.manifest_path.is_some() || request.performance.is_some() {
                 return Err("control request must select one command".into());
             }
             let urls = performance_settings.urls()?;
-            return Ok(ControlResponse { result: None, performance: None, performance_urls: Some(urls), error: None });
+            return Ok(ControlResponse { backup: None, result: None, performance: None, performance_urls: Some(urls), error: None });
         }
         if let Some(performance_request) = request.performance {
             if request.manifest_path.is_some() {
@@ -265,7 +321,7 @@ async fn handle<S: StorageClient>(
                 performance_settings.transport.clone(),
                 performance_settings.initial_stream_window_size,
                 performance_settings.initial_connection_window_size).await?;
-            return Ok(ControlResponse { result: None, performance: Some(result), performance_urls: None, error: None });
+            return Ok(ControlResponse { backup: None, result: None, performance: Some(result), performance_urls: None, error: None });
         }
         let manifest_path = request.manifest_path.ok_or("control request is missing a command")?;
         if !manifest_path.is_absolute() {
@@ -273,12 +329,12 @@ async fn handle<S: StorageClient>(
         }
         let prepared = import::prepare_manifest(&manifest_path).await?;
         let result = import::apply_import(prepared, database, storage).await?;
-        Ok(ControlResponse { result: Some(result), performance: None, performance_urls: None, error: None })
+        Ok(ControlResponse { backup: None, result: Some(result), performance: None, performance_urls: None, error: None })
     }
     .await;
     let response = match result {
         Ok(result) => result,
-        Err(error) => ControlResponse { result: None, performance: None, performance_urls: None, error: Some(error.to_string()) },
+        Err(error) => ControlResponse { backup: None, result: None, performance: None, performance_urls: None, error: Some(error.to_string()) },
     };
     let mut stream = reader.into_inner();
     stream.write_all(&serde_json::to_vec(&response)?).await?;
@@ -309,7 +365,7 @@ mod tests {
         let request: ControlRequest = serde_json::from_str(r#"{"manifest_path":"/tmp/import.json"}"#).unwrap();
         assert_eq!(request.manifest_path.as_deref(), Some(Path::new("/tmp/import.json")));
         assert!(request.performance.is_none());
-        let request = ControlRequest { manifest_path: Some(PathBuf::from("/tmp/import.json")), performance: None, performance_urls: None };
+        let request = ControlRequest { command: None, output_path: None, manifest_path: Some(PathBuf::from("/tmp/import.json")), performance: None, performance_urls: None };
         assert_eq!(serde_json::to_string(&request).unwrap(), r#"{"manifest_path":"/tmp/import.json"}"#);
     }
 

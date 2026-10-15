@@ -11,6 +11,8 @@ use crate::control;
 #[serde(default, deny_unknown_fields)]
 pub struct AppConfig {
     #[serde(default)]
+    pub backup: BackupSettings,
+    #[serde(default)]
     pub diagnostics: DiagnosticsSettings,
     #[serde(default)]
     pub site: SiteSettings,
@@ -18,6 +20,14 @@ pub struct AppConfig {
     pub storage: StorageSettings,
     #[serde(default)]
     pub logging: journey_logging::LoggingSettings,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct BackupSettings { pub daily_utc: String }
+
+impl Default for BackupSettings {
+    fn default() -> Self { Self { daily_utc: "03:00".to_owned() } }
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -53,6 +63,7 @@ pub struct StorageSettings {
 impl Default for AppConfig {
     fn default() -> Self {
         Self {
+            backup: BackupSettings::default(),
             diagnostics: DiagnosticsSettings::default(),
             site: SiteSettings::default(),
             storage: StorageSettings::default(),
@@ -100,6 +111,7 @@ impl AppConfig {
         let mut config: Self = toml::from_str(&contents).map_err(|error| {
             format!("could not parse TOML configuration file {}: {error}", path.display())
         })?;
+        crate::backup::parse_daily(&config.backup.daily_utc)?;
         let base = path
             .parent()
             .filter(|parent| !parent.as_os_str().is_empty())
