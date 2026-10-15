@@ -37,6 +37,7 @@ pub struct AppState<S: StorageClient> {
     storage: S,
     security: SiteSecurity,
     preview_image_authorizations: whatsapp_preview::PreviewImageAuthorizations,
+    image_cache: Option<std::sync::Arc<crate::image_cache::ImageCache>>,
     performance: Option<std::sync::Arc<journey_performance::Sample>>,
     performance_token: Option<String>,
 }
@@ -584,6 +585,7 @@ async fn shared_media<S: StorageClient>(
         }
     };
     no_store(proxy_media(
+        state.image_cache.as_ref(),
         &state.storage,
         media,
         method,
@@ -2875,6 +2877,7 @@ async fn media<S: StorageClient>(
         }
     };
     proxy_media(
+        state.image_cache.as_ref(),
         &state.storage,
         media,
         method,
@@ -2894,6 +2897,7 @@ fn has_query_flag(query: Option<&str>, name: &str) -> bool {
 }
 
 async fn proxy_media<S: StorageClient>(
+    image_cache: Option<&std::sync::Arc<crate::image_cache::ImageCache>>,
     storage: &S,
     media: MediaReference,
     method: Method,
@@ -2923,6 +2927,37 @@ async fn proxy_media<S: StorageClient>(
         None
     };
 
+    let cache_identity = if thumbnail {
+        Some(crate::image_cache::Identity::thumbnail(&media.storage_key))
+    } else if is_media_type(&media.content_type, "image/") {
+        Some(crate::image_cache::Identity::original(&media.storage_key))
+    } else {
+        None
+    };
+    let fill_generation = match (image_cache, cache_identity.as_ref()) {
+        (Some(image_cache), Some(identity)) => Some(image_cache.fill_generation(identity)),
+        _ => None,
+    };
+    if let (Some(image_cache), Some(identity)) = (image_cache, cache_identity.as_ref()) {
+        if let Some(hit) = image_cache.lookup(identity, head).await {
+            let mut builder = Response::builder()
+                .status(StatusCode::OK)
+                .header(header::CONTENT_TYPE, hit.content_type)
+                .header(header::X_CONTENT_TYPE_OPTIONS, "nosniff")
+                .header(header::CONTENT_LENGTH, hit.payload_length);
+            if download {
+                builder = builder.header(header::CONTENT_DISPOSITION, media_download_disposition(&media.content_type, block_id));
+            }
+            if !thumbnail {
+                builder = builder.header(header::ACCEPT_RANGES, "bytes");
+            }
+            if head {
+                return builder.body(Body::empty()).unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response());
+            }
+            return builder.body(Body::from_stream(hit.body)).unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response());
+        }
+    }
+
     let stored = match storage.get(&media.storage_key, range, head, thumbnail).await {
         Ok(stored) => stored,
         Err(error) => {
@@ -2940,18 +2975,7 @@ async fn proxy_media<S: StorageClient>(
         .header(header::CONTENT_TYPE, response_content_type)
         .header(header::X_CONTENT_TYPE_OPTIONS, "nosniff");
     if download {
-        let extension = match media.content_type.as_str() {
-            "image/jpeg" => "jpg",
-            "image/png" => "png",
-            "image/webp" => "webp",
-            "image/gif" => "gif",
-            "image/heic" => "heic",
-            "image/heif" => "heif",
-            "video/mp4" => "mp4",
-            "video/quicktime" => "mov",
-            _ => "bin",
-        };
-        builder = builder.header(header::CONTENT_DISPOSITION, format!("attachment; filename=\"media-{block_id}.{extension}\""));
+        builder = builder.header(header::CONTENT_DISPOSITION, media_download_disposition(&media.content_type, block_id));
     }
     if let Some(value) = stored.headers.get(header::CONTENT_LENGTH) {
         builder = builder.header(header::CONTENT_LENGTH, value);
@@ -2968,10 +2992,33 @@ async fn proxy_media<S: StorageClient>(
             StatusCode::INTERNAL_SERVER_ERROR.into_response()
         });
     }
-    let body = Body::from_stream(stored.body);
+    let mut stored_body = stored.body;
+    if let (Some(image_cache), Some(identity), Some(generation)) = (image_cache, cache_identity, fill_generation) {
+        let content_type = stored.headers.get(header::CONTENT_TYPE).cloned();
+        let content_length = stored.headers.get(header::CONTENT_LENGTH)
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.parse::<u64>().ok());
+        stored_body = image_cache.cache_body(identity, generation, stored.status, content_type.as_ref(), content_length, stored_body).await;
+    }
+    let body = Body::from_stream(stored_body);
     builder.body(body).unwrap_or_else(|_| {
         StatusCode::INTERNAL_SERVER_ERROR.into_response()
     })
+}
+
+fn media_download_disposition(content_type: &str, block_id: i64) -> String {
+    let extension = match content_type {
+        "image/jpeg" => "jpg",
+        "image/png" => "png",
+        "image/webp" => "webp",
+        "image/gif" => "gif",
+        "image/heic" => "heic",
+        "image/heif" => "heif",
+        "video/mp4" => "mp4",
+        "video/quicktime" => "mov",
+        _ => "bin",
+    };
+    format!("attachment; filename=\"media-{block_id}.{extension}\"")
 }
 
 #[cfg(test)]
@@ -2979,6 +3026,7 @@ pub fn state<S: StorageClient>(database: Database, storage: S) -> AppState<S> {
     AppState {
         database,
         storage,
+        image_cache: None,
         preview_image_authorizations: whatsapp_preview::PreviewImageAuthorizations::default(),
         performance: None,
         performance_token: None,
@@ -3002,12 +3050,18 @@ pub fn state_with_security<S: StorageClient>(
         storage,
         security,
         preview_image_authorizations: whatsapp_preview::PreviewImageAuthorizations::default(),
+        image_cache: None,
         performance: None,
         performance_token: None,
     }
 }
 
 impl<S: StorageClient> AppState<S> {
+    pub fn with_image_cache(mut self, image_cache: std::sync::Arc<crate::image_cache::ImageCache>) -> Self {
+        self.image_cache = Some(image_cache);
+        self
+    }
+
     pub fn with_performance(mut self, sample: std::sync::Arc<journey_performance::Sample>, token: String) -> Self {
         self.performance = Some(sample);
         self.performance_token = Some(token);
@@ -3019,7 +3073,9 @@ impl<S: StorageClient> AppState<S> {
 mod tests {
     use std::{
         net::{IpAddr, Ipv4Addr, SocketAddr},
+        os::unix::fs::PermissionsExt,
         path::{Path, PathBuf},
+        sync::{Arc, atomic::{AtomicUsize, Ordering}},
         time::{Duration, SystemTime, UNIX_EPOCH},
     };
 
@@ -3033,8 +3089,10 @@ mod tests {
     use crate::{
         auth,
         db::{AccountRole, Database, NewPost, Post, PostAccess, PostBlock, PostSummary, ShareAccess, SidebarData},
+        image_cache::{ByteLimit, ImageCache, Settings as ImageCacheSettings},
         storage::{StorageBody, StorageClient, StorageResponse},
     };
+    use bytes::Bytes;
     use axum::{
         body::{to_bytes, Body},
         extract::{ConnectInfo, Extension, Query, State},
@@ -3072,6 +3130,58 @@ mod tests {
         }
     }
 
+    #[derive(Clone)]
+    struct CountingStorage {
+        get_calls: Arc<AtomicUsize>,
+    }
+
+    impl StorageClient for CountingStorage {
+        async fn put_file(&self, _content_type: &str, _path: &Path) -> Result<String, String> {
+            unreachable!()
+        }
+
+        async fn put_stream(
+            &self,
+            _content_type: &str,
+            _content_length: Option<u64>,
+            _body: StorageBody,
+            _max_bytes: u64,
+        ) -> Result<(String, u64), String> {
+            unreachable!()
+        }
+
+        async fn get(
+            &self,
+            key: &str,
+            range: Option<&str>,
+            head: bool,
+            thumbnail: bool,
+        ) -> Result<StorageResponse, String> {
+            self.get_calls.fetch_add(1, Ordering::Relaxed);
+            let is_video = key == "media/video" && !thumbnail;
+            let is_large = key == "media/large";
+            let payload: &'static [u8] = if is_large { b"12345678" } else { b"data" };
+            let content_type = if is_video { "video/mp4" } else if key == "media/head" { "image/png" } else { "image/jpeg" };
+            let mut headers = http::HeaderMap::new();
+            headers.insert(header::CONTENT_TYPE, http::HeaderValue::from_static(content_type));
+            headers.insert(header::CONTENT_LENGTH, http::HeaderValue::from_str(&payload.len().to_string()).unwrap());
+            headers.insert(header::ACCEPT_RANGES, http::HeaderValue::from_static("bytes"));
+            if range.is_some() {
+                headers.insert(header::CONTENT_RANGE, http::HeaderValue::from_static("bytes 0-3/8"));
+            }
+            let body: StorageBody = if head {
+                Box::pin(futures_util::stream::empty())
+            } else {
+                Box::pin(futures_util::stream::iter([Ok::<_, std::io::Error>(Bytes::from_static(payload))]))
+            };
+            Ok(StorageResponse {
+                status: if range.is_some() { StatusCode::PARTIAL_CONTENT } else { StatusCode::OK },
+                headers,
+                body,
+            })
+        }
+    }
+
     async fn get_route(app: &axum::Router, target: &str) -> Response {
         app.clone()
             .oneshot(
@@ -3082,6 +3192,127 @@ mod tests {
             )
             .await
             .unwrap()
+    }
+
+    #[tokio::test]
+    async fn media_cache_hits_follow_authorization_and_preserve_media_request_headers() {
+        let nonce = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+        let directory = std::env::temp_dir().join(format!("journey-site-image-cache-{}-{nonce}", std::process::id()));
+        std::fs::create_dir_all(&directory).unwrap();
+        std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let database_path = directory.join("site.sqlite3");
+        let database = Database::new(database_path.clone());
+        database.initialize().await.unwrap();
+        database.create_account("reader-one".to_owned(), AccountRole::Read, "test-hash".to_owned()).await.unwrap();
+        let account = database.login_account("reader-one".to_owned()).await.unwrap().unwrap();
+        let now = super::unix_time();
+        let token = auth::new_session_token();
+        database.issue_session(account.id, auth::session_token_digest(&token), now, now + Duration::from_secs(3600)).await.unwrap();
+        let connection = Connection::open(&database_path).unwrap();
+        connection.execute_batch(
+            "INSERT INTO media_assets (storage_key, content_type, size_bytes) VALUES\
+                ('media/image', 'image/jpeg', 4),\
+                ('media/head', 'image/png', 4),\
+                ('media/video', 'video/mp4', 8),\
+                ('media/large', 'image/png', 8);\
+             INSERT INTO posts (id, author_id, title, published_at, summary, published)\
+                VALUES (1, 1, 'Media', 1, '', 1);\
+             INSERT INTO post_blocks (id, post_id, parent_id, position) VALUES (1, 1, NULL, 0);\
+             INSERT INTO post_blocks (id, post_id, parent_id, position, storage_key) VALUES\
+                (2, 1, 1, 0, 'media/image'),\
+                (3, 1, 1, 1, 'media/image'),\
+                (4, 1, 1, 2, 'media/head'),\
+                (5, 1, 1, 3, 'media/video'),\
+                (6, 1, 1, 4, 'media/large');",
+        ).unwrap();
+        drop(connection);
+
+        let cache_settings = ImageCacheSettings {
+            enabled: true,
+            directory: Some(directory.join("image-cache")),
+            max_bytes: ByteLimit(64),
+            max_entry_bytes: ByteLimit(4),
+            max_concurrent_fills: 2,
+            recent_post_count: 5,
+            eviction_interval: "1h".to_owned(),
+            eviction_target_percent: 90,
+            access_timestamp_interval: "1m".to_owned(),
+        };
+        let cache = ImageCache::open(&cache_settings).await.unwrap();
+        let storage = CountingStorage { get_calls: Arc::new(AtomicUsize::new(0)) };
+        let get_calls = Arc::clone(&storage.get_calls);
+        let cookie = format!("journey_session={token}");
+        let app = router(state(database, storage).with_image_cache(cache.clone()));
+
+        async fn media_request(
+            app: &axum::Router,
+            method: &str,
+            target: &str,
+            cookie: Option<&str>,
+            range: Option<&str>,
+        ) -> Response {
+            let mut builder = Request::builder().method(method).uri(target);
+            if let Some(cookie) = cookie { builder = builder.header(header::COOKIE, cookie); }
+            if let Some(range) = range { builder = builder.header(header::RANGE, range); }
+            app.clone().oneshot(builder.body(Body::empty()).unwrap()).await.unwrap()
+        }
+
+        let unauthorized = media_request(&app, "GET", "/posts/1/blocks/2/media", None, None).await;
+        assert_eq!(unauthorized.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(get_calls.load(Ordering::Relaxed), 0);
+
+        let first = media_request(&app, "GET", "/posts/1/blocks/2/media", Some(&cookie), None).await;
+        assert_eq!(first.status(), StatusCode::OK);
+        assert_eq!(to_bytes(first.into_body(), usize::MAX).await.unwrap(), "data");
+        assert_eq!(get_calls.load(Ordering::Relaxed), 1);
+
+        let reused = media_request(&app, "GET", "/posts/1/blocks/3/media?download=1", Some(&cookie), None).await;
+        assert_eq!(reused.headers()[header::CONTENT_DISPOSITION], "attachment; filename=\"media-3.jpg\"");
+        assert_eq!(to_bytes(reused.into_body(), usize::MAX).await.unwrap(), "data");
+        assert_eq!(get_calls.load(Ordering::Relaxed), 1);
+
+        let cached_head = media_request(&app, "HEAD", "/posts/1/blocks/3/media", Some(&cookie), None).await;
+        assert_eq!(cached_head.headers()[header::CONTENT_LENGTH], "4");
+        assert!(to_bytes(cached_head.into_body(), usize::MAX).await.unwrap().is_empty());
+        assert_eq!(get_calls.load(Ordering::Relaxed), 1);
+
+        let head_miss = media_request(&app, "HEAD", "/posts/1/blocks/4/media", Some(&cookie), None).await;
+        assert_eq!(head_miss.headers()[header::CONTENT_LENGTH], "4");
+        assert_eq!(get_calls.load(Ordering::Relaxed), 2);
+        let first_after_head = media_request(&app, "GET", "/posts/1/blocks/4/media", Some(&cookie), None).await;
+        assert_eq!(to_bytes(first_after_head.into_body(), usize::MAX).await.unwrap(), "data");
+        assert_eq!(get_calls.load(Ordering::Relaxed), 3);
+
+        for _ in 0..2 {
+            let video = media_request(&app, "GET", "/posts/1/blocks/5/media", Some(&cookie), None).await;
+            assert_eq!(to_bytes(video.into_body(), usize::MAX).await.unwrap(), "data");
+        }
+        assert_eq!(get_calls.load(Ordering::Relaxed), 5);
+        for _ in 0..2 {
+            let partial = media_request(&app, "GET", "/posts/1/blocks/5/media", Some(&cookie), Some("bytes=0-3")).await;
+            assert_eq!(partial.status(), StatusCode::PARTIAL_CONTENT);
+            let _ = to_bytes(partial.into_body(), usize::MAX).await.unwrap();
+        }
+        assert_eq!(get_calls.load(Ordering::Relaxed), 7);
+
+        let thumbnail = media_request(&app, "GET", "/posts/1/blocks/5/media?thumbnail=1", Some(&cookie), None).await;
+        assert_eq!(to_bytes(thumbnail.into_body(), usize::MAX).await.unwrap(), "data");
+        let thumbnail_hit = media_request(&app, "GET", "/posts/1/blocks/5/media?thumbnail=1", Some(&cookie), None).await;
+        assert_eq!(to_bytes(thumbnail_hit.into_body(), usize::MAX).await.unwrap(), "data");
+        assert_eq!(get_calls.load(Ordering::Relaxed), 8);
+
+        for _ in 0..2 {
+            let oversized = media_request(&app, "GET", "/posts/1/blocks/6/media", Some(&cookie), None).await;
+            assert_eq!(to_bytes(oversized.into_body(), usize::MAX).await.unwrap(), "12345678");
+        }
+        assert_eq!(get_calls.load(Ordering::Relaxed), 10);
+        let unauthorized_cached = media_request(&app, "GET", "/posts/1/blocks/2/media", None, None).await;
+        assert_eq!(unauthorized_cached.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(get_calls.load(Ordering::Relaxed), 10);
+
+        drop(app);
+        drop(cache);
+        std::fs::remove_dir_all(directory).unwrap();
     }
 
     #[tokio::test]

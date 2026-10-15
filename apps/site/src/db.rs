@@ -1455,6 +1455,26 @@ impl Database {
         .await
     }
 
+    pub async fn recent_published_media_keys(&self, limit: usize) -> Result<Vec<String>, String> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let limit = i64::try_from(limit).unwrap_or(i64::MAX);
+        self.run(move |connection| {
+            let mut statement = connection.prepare(
+                "SELECT DISTINCT b.storage_key FROM posts AS p \
+                 JOIN post_blocks AS b ON b.post_id = p.id \
+                 WHERE p.published = 1 AND p.id IN (\
+                     SELECT id FROM posts WHERE published = 1 \
+                     ORDER BY published_at DESC, id DESC LIMIT ?1\
+                 ) AND b.storage_key IS NOT NULL",
+            )?;
+            let rows = statement.query_map([limit], |row| row.get(0))?;
+            rows.collect()
+        })
+        .await
+    }
+
     pub async fn drafts(&self, author_username: Option<String>) -> Result<Vec<PostSummary>, String> {
         self.run(move |connection| {
             let mut statement = connection.prepare(

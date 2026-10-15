@@ -227,10 +227,32 @@ pub(super) async fn image<S: StorageClient>(
         Some(WHATSAPP_PREVIEW_IMAGE_MAX_BYTES),
     ).expect("WhatsApp preview image reduction options are valid");
     let head = method == Method::HEAD;
+    let video_thumbnail = is_media_type(&media.content_type, "video/");
+    let cache_identity = crate::image_cache::Identity::reduced_image(
+        &media.storage_key,
+        WHATSAPP_PREVIEW_IMAGE_MAX_EDGE,
+        Some(WHATSAPP_PREVIEW_IMAGE_MAX_BYTES),
+        video_thumbnail,
+    );
+    let fill_generation = state.image_cache.as_ref().map(|cache| cache.fill_generation(&cache_identity));
+    if let Some(image_cache) = &state.image_cache {
+        if let Some(hit) = image_cache.lookup(&cache_identity, head).await {
+            if hit.content_type == "image/jpeg" && (1..=WHATSAPP_PREVIEW_IMAGE_MAX_BYTES).contains(&hit.payload_length) {
+                let response = Response::builder()
+                    .status(StatusCode::OK)
+                    .header(header::CONTENT_TYPE, "image/jpeg")
+                    .header(header::X_CONTENT_TYPE_OPTIONS, "nosniff")
+                    .header(header::CONTENT_LENGTH, hit.payload_length)
+                    .body(if head { Body::empty() } else { Body::from_stream(hit.body) })
+                    .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response());
+                return no_store(response);
+            }
+        }
+    }
     let stored = match state.storage.get_reduced_image(
         &media.storage_key,
         options,
-        is_media_type(&media.content_type, "video/"),
+        video_thumbnail,
         head,
     ).await {
         Ok(stored) if stored.status == StatusCode::OK => stored,
@@ -320,6 +342,19 @@ pub(super) async fn image<S: StorageClient>(
                 Err(error)
             }
         });
+        let body: crate::storage::StorageBody = Box::pin(body);
+        let body = if let Some(image_cache) = &state.image_cache {
+            image_cache.cache_body(
+                cache_identity,
+                fill_generation.expect("cache fill generation exists when image cache is enabled"),
+                stored.status,
+                Some(&http::HeaderValue::from_static("image/jpeg")),
+                Some(content_length),
+                body,
+            ).await
+        } else {
+            body
+        };
         Body::from_stream(body)
     };
     no_store(builder.body(body).unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response()))
@@ -454,6 +489,7 @@ mod tests {
     use crate::{
         auth,
         db::{AccountRole, Database, ImportedAccount, NewBlock, NewPost, ShareAccess},
+        image_cache::{ByteLimit, ImageCache, Settings as ImageCacheSettings},
         storage::{ImageReductionOptions, StorageBody, StorageClient, StorageResponse},
         web::{self, router},
     };
@@ -743,6 +779,19 @@ mod tests {
             }],
         ).await.unwrap();
         let storage = PreviewStorage::new(Bytes::from_static(b"jpeg"), Some(4));
+        let cache_directory = path.with_extension("image-cache");
+        let cache_settings = ImageCacheSettings {
+            enabled: true,
+            directory: Some(cache_directory.clone()),
+            max_bytes: ByteLimit(4 * 1024 * 1024),
+            max_entry_bytes: ByteLimit(1024 * 1024),
+            max_concurrent_fills: 4,
+            recent_post_count: 5,
+            eviction_interval: "1h".to_owned(),
+            eviction_target_percent: 90,
+            access_timestamp_interval: "1m".to_owned(),
+        };
+        let cache = ImageCache::open(&cache_settings).await.unwrap();
         let security = web::SiteSecurity::from_config(
             SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 3000),
             Some("https://journey.example"),
@@ -751,7 +800,8 @@ mod tests {
             10,
             false,
         ).unwrap();
-        let state = web::state_with_security(database.clone(), storage.clone(), security.clone());
+        let state = web::state_with_security(database.clone(), storage.clone(), security.clone())
+            .with_image_cache(cache.clone());
         let app = router(state.clone());
         let now = web::unix_time();
         let (photo_link_id, photo_secret) = create_link(&database, 1, now).await;
@@ -799,6 +849,7 @@ mod tests {
         assert_eq!(photo_image.headers().get(header::CACHE_CONTROL).unwrap(), "private, no-store");
         assert!(photo_image.headers().get(header::SET_COOKIE).is_none());
         assert_eq!(to_bytes(photo_image.into_body(), usize::MAX).await.unwrap(), Bytes::from_static(b"jpeg"));
+        assert_eq!(storage.requests.lock().unwrap().len(), 1);
         let restarted_state = web::state_with_security(database.clone(), storage.clone(), security.clone());
         assert_eq!(restarted_state.preview_image_authorizations.len(), 0);
         let restarted_app = router(restarted_state);
@@ -828,6 +879,7 @@ mod tests {
         let retry = get_route(&app, photo_image_path).await;
         assert_eq!(retry.status(), StatusCode::OK);
         let _ = to_bytes(retry.into_body(), usize::MAX).await.unwrap();
+        assert_eq!(storage.requests.lock().unwrap().len(), 1);
         assert_eq!(state.preview_image_authorizations.expires_at(&photo_link_id, &photo_digest), Some(photo_deadline));
         state.preview_image_authorizations.set_expiry(&photo_link_id, &photo_digest, Instant::now());
         assert_eq!(get_route(&app, photo_image_path).await.status(), StatusCode::NOT_FOUND);
@@ -839,6 +891,10 @@ mod tests {
         let repeated_image_path = image_url(&repeated_html).strip_prefix("https://journey.example").unwrap().to_owned();
         assert_ne!(repeated_image_path, photo_image_path);
         assert_eq!(state.preview_image_authorizations.len(), 1);
+        let repeated_image = get_route(&app, &repeated_image_path).await;
+        assert_eq!(repeated_image.headers().get(header::CACHE_CONTROL).unwrap(), "private, no-store");
+        assert_eq!(to_bytes(repeated_image.into_body(), usize::MAX).await.unwrap(), Bytes::from_static(b"jpeg"));
+        assert_eq!(storage.requests.lock().unwrap().len(), 1);
 
         let (short_link_id, short_secret) = create_link(
             &database,
@@ -874,7 +930,11 @@ mod tests {
         let video_image = get_route(&app, &video_image_path).await;
         assert_eq!(video_image.status(), StatusCode::OK);
         let _ = to_bytes(video_image.into_body(), usize::MAX).await.unwrap();
+        let video_image_hit = get_route(&app, &video_image_path).await;
+        assert_eq!(video_image_hit.status(), StatusCode::OK);
+        let _ = to_bytes(video_image_hit.into_body(), usize::MAX).await.unwrap();
         let requests = storage.requests.lock().unwrap().clone();
+        assert_eq!(requests.iter().filter(|request| request.0 == "media/first-video").count(), 1);
         let video_request = requests.iter().find(|request| request.0 == "media/first-video").unwrap();
         assert!(video_request.1);
         let connection = Connection::open(&path).unwrap();
@@ -895,6 +955,7 @@ mod tests {
         let oversized_html = String::from_utf8(oversized_body.to_vec()).unwrap();
         let oversized_image_path = image_url(&oversized_html).strip_prefix("https://journey.example").unwrap().to_owned();
         let oversized_storage = PreviewStorage::new(Bytes::from_static(b"jpeg"), Some(600_000));
+        cache.clear(Some("media/first-photo")).await.unwrap();
         let mut oversized_state = state.clone();
         oversized_state.storage = oversized_storage;
         let oversized_app = router(oversized_state);
@@ -906,6 +967,7 @@ mod tests {
             Bytes::from(vec![b'x'; 600_000]),
             Some(1),
         );
+        cache.clear(Some("media/first-photo")).await.unwrap();
         let mut streamed_oversized_state = state.clone();
         streamed_oversized_state.storage = streamed_oversized_storage;
         let streamed_oversized_app = router(streamed_oversized_state);
@@ -942,6 +1004,13 @@ mod tests {
         drop(connection);
         assert_eq!(get_route(&app, &unpublished_image_path).await.status(), StatusCode::NOT_FOUND);
 
+        drop(app);
+        drop(restarted_app);
+        drop(oversized_app);
+        drop(streamed_oversized_app);
+        drop(state);
+        drop(cache);
         std::fs::remove_file(path).unwrap();
+        std::fs::remove_dir_all(cache_directory).unwrap();
     }
 }

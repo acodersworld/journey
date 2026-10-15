@@ -15,9 +15,10 @@ remain read-only. Its server-rendered sign-in page, feed, editor, and sidebar
 are described in the
 [implemented website design](website-post-backend.md). References below to a
 public post feed or public-media cache describe earlier or possible future
-architecture, not anonymous access in the current site. The media cache in
-this draft is not implemented. WebSocket storage currently has a disposable
-two-host LAN integration described in
+architecture, not anonymous access in the current site. The public media cache
+proposed here is not implemented; the current optional site image cache is
+documented in [Website image disk cache](website-image-cache.md). WebSocket
+storage currently has a disposable two-host LAN integration described in
 [`two-host-lan-integration.md`](two-host-lan-integration.md); it uses plaintext
 HTTP and WS and is not a production transport.
 

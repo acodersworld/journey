@@ -32,19 +32,62 @@ struct ControlRequest {
     performance: Option<performance::Request>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     performance_urls: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    cache_key: Option<String>,
 }
 
-#[derive(Serialize, Deserialize)]
-struct ControlResponse {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+#[derive(Serialize)]
+#[serde(untagged)]
+enum ControlResponse {
+    Backup { backup: bool },
+    Import { result: ImportResult },
+    Performance { performance: performance::Result },
+    PerformanceUrls { performance_urls: PerformanceUrls },
+    ImageCacheCleared { image_cache_cleared: usize },
+    Error { error: String },
+}
+
+#[derive(Deserialize)]
+struct ControlResponseFields {
+    #[serde(default)]
     backup: Option<bool>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
     result: Option<ImportResult>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
     performance: Option<performance::Result>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
     performance_urls: Option<PerformanceUrls>,
+    #[serde(default)]
+    image_cache_cleared: Option<usize>,
+    #[serde(default)]
     error: Option<String>,
+}
+
+impl<'de> Deserialize<'de> for ControlResponse {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        use serde::de::Error as _;
+
+        let fields = ControlResponseFields::deserialize(deserializer)?;
+        match (
+            fields.backup,
+            fields.result,
+            fields.performance,
+            fields.performance_urls,
+            fields.image_cache_cleared,
+            fields.error,
+        ) {
+            (Some(backup), None, None, None, None, None) => Ok(Self::Backup { backup }),
+            (None, Some(result), None, None, None, None) => Ok(Self::Import { result }),
+            (None, None, Some(performance), None, None, None) => Ok(Self::Performance { performance }),
+            (None, None, None, Some(performance_urls), None, None) => Ok(Self::PerformanceUrls { performance_urls }),
+            (None, None, None, None, Some(image_cache_cleared), None) => Ok(Self::ImageCacheCleared { image_cache_cleared }),
+            (None, None, None, None, None, Some(error)) => Ok(Self::Error { error }),
+            _ => Err(D::Error::custom("control response must contain exactly one result")),
+        }
+    }
 }
 
 #[derive(Serialize, Deserialize)]
@@ -152,6 +195,7 @@ pub async fn serve<S: StorageClient>(
     database: Database,
     storage: S,
     backup_jobs: backup::Jobs,
+    image_cache: Option<std::sync::Arc<crate::image_cache::ImageCache>>,
     performance_settings: PerformanceSettings,
     mut shutdown: shutdown::Receiver,
 ) -> std::io::Result<()> {
@@ -164,7 +208,7 @@ pub async fn serve<S: StorageClient>(
         };
         tokio::select! {
             biased;
-            result = handle(stream, &database, &storage, &backup_jobs, &performance_settings) => {
+            result = handle(stream, &database, &storage, &backup_jobs, image_cache.as_ref(), &performance_settings) => {
                 if let Err(error) = result {
                     log::error!("site control request failed: {error}");
                 }
@@ -188,6 +232,7 @@ pub async fn request_import(manifest_path: &Path, socket_path: &Path) -> AppResu
         manifest_path: Some(manifest_path.to_path_buf()),
         performance: None,
         performance_urls: None,
+        cache_key: None,
     })?;
     stream.write_all(&request).await?;
     stream.write_all(b"\n").await?;
@@ -197,9 +242,9 @@ pub async fn request_import(manifest_path: &Path, socket_path: &Path) -> AppResu
         return Err("running site closed the control connection without a result".into());
     }
     let response: ControlResponse = serde_json::from_str(&response_line)?;
-    match (response.result, response.error) {
-        (Some(result), None) => Ok(result),
-        (None, Some(error)) => Err(error.into()),
+    match response {
+        ControlResponse::Import { result } => Ok(result),
+        ControlResponse::Error { error } => Err(error.into()),
         _ => Err("running site returned an invalid control response".into()),
     }
 }
@@ -217,16 +262,16 @@ async fn request_backup(socket_path: &Path, command: &str, output: Option<&Path>
     let mut stream = UnixStream::connect(socket_path).await?;
     stream.write_all(&serde_json::to_vec(&ControlRequest {
         command: Some(command.to_owned()), output_path: output.map(Path::to_path_buf),
-        manifest_path: None, performance: None, performance_urls: None,
+        manifest_path: None, performance: None, performance_urls: None, cache_key: None,
     })?).await?;
     stream.write_all(b"\n").await?;
     let mut line = String::new();
     BufReader::new(stream).read_line(&mut line).await?;
     if line.is_empty() { return Err("running site closed the control connection without a result".into()); }
     let response: ControlResponse = serde_json::from_str(&line)?;
-    match (response.backup, response.error) {
-        (Some(true), None) => Ok(()),
-        (_, Some(error)) => Err(error.into()),
+    match response {
+        ControlResponse::Backup { backup: true } => Ok(()),
+        ControlResponse::Error { error } => Err(error.into()),
         _ => Err("running site returned an invalid backup response".into()),
     }
 }
@@ -239,6 +284,7 @@ pub async fn request_performance(
     stream.write_all(&serde_json::to_vec(&ControlRequest {
         command: Some("performance".to_owned()), output_path: None,
         manifest_path: None, performance: Some(request), performance_urls: None,
+        cache_key: None,
     })?).await?;
     stream.write_all(b"\n").await?;
     let mut line = String::new();
@@ -247,9 +293,9 @@ pub async fn request_performance(
         return Err("running site closed the control connection without a result".into());
     }
     let response: ControlResponse = serde_json::from_str(&line)?;
-    match (response.performance, response.error) {
-        (Some(result), None) => Ok(result),
-        (None, Some(error)) => Err(error.into()),
+    match response {
+        ControlResponse::Performance { performance } => Ok(performance),
+        ControlResponse::Error { error } => Err(error.into()),
         _ => Err("running site returned an invalid performance response".into()),
     }
 }
@@ -259,6 +305,7 @@ pub async fn request_performance_urls(socket_path: &Path) -> AppResult<Performan
     stream.write_all(&serde_json::to_vec(&ControlRequest {
         command: Some("performance_urls".to_owned()), output_path: None,
         manifest_path: None, performance: None, performance_urls: Some(true),
+        cache_key: None,
     })?).await?;
     stream.write_all(b"\n").await?;
     let mut line = String::new();
@@ -267,10 +314,35 @@ pub async fn request_performance_urls(socket_path: &Path) -> AppResult<Performan
         return Err("running site closed the control connection without a result".into());
     }
     let response: ControlResponse = serde_json::from_str(&line)?;
-    match (response.performance_urls, response.error) {
-        (Some(urls), None) => Ok(urls),
-        (None, Some(error)) => Err(error.into()),
+    match response {
+        ControlResponse::PerformanceUrls { performance_urls } => Ok(performance_urls),
+        ControlResponse::Error { error } => Err(error.into()),
         _ => Err("running site returned an invalid performance URL response".into()),
+    }
+}
+
+pub async fn request_image_cache_clear(storage_key: Option<&str>, socket_path: &Path) -> AppResult<usize> {
+    let mut stream = UnixStream::connect(socket_path).await?;
+    let request = ControlRequest {
+        command: Some("image_cache_clear".to_owned()),
+        output_path: None,
+        manifest_path: None,
+        performance: None,
+        performance_urls: None,
+        cache_key: storage_key.map(str::to_owned),
+    };
+    stream.write_all(&serde_json::to_vec(&request)?).await?;
+    stream.write_all(b"\n").await?;
+    let mut line = String::new();
+    BufReader::new(stream).read_line(&mut line).await?;
+    if line.is_empty() {
+        return Err("running site closed the control connection without a result".into());
+    }
+    let response: ControlResponse = serde_json::from_str(&line)?;
+    match response {
+        ControlResponse::ImageCacheCleared { image_cache_cleared } => Ok(image_cache_cleared),
+        ControlResponse::Error { error } => Err(error.into()),
+        _ => Err("running site returned an invalid image cache response".into()),
     }
 }
 
@@ -279,6 +351,7 @@ async fn handle<S: StorageClient>(
     database: &Database,
     storage: &S,
     backup_jobs: &backup::Jobs,
+    image_cache: Option<&std::sync::Arc<crate::image_cache::ImageCache>>,
     performance_settings: &PerformanceSettings,
 ) -> AppResult<()> {
     let mut reader = BufReader::new(stream);
@@ -291,15 +364,23 @@ async fn handle<S: StorageClient>(
                 "backup_create" => {
                     if request.output_path.is_some() || request.manifest_path.is_some() || request.performance.is_some() || request.performance_urls.is_some() { return Err("invalid backup request".into()); }
                     backup::create(backup_jobs, database.path(), storage).await.map_err(|error| format!("backup create key={} failed: {error}", backup::KEY))?;
-                    return Ok(ControlResponse { backup: Some(true), result: None, performance: None, performance_urls: None, error: None });
+                    return Ok(ControlResponse::Backup { backup: true });
                 }
                 "backup_restore" => {
                     let output = request.output_path.as_deref().ok_or("missing restore output path")?;
                     if request.manifest_path.is_some() || request.performance.is_some() || request.performance_urls.is_some() { return Err("invalid backup request".into()); }
                     backup::restore_check(backup_jobs, storage, output).await.map_err(|error| format!("backup restore-check key={} failed: {error}", backup::KEY))?;
-                    return Ok(ControlResponse { backup: Some(true), result: None, performance: None, performance_urls: None, error: None });
+                    return Ok(ControlResponse::Backup { backup: true });
                 }
                 "import" | "performance" | "performance_urls" => {}
+                "image_cache_clear" => {
+                    if request.output_path.is_some() || request.manifest_path.is_some() || request.performance.is_some() || request.performance_urls.is_some() {
+                        return Err("invalid image cache clear request".into());
+                    }
+                    let cache = image_cache.ok_or("image cache is disabled")?;
+                    let removed = cache.clear(request.cache_key.as_deref()).await?;
+                    return Ok(ControlResponse::ImageCacheCleared { image_cache_cleared: removed });
+                }
                 _ => return Err("unknown control command".into()),
             }
         }
@@ -308,7 +389,7 @@ async fn handle<S: StorageClient>(
                 return Err("control request must select one command".into());
             }
             let urls = performance_settings.urls()?;
-            return Ok(ControlResponse { backup: None, result: None, performance: None, performance_urls: Some(urls), error: None });
+            return Ok(ControlResponse::PerformanceUrls { performance_urls: urls });
         }
         if let Some(performance_request) = request.performance {
             if request.manifest_path.is_some() {
@@ -321,7 +402,7 @@ async fn handle<S: StorageClient>(
                 performance_settings.transport.clone(),
                 performance_settings.initial_stream_window_size,
                 performance_settings.initial_connection_window_size).await?;
-            return Ok(ControlResponse { backup: None, result: None, performance: Some(result), performance_urls: None, error: None });
+            return Ok(ControlResponse::Performance { performance: result });
         }
         let manifest_path = request.manifest_path.ok_or("control request is missing a command")?;
         if !manifest_path.is_absolute() {
@@ -329,12 +410,12 @@ async fn handle<S: StorageClient>(
         }
         let prepared = import::prepare_manifest(&manifest_path).await?;
         let result = import::apply_import(prepared, database, storage).await?;
-        Ok(ControlResponse { backup: None, result: Some(result), performance: None, performance_urls: None, error: None })
+        Ok(ControlResponse::Import { result })
     }
     .await;
     let response = match result {
         Ok(result) => result,
-        Err(error) => ControlResponse { backup: None, result: None, performance: None, performance_urls: None, error: Some(error.to_string()) },
+        Err(error) => ControlResponse::Error { error: error.to_string() },
     };
     let mut stream = reader.into_inner();
     stream.write_all(&serde_json::to_vec(&response)?).await?;
@@ -365,8 +446,24 @@ mod tests {
         let request: ControlRequest = serde_json::from_str(r#"{"manifest_path":"/tmp/import.json"}"#).unwrap();
         assert_eq!(request.manifest_path.as_deref(), Some(Path::new("/tmp/import.json")));
         assert!(request.performance.is_none());
-        let request = ControlRequest { command: None, output_path: None, manifest_path: Some(PathBuf::from("/tmp/import.json")), performance: None, performance_urls: None };
+        let request = ControlRequest { command: None, output_path: None, manifest_path: Some(PathBuf::from("/tmp/import.json")), performance: None, performance_urls: None, cache_key: None };
         assert_eq!(serde_json::to_string(&request).unwrap(), r#"{"manifest_path":"/tmp/import.json"}"#);
+    }
+
+    #[test]
+    fn control_responses_keep_flat_wire_format_and_reject_ambiguous_shapes() {
+        let response = ControlResponse::ImageCacheCleared { image_cache_cleared: 0 };
+        let json = serde_json::to_string(&response).unwrap();
+        assert_eq!(json, r#"{"image_cache_cleared":0}"#);
+        assert!(matches!(
+            serde_json::from_str::<ControlResponse>(&json).unwrap(),
+            ControlResponse::ImageCacheCleared { image_cache_cleared: 0 }
+        ));
+
+        let response: ControlResponse = serde_json::from_str(r#"{"error":"cache is disabled"}"#).unwrap();
+        assert!(matches!(response, ControlResponse::Error { error } if error == "cache is disabled"));
+        assert!(serde_json::from_str::<ControlResponse>(r#"{"backup":true,"error":"failed"}"#).is_err());
+        assert!(serde_json::from_str::<ControlResponse>("{}").is_err());
     }
 
     #[test]

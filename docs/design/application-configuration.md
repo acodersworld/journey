@@ -18,9 +18,12 @@ credentials, and HTTP/2 window sizes before opening persistent storage or
 binding service listeners. CLI options such as `--window-size` override the
 corresponding TOML values for one invocation.
 
-Relative database, control-socket, and object-directory paths are resolved
-relative to the selected configuration file. Absolute paths are recommended
-for container deployments.
+Relative database, control-socket, object-directory, and explicitly configured
+image-cache paths are resolved relative to the selected configuration file.
+The default image-cache directory is `image-cache/` beside the site database.
+Absolute paths are recommended for container deployments. See the
+[website image cache design](website-image-cache.md) for its persistent mount
+and ownership requirements.
 
 Docker Compose uses `JOURNEY_CONFIG` only to point each service at its mounted
 file. Compose-level values such as image tags, host port bindings, and the

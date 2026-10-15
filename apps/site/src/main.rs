@@ -4,6 +4,7 @@ mod config;
 mod control;
 mod db;
 mod import;
+mod image_cache;
 mod performance;
 mod shutdown;
 mod storage;
@@ -44,6 +45,8 @@ struct Cli {
 #[derive(Subcommand)]
 enum Commands {
     Backup { #[command(subcommand)] command: BackupCommands },
+    #[command(name = "image-cache")]
+    ImageCache { #[command(subcommand)] command: ImageCacheCommands },
     Import(ImportArgs),
     Performance {
         #[command(subcommand)]
@@ -63,6 +66,14 @@ enum Commands {
         command: ShareLinkCommands,
     },
     Serve(ServeArgs),
+}
+
+#[derive(Subcommand)]
+enum ImageCacheCommands {
+    Clear {
+        #[arg(long, value_name = "STORAGE_KEY")]
+        key: Option<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -176,6 +187,11 @@ async fn main() -> AppResult<()> {
     journey_logging::initialize("journey-site", &config.logging)?;
     let database = Database::new(config.site.database_path.clone());
     match command {
+        Commands::ImageCache { command: ImageCacheCommands::Clear { key } } => {
+            let removed = control::request_image_cache_clear(key.as_deref(), &config.site.control_socket).await?;
+            println!("cleared {removed} image cache entries");
+            Ok(())
+        }
         Commands::Backup { command } => {
             match command {
                 BackupCommands::Create => control::request_backup_create(&config.site.control_socket).await?,
@@ -418,6 +434,15 @@ async fn main() -> AppResult<()> {
             database.initialize().await.map_err(|error| {
                 format!("could not initialize site database at {}: {error}", database_path.display())
             })?;
+            let image_cache = if config.image_cache.enabled {
+                let image_cache = image_cache::ImageCache::open(&config.image_cache).await?;
+                if image_cache.startup_exceeds_limit() {
+                    image_cache.evict(&database, true).await?;
+                }
+                Some(image_cache)
+            } else {
+                None
+            };
             let (storage, websocket_listener) = match storage_transport {
                 ConfiguredStorageTransport::H2c(address) => {
                     let storage = tokio::select! {
@@ -483,6 +508,7 @@ async fn main() -> AppResult<()> {
             let control_storage = storage.clone();
             let backup_jobs = backup::Jobs::default();
             let control_backup_jobs = backup_jobs.clone();
+            let control_image_cache = image_cache.clone();
             let control_shutdown = shutdown.clone();
             let performance_token = config.diagnostics.enabled.then(auth::new_session_token);
             let local_origin = if listener_address.ip().is_unspecified() {
@@ -503,8 +529,30 @@ async fn main() -> AppResult<()> {
                 origin: config.site.public_origin.clone().unwrap_or(local_origin),
             };
             listener_tasks.spawn(async move {
-                control::serve(control_listener, control_database, control_storage, control_backup_jobs, performance_settings, control_shutdown).await
+                control::serve(control_listener, control_database, control_storage, control_backup_jobs, control_image_cache, performance_settings, control_shutdown).await
             });
+
+            if let Some(image_cache) = image_cache.clone() {
+                let cache_database = database.clone();
+                let mut cache_shutdown = shutdown.clone();
+                listener_tasks.spawn(async move {
+                    let interval = image_cache.eviction_interval();
+                    let mut eviction_interval = tokio::time::interval_at(tokio::time::Instant::now() + interval, interval);
+                    loop {
+                        tokio::select! {
+                            signal = shutdown::requested(&mut cache_shutdown) => {
+                                signal.map_err(std::io::Error::other)?;
+                                return Ok(());
+                            }
+                            _ = eviction_interval.tick() => {
+                                if let Err(error) = image_cache.evict(&cache_database, false).await {
+                                    log::warn!("image_cache_eviction_sweep_failed: {error}");
+                                }
+                            }
+                        }
+                    }
+                });
+            }
 
             let backup_storage = storage.clone();
             let backup_database = config.site.database_path.clone();
@@ -526,6 +574,9 @@ async fn main() -> AppResult<()> {
             });
 
             let mut app_state = web::state_with_security(database, storage.clone(), security);
+            if let Some(image_cache) = image_cache {
+                app_state = app_state.with_image_cache(image_cache);
+            }
             if let Some(token) = performance_token {
                 app_state = app_state.with_performance(std::sync::Arc::new(journey_performance::Sample::default()), token);
                 log::info!("site_performance_enabled");

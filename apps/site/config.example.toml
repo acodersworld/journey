@@ -7,6 +7,17 @@ session_ttl_seconds = 604800
 whatsapp_preview_image_ttl_seconds = 10
 max_media_upload_bytes = 2147483648
 
+[image_cache]
+enabled = false
+# directory = "./image-cache" # Defaults to image-cache/ beside the site database.
+max_bytes = "1GiB"
+max_entry_bytes = "64MiB"
+max_concurrent_fills = 4
+recent_post_count = 5
+eviction_interval = "1h"
+eviction_target_percent = 90
+access_timestamp_interval = "1m"
+
 [storage]
 transport = "h2c"
 h2c_address = "127.0.0.1:8081"
