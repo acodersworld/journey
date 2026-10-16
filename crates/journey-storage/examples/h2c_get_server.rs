@@ -11,7 +11,7 @@ use clap::Parser;
 use h2::server;
 use journey_storage::{
     serve_web_interface, start_range_get_aggregator, ContentType, FilesystemStore,
-    FilesystemStoreConfig, Key, Object, Service, Store, StoreInterface, WebCredentials,
+    FilesystemStoreConfig, DerivativeCacheSettings, Key, Object, Service, Store, StoreInterface, WebCredentials,
 };
 use http::HeaderValue;
 use tokio::{
@@ -36,6 +36,8 @@ const VIDEO: &[u8] = include_bytes!("assets/video.mp4");
 struct Options {
     #[arg(long, value_name = "PATH")]
     storage_dir: Option<PathBuf>,
+    #[arg(long)]
+    disable_derivative_cache: bool,
     #[arg(long, default_value = DEFAULT_BIND)]
     bind: SocketAddr,
     #[arg(long, default_value = DEFAULT_WEB_BIND)]
@@ -55,7 +57,8 @@ async fn main() -> Result<(), Box<dyn Error>> {
     )?;
     match options.storage_dir {
         Some(root) => {
-            let store = FilesystemStore::open(FilesystemStoreConfig::new(&root)).await?;
+            let settings = DerivativeCacheSettings { enabled: !options.disable_derivative_cache, ..DerivativeCacheSettings::default() };
+            let store = FilesystemStore::open(FilesystemStoreConfig::new(&root).with_derivative_cache(settings)).await?;
             println!("filesystem storage root: {}", root.display());
             run_server(
                 store,
@@ -163,6 +166,9 @@ async fn run_server<S: StoreInterface + Sync + Send>(
     println!("  curl --http2-prior-knowledge -X PUT -H 'Content-Type: image/jpeg' --data-binary @crates/journey-storage/examples/assets/image.jpg http://{bound_address}/objects/uploaded.jpg");
     println!("  curl --http2-prior-knowledge http://{bound_address}/objects/uploaded.jpg --output downloaded.jpg");
     println!("  cmp crates/journey-storage/examples/assets/image.jpg downloaded.jpg");
+    println!("Get generated image representations:");
+    println!("  curl --http2-prior-knowledge -H 'Object-Image-Quality: 80' -H 'Object-Image-Cache: true' http://{bound_address}/objects/uploaded.jpg --output reencoded.jpg");
+    println!("  curl --http2-prior-knowledge -H 'Object-Representation: reduced-image' -H 'Object-Image-Max-Edge: 640' -H 'Object-Image-Cache: true' http://{bound_address}/objects/uploaded.jpg --output reduced.jpg");
     println!("Upload with a server-generated SHA-256 key (the response includes Object-Name):");
     println!("  curl --http2-prior-knowledge -X PUT -H 'Object-Key-Mode: sha256' -H 'Content-Type: image/jpeg' --data-binary @crates/journey-storage/examples/assets/image.jpg -D - http://{bound_address}/objects");
     println!("Upload into a logical folder with a server-generated key:");
@@ -176,6 +182,9 @@ async fn run_server<S: StoreInterface + Sync + Send>(
     println!("  curl --http2-prior-knowledge -X PUT -H 'Content-Type: video/mp4' --data-binary @crates/journey-storage/examples/assets/video.mp4 http://{bound_address}/objects/uploaded.jpg");
     println!("  curl --http2-prior-knowledge -D - http://{bound_address}/objects/uploaded.jpg --output downloaded.mp4");
     println!("  cmp crates/journey-storage/examples/assets/video.mp4 downloaded.mp4");
+    println!("Get a video thumbnail:");
+    println!("  curl --http2-prior-knowledge -H 'Object-Representation: thumbnail' http://{bound_address}/objects/uploaded.jpg --output thumbnail.jpg");
+    println!("  curl --http2-prior-knowledge -H 'Object-Representation: thumbnail' -H 'Object-Image-Max-Edge: 320' -H 'Object-Image-Cache: true' http://{bound_address}/objects/uploaded.jpg --output reduced-thumbnail.jpg");
     println!("Delete it with:");
     println!("  curl --http2-prior-knowledge -X DELETE http://{bound_address}/objects/uploaded.jpg");
 

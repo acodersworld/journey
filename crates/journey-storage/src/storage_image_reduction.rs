@@ -8,7 +8,7 @@ use ffmpeg_next as ffmpeg;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 use crate::storage_interface::{
-    ImageFit, ImageOutputFormat, ImageReductionRequest, ImageReductionSize, ReducedImage,
+    ImageFit, ImageOutputFormat, ImageQuality, ImageReductionRequest, ImageReductionSize, ReducedImage,
     StoreError, StoreErrorKind,
 };
 
@@ -53,16 +53,31 @@ pub(crate) async fn reduce_image_with_slot(
 ) -> Result<ReducedImage, StoreError> {
     tokio::task::spawn_blocking(move || {
         let _permit = permit;
-        reduce_image_blocking(bytes, &source_content_type, &request)
+        process_image_blocking(bytes, &source_content_type, Some(&request), None)
     })
     .await
     .map_err(|error| StoreError::new(StoreErrorKind::Unavailable, format!("Image reduction task failed: {error}")))?
 }
 
-fn reduce_image_blocking(
+pub(crate) async fn reencode_image_with_slot(
+    bytes: Bytes,
+    source_content_type: String,
+    quality: ImageQuality,
+    permit: OwnedSemaphorePermit,
+) -> Result<ReducedImage, StoreError> {
+    tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        process_image_blocking(bytes, &source_content_type, None, Some(quality))
+    })
+    .await
+    .map_err(|error| StoreError::new(StoreErrorKind::Unavailable, format!("Image re-encoding task failed: {error}")))?
+}
+
+fn process_image_blocking(
     bytes: Bytes,
     source_content_type: &str,
-    request: &ImageReductionRequest,
+    request: Option<&ImageReductionRequest>,
+    quality: Option<ImageQuality>,
 ) -> Result<ReducedImage, StoreError> {
     if bytes.is_empty() || bytes.len() as u64 > MAX_IMAGE_SOURCE_BYTES {
         return Err(StoreError::new(StoreErrorKind::Capacity, "Source image is empty or exceeds the decoding limit"));
@@ -122,11 +137,14 @@ fn reduce_image_blocking(
             .map_err(|error| ffmpeg_error("finish image decoding", error))?;
         decoded_frame = receive_image_frame(&mut decoder)?;
     }
-    let frame = decoded_frame.ok_or_else(|| unsupported("Image contains no decodable still frame"))?;
-    let (pixels, width, height) = frame_to_rgba(&frame)?;
+    let mut frame = decoded_frame.ok_or_else(|| unsupported("Image contains no decodable still frame"))?;
+    let (pixels, width, height) = frame_to_rgba(&mut frame)?;
     let (pixels, width, height) = orient_rgba(pixels, width, height, orientation)?;
     let (output_width, output_height, canvas_width, canvas_height) =
-        output_dimensions(width, height, request.size(), request.fit())?;
+        match request {
+            Some(request) => output_dimensions(width, height, request.size(), request.fit())?,
+            None => (width, height, width, height),
+        };
 
     let mut scaled = ffmpeg::frame::Video::empty();
     let mut scaler = ffmpeg::software::scaling::Context::get(
@@ -146,9 +164,13 @@ fn reduce_image_blocking(
         .map_err(|error| ffmpeg_error("scale reduced image", error))?;
 
     let source_format = reduced_source_format(source_content_type);
-    let output_format = match request.format() {
-        Some(ImageOutputFormat::Jpeg) => ReducedFormat::Jpeg,
-        None => source_format,
+    let output_format = if quality.is_some() {
+        ReducedFormat::Jpeg
+    } else {
+        match request.and_then(ImageReductionRequest::format) {
+            Some(ImageOutputFormat::Jpeg) => ReducedFormat::Jpeg,
+            None => source_format,
+        }
     };
     let output_format = if encoder_id(output_format).is_some_and(|id| ffmpeg::encoder::find(id).is_some()) {
         output_format
@@ -207,17 +229,22 @@ fn reduce_image_blocking(
     write_packed_rows(&mut output_frame, &output_bytes, canvas_width, canvas_height, bytes_per_pixel)?;
 
     if !is_jpeg {
-        if let Ok(encoded) = encode_image(&output_frame, output_format, JPEG_QUALITY_LEVELS[0]) {
+        if let Ok(encoded) = encode_image(&output_frame, output_format, JPEG_QUALITY_LEVELS[0], false) {
             return Ok(ReducedImage::new(Bytes::from(encoded), output_format.content_type()));
         }
-        let jpeg = encode_image(&output_frame, ReducedFormat::Jpeg, JPEG_QUALITY_LEVELS[0])?;
+        let jpeg = encode_image(&output_frame, ReducedFormat::Jpeg, JPEG_QUALITY_LEVELS[0], false)?;
         return Ok(ReducedImage::new(Bytes::from(jpeg), ReducedFormat::Jpeg.content_type()));
     }
 
-    let attempts: &[usize] = if request.max_bytes().is_some() { &JPEG_QUALITY_LEVELS } else { &JPEG_QUALITY_LEVELS[..1] };
-    let max_bytes = request.max_bytes();
-    for quality in attempts {
-        let output = encode_image(&output_frame, ReducedFormat::Jpeg, *quality)?;
+    let quality_attempt = quality.map(ImageQuality::quantizer);
+    let attempts: &[usize] = match quality_attempt.as_ref() {
+        Some(value) => std::slice::from_ref(value),
+        None if request.is_some_and(|request| request.max_bytes().is_some()) => &JPEG_QUALITY_LEVELS,
+        None => &JPEG_QUALITY_LEVELS[..1],
+    };
+    let max_bytes = request.and_then(ImageReductionRequest::max_bytes);
+    for attempt in attempts {
+        let output = encode_image(&output_frame, ReducedFormat::Jpeg, *attempt, quality_attempt.is_some())?;
         if max_bytes.is_none_or(|limit| output.len() as u64 <= limit) {
             return Ok(ReducedImage::new(Bytes::from(output), ReducedFormat::Jpeg.content_type()));
         }
@@ -288,7 +315,21 @@ fn receive_image_frame(
     }
 }
 
-fn frame_to_rgba(frame: &ffmpeg::frame::Video) -> Result<(Vec<u8>, u32, u32), StoreError> {
+pub(crate) fn normalize_legacy_jpeg_frame(frame: &mut ffmpeg::frame::Video) {
+    let format = match frame.format() {
+        ffmpeg::format::Pixel::YUVJ420P => ffmpeg::format::Pixel::YUV420P,
+        ffmpeg::format::Pixel::YUVJ422P => ffmpeg::format::Pixel::YUV422P,
+        ffmpeg::format::Pixel::YUVJ444P => ffmpeg::format::Pixel::YUV444P,
+        ffmpeg::format::Pixel::YUVJ440P => ffmpeg::format::Pixel::YUV440P,
+        ffmpeg::format::Pixel::YUVJ411P => ffmpeg::format::Pixel::YUV411P,
+        _ => return,
+    };
+    frame.set_format(format);
+    frame.set_color_range(ffmpeg::color::Range::JPEG);
+}
+
+fn frame_to_rgba(frame: &mut ffmpeg::frame::Video) -> Result<(Vec<u8>, u32, u32), StoreError> {
+    normalize_legacy_jpeg_frame(frame);
     let width = frame.width();
     let height = frame.height();
     let mut rgba = ffmpeg::frame::Video::empty();
@@ -302,6 +343,16 @@ fn frame_to_rgba(frame: &ffmpeg::frame::Video) -> Result<(Vec<u8>, u32, u32), St
         ffmpeg::software::scaling::flag::Flags::BILINEAR,
     )
     .map_err(|error| ffmpeg_error("prepare image color conversion", error))?;
+    if frame.color_range() == ffmpeg::color::Range::JPEG {
+        let coefficients = unsafe { ffmpeg::ffi::sws_getCoefficients(ffmpeg::ffi::SWS_CS_DEFAULT) };
+        if coefficients.is_null() || unsafe {
+            ffmpeg::ffi::sws_setColorspaceDetails(
+                scaler.as_mut_ptr(), coefficients, 1, coefficients, 1, 0, 1 << 16, 1 << 16,
+            )
+        } < 0 {
+            return Err(internal("Could not configure full-range image color conversion"));
+        }
+    }
     scaler
         .run(frame, &mut rgba)
         .map_err(|error| ffmpeg_error("convert decoded image to RGBA", error))?;
@@ -409,6 +460,7 @@ fn encode_image(
     frame: &ffmpeg::frame::Video,
     format: ReducedFormat,
     quality: usize,
+    set_frame_quality: bool,
 ) -> Result<Vec<u8>, StoreError> {
     let id = encoder_id(format).ok_or_else(|| unsupported("Requested image encoder is unavailable"))?;
     let codec = ffmpeg::encoder::find(id).ok_or_else(|| unsupported("Requested image encoder is unavailable"))?;
@@ -428,6 +480,10 @@ fn encode_image(
             .run(frame, &mut converted_frame)
             .map_err(|error| ffmpeg_error("convert reduced image for JPEG", error))?;
         converted_frame.set_color_range(ffmpeg::color::Range::JPEG);
+        if set_frame_quality {
+            // The MJPEG encoder reads the quantizer from the submitted frame.
+            unsafe { (*converted_frame.as_mut_ptr()).quality = (quality as i32) * ffmpeg::ffi::FF_QP2LAMBDA; }
+        }
         &converted_frame
     } else {
         frame
@@ -442,7 +498,7 @@ fn encode_image(
     video_encoder.set_time_base((1, 1));
     if format == ReducedFormat::Jpeg {
         video_encoder.set_color_range(ffmpeg::color::Range::JPEG);
-        video_encoder.set_quality(quality.saturating_mul(118));
+        video_encoder.set_quality(quality.saturating_mul(ffmpeg::ffi::FF_QP2LAMBDA as usize));
         video_encoder.set_flags(ffmpeg::codec::Flags::QSCALE);
     }
     let mut encoder = video_encoder
@@ -534,4 +590,98 @@ fn unsupported(detail: impl Into<String>) -> StoreError {
 
 fn capacity(detail: impl Into<String>) -> StoreError {
     StoreError::new(StoreErrorKind::Capacity, detail)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::storage_interface::ImageQuality;
+
+    #[test]
+    fn quality_scale_maps_endpoints_and_middle() {
+        assert_eq!(ImageQuality::new(100).unwrap().quantizer(), 2);
+        assert_eq!(ImageQuality::new(1).unwrap().quantizer(), 31);
+        assert_eq!(ImageQuality::new(50).unwrap().quantizer(), 17);
+        assert!(ImageQuality::new(0).is_err());
+        assert!(ImageQuality::new(101).is_err());
+    }
+
+    #[tokio::test]
+    async fn quality_changes_jpeg_encoding() {
+        let source = Bytes::from_static(include_bytes!("../examples/assets/image.jpg"));
+        let high = reencode_image_with_slot(source.clone(), "image/jpeg".into(), ImageQuality::new(100).unwrap(), acquire_image_reduction_slot().await.unwrap()).await.unwrap();
+        let low = reencode_image_with_slot(source, "image/jpeg".into(), ImageQuality::new(1).unwrap(), acquire_image_reduction_slot().await.unwrap()).await.unwrap();
+        assert_ne!(high.bytes(), low.bytes());
+        assert!(high.bytes().len() > low.bytes().len(), "high={} low={}", high.bytes().len(), low.bytes().len());
+    }
+
+    #[tokio::test]
+    async fn quality_outputs_jpeg_from_transparent_png() {
+        let mut frame = ffmpeg::frame::Video::new(ffmpeg::format::Pixel::RGBA, 2, 2);
+        write_rgba_rows(&mut frame, &[255, 0, 0, 0, 255, 0, 0, 0, 255, 0, 0, 0, 255, 0, 0, 0], 2, 2).unwrap();
+        let png = encode_image(&frame, ReducedFormat::Png, 2, false).unwrap();
+        let permit = acquire_image_reduction_slot().await.unwrap();
+        let result = reencode_image_with_slot(Bytes::from(png), "image/png".into(), ImageQuality::new(90).unwrap(), permit).await.unwrap();
+        assert_eq!(result.content_type(), "image/jpeg");
+        let mut decoder = jpeg_decoder::Decoder::new(Cursor::new(result.bytes().as_ref()));
+        let pixels = decoder.decode().unwrap();
+        assert!(pixels.iter().all(|channel| *channel > 230));
+    }
+
+    #[tokio::test]
+    async fn quality_applies_exif_orientation() {
+        let source = include_bytes!("../examples/assets/image.jpg");
+        let mut decoder = jpeg_decoder::Decoder::new(Cursor::new(source.as_slice()));
+        decoder.read_info().unwrap();
+        let original = decoder.info().unwrap();
+        let mut tiff = Vec::new();
+        tiff.extend_from_slice(b"II");
+        tiff.extend_from_slice(&42u16.to_le_bytes());
+        tiff.extend_from_slice(&8u32.to_le_bytes());
+        tiff.extend_from_slice(&1u16.to_le_bytes());
+        tiff.extend_from_slice(&0x0112u16.to_le_bytes());
+        tiff.extend_from_slice(&3u16.to_le_bytes());
+        tiff.extend_from_slice(&1u32.to_le_bytes());
+        tiff.extend_from_slice(&6u16.to_le_bytes());
+        tiff.extend_from_slice(&0u16.to_le_bytes());
+        tiff.extend_from_slice(&0u32.to_le_bytes());
+        let mut oriented = Vec::new();
+        oriented.extend_from_slice(&source[..2]);
+        oriented.extend_from_slice(&[0xff, 0xe1]);
+        oriented.extend_from_slice(&((tiff.len() + 8) as u16).to_be_bytes());
+        oriented.extend_from_slice(b"Exif\0\0");
+        oriented.extend_from_slice(&tiff);
+        oriented.extend_from_slice(&source[2..]);
+        let permit = acquire_image_reduction_slot().await.unwrap();
+        let image = reencode_image_with_slot(Bytes::from(oriented), "image/jpeg".into(), ImageQuality::new(80).unwrap(), permit).await.unwrap();
+        let mut output_decoder = jpeg_decoder::Decoder::new(Cursor::new(image.bytes().as_ref()));
+        output_decoder.read_info().unwrap();
+        assert_eq!(output_decoder.info().unwrap().width, original.height);
+        assert_eq!(output_decoder.info().unwrap().height, original.width);
+    }
+
+    #[tokio::test]
+    async fn quality_preserves_dimensions_above_reduction_limit() {
+        let width = 2300usize;
+        let height = 2usize;
+        let row = (width * 3 + 3) & !3;
+        let file_len = 54 + row * height;
+        let mut bmp = vec![0u8; file_len];
+        bmp[..2].copy_from_slice(b"BM");
+        bmp[2..6].copy_from_slice(&(file_len as u32).to_le_bytes());
+        bmp[10..14].copy_from_slice(&54u32.to_le_bytes());
+        bmp[14..18].copy_from_slice(&40u32.to_le_bytes());
+        bmp[18..22].copy_from_slice(&(width as u32).to_le_bytes());
+        bmp[22..26].copy_from_slice(&(height as u32).to_le_bytes());
+        bmp[26..28].copy_from_slice(&1u16.to_le_bytes());
+        bmp[28..30].copy_from_slice(&24u16.to_le_bytes());
+        for pixel in bmp[54..].chunks_exact_mut(3) { pixel.copy_from_slice(&[40, 80, 120]); }
+        let permit = acquire_image_reduction_slot().await.unwrap();
+        let image = reencode_image_with_slot(Bytes::from(bmp), "image/bmp".into(), ImageQuality::new(80).unwrap(), permit).await.unwrap();
+        assert_eq!(image.content_type(), "image/jpeg");
+        let mut decoder = jpeg_decoder::Decoder::new(Cursor::new(image.bytes().as_ref()));
+        decoder.read_info().unwrap();
+        assert_eq!(decoder.info().unwrap().width, width as u16);
+        assert_eq!(decoder.info().unwrap().height, height as u16);
+    }
 }

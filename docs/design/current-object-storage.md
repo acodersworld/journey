@@ -78,17 +78,14 @@ metadata and stop at the declared payload length. Decoding and JPEG encoding
 run in blocking tasks, with at most two decodes at once. The output preserves
 the frame's aspect ratio and has a longest edge no larger than 640 pixels.
 
-Generated JPEGs are stored under `<object_dir>/thumbnail-cache`, beside
-`objects/` and `part/`. This directory is outside the indexed object namespace;
-logical keys still map to hashed `.obj` files under `objects/`. Cache filenames
-hash the source object's UUID and thumbnail settings, so replacing a logical
-key cannot reuse an older object's image. Cache writes use a synced temporary
-file and atomic rename. Requests for one cache entry share an in-process
-generation lock; missing, malformed, or undecodable cache files are rebuilt.
-The cache is persistent across service restarts and can be deleted without
-affecting stored objects. The storage service itself adds no public thumbnail
-URL. The website can proxy this representation through its access-controlled
-media routes.
+The filesystem store caches generated JPEGs beneath
+`<object_dir>/derivative-cache/cache/`, outside the indexed object namespace.
+The cache is shared with other image derivatives and keyed by the stored
+payload digest, content type, settings, and implementation version. The former
+UUID-addressed `thumbnail-cache/` entries are removed on startup when their
+names match the legacy format. Originals and unknown files are preserved.
+The storage service adds no public thumbnail URL; the website can proxy this
+representation through its access-controlled media routes.
 
 ## On-demand image reduction
 
@@ -110,22 +107,25 @@ by PNG and WebP output; JPEG composites it over white. An optional
 tries a bounded set of quality levels at the requested dimensions and returns
 `413` if the body cannot fit the byte cap.
 
-Image options are invalid on the original representation. `Range` is invalid
-for reduced images and thumbnails. The thumbnail representation can take the
-same fit, dimensions, JPEG, and byte-cap options after its existing cached base
-frame is generated; requests without those options retain the existing JPEG
-thumbnail behavior. All representation and image-option headers appear in
-`Vary`, and generated responses return their actual content type and length.
-`HEAD` generates the same representation as `GET` but sends no body.
+Reduction options are invalid on the original representation. `Range` is invalid
+for generated images. The thumbnail representation can take the same fit,
+dimensions, JPEG, and byte-cap options after its base frame is generated;
+requests without those options retain the existing JPEG thumbnail behavior.
+`Object-Image-Quality` selects JPEG at the original display dimensions for an
+image, without the reduction size limit. It cannot be combined with other image
+options or `Object-Representation`. `Object-Image-Cache` controls admission of
+generated results to disk. Both new headers appear in `Vary`. Generated
+responses return their actual content type and length. `HEAD` generates the
+same representation as `GET` but sends no body.
 
 The site storage client exposes a typed `get_reduced_image` method for max-edge,
 contain-fit JPEG output with an optional byte cap, so callers do not need to
 construct protocol headers. The storage protocol also supports bounding-box
 dimensions, padded output, and preserving supported source formats for clients
 that need those options. The filesystem and in-memory stores share the
-implementation over their existing payload readers; they create no image
-variant object or image-reduction cache. Native decode and encode work runs in
-blocking tasks under a shared two-job semaphore. Source images are limited to
+encoding implementation, while the filesystem store adds a disposable disk
+cache for generated images. Native decode and encode work runs in blocking
+tasks under a shared two-job semaphore. Source images are limited to
 64 MiB and decoded images to 16 million pixels. The original payload and
 metadata are never modified.
 

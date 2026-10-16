@@ -7,6 +7,7 @@ mod storage_interface;
 mod storage_in_memory;
 mod storage_filesystem;
 mod storage_thumbnail;
+mod storage_derivative_cache;
 mod storage_image_reduction;
 mod http2_storage_service;
 mod storage_web_interface;
@@ -14,7 +15,7 @@ mod range_get_logging;
 mod storage_performance;
 
 pub use storage_interface::{
-    ContentType, ContentTypeError, GetResult, ImageFit, ImageOutputFormat, ImageReductionRequest,
+    ContentType, ContentTypeError, DerivativeCachePolicy, GetResult, ImageDerivativeRequest, ImageQuality, ImageFit, ImageOutputFormat, ImageReductionRequest,
     ImageReductionSize, Key, ListCursor, ListPage, ListRequest, ObjectInterface, ObjectMetadata,
     ObjectName, PutCondition, PutContextInterface, ReadObject, ReadRange, ReadSpan, ReducedImage,
     StoreError, StoreErrorKind, StoreInterface,
@@ -22,6 +23,7 @@ pub use storage_interface::{
 pub use storage_in_memory::{
     Object, ObjectReader, PutContextWithGeneratedName, PutContextWithKey, Store, StoreConfig,
 };
+pub use storage_derivative_cache::DerivativeCacheSettings;
 pub use storage_filesystem::{
     FilesystemPutContextWithGeneratedName, FilesystemPutContextWithKey, FilesystemStore,
     FilesystemStoreConfig,

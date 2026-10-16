@@ -13,6 +13,8 @@ pub struct AppConfig {
     #[serde(default)]
     pub storage: StorageSettings,
     #[serde(default)]
+    pub derivative_cache: DerivativeCacheConfig,
+    #[serde(default)]
     pub management: ManagementSettings,
     #[serde(default)]
     pub site_connection: SiteConnectionSettings,
@@ -56,11 +58,61 @@ impl Default for AppConfig {
         Self {
             diagnostics: DiagnosticsSettings::default(),
             storage: StorageSettings::default(),
+            derivative_cache: DerivativeCacheConfig::default(),
             management: ManagementSettings::default(),
             site_connection: SiteConnectionSettings::default(),
             logging: journey_logging::LoggingSettings::default(),
         }
     }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct DerivativeCacheConfig {
+    pub enabled: bool,
+    pub max_bytes: String,
+    pub max_entry_bytes: String,
+    pub eviction_interval: String,
+    pub eviction_target_percent: u8,
+    pub access_timestamp_interval: String,
+}
+
+impl Default for DerivativeCacheConfig {
+    fn default() -> Self {
+        Self { enabled: true, max_bytes: "1GiB".into(), max_entry_bytes: "64MiB".into(),
+            eviction_interval: "1h".into(), eviction_target_percent: 90,
+            access_timestamp_interval: "1m".into() }
+    }
+}
+
+impl DerivativeCacheConfig {
+    pub fn settings(&self) -> Result<journey_storage::DerivativeCacheSettings, String> {
+        let settings = journey_storage::DerivativeCacheSettings {
+            enabled: self.enabled,
+            max_bytes: journey_performance::parse_size(&self.max_bytes).map_err(|error| format!("derivative_cache.max_bytes: {error}"))?,
+            max_entry_bytes: journey_performance::parse_size(&self.max_entry_bytes).map_err(|error| format!("derivative_cache.max_entry_bytes: {error}"))?,
+            eviction_interval: parse_duration(&self.eviction_interval, "derivative_cache.eviction_interval")?,
+            eviction_target_percent: self.eviction_target_percent,
+            access_timestamp_interval: parse_duration(&self.access_timestamp_interval, "derivative_cache.access_timestamp_interval")?,
+        };
+        settings.validate()?;
+        Ok(settings)
+    }
+}
+
+fn parse_duration(value: &str, name: &str) -> Result<std::time::Duration, String> {
+    let digits_end = value.bytes().take_while(u8::is_ascii_digit).count();
+    let (digits, suffix) = value.split_at(digits_end);
+    let number = digits.parse::<u64>().ok().filter(|number| *number > 0)
+        .ok_or_else(|| format!("{name} must be a positive whole number followed by s, m, h, or d"))?;
+    let multiplier = match suffix.to_ascii_lowercase().as_str() {
+        "s" => 1, "m" => 60, "h" => 3600, "d" => 86400,
+        _ => return Err(format!("{name} must end in s, m, h, or d")),
+    };
+    let seconds = number.checked_mul(multiplier).ok_or_else(|| format!("{name} is too large"))?;
+    let duration = std::time::Duration::from_secs(seconds);
+    if std::time::Instant::now().checked_add(duration).is_none() { return Err(format!("{name} is too large")); }
+    Ok(duration)
 }
 
 impl Default for StorageSettings {
@@ -164,6 +216,27 @@ mod tests {
         assert_eq!(config.logging.queue_capacity, 65_536);
         assert_eq!(config.storage.range_get_summary_interval_seconds, 10);
         assert!(config.storage.validate_range_get_summary_interval().is_ok());
+    }
+
+    #[test]
+    fn derivative_cache_defaults_and_validation() {
+        let legacy: AppConfig = toml::from_str("[storage]\nobject_dir = \"objects\"\n").unwrap();
+        let settings = legacy.derivative_cache.settings().unwrap();
+        assert_eq!(settings.max_bytes, 1024 * 1024 * 1024);
+        assert_eq!(settings.max_entry_bytes, 64 * 1024 * 1024);
+        let parsed: AppConfig = toml::from_str("[derivative_cache]\nmax_bytes = \"3MiB\"\nmax_entry_bytes = \"1MiB\"\neviction_interval = \"2D\"\naccess_timestamp_interval = \"30S\"\n").unwrap();
+        let settings = parsed.derivative_cache.settings().unwrap();
+        assert_eq!(settings.max_bytes, 3 * 1024 * 1024);
+        assert_eq!(settings.eviction_interval.as_secs(), 2 * 86400);
+        for invalid in [
+            "max_bytes = \"0B\"", "max_entry_bytes = \"2GiB\"",
+            "eviction_interval = \"60\"", "eviction_interval = \"0s\"",
+            "access_timestamp_interval = \"18446744073709551615d\"",
+            "eviction_target_percent = 100",
+        ] {
+            let config: AppConfig = toml::from_str(&format!("[derivative_cache]\n{invalid}\n")).unwrap();
+            assert!(config.derivative_cache.settings().is_err(), "{invalid}");
+        }
     }
 
     #[test]

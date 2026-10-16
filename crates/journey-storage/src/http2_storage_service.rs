@@ -19,12 +19,11 @@ use std::sync::{
 };
 
 use crate::storage_interface::{
-    ContentType, GetResult, ImageFit, ImageOutputFormat, ImageReductionRequest, ImageReductionSize,
+    ContentType, DerivativeCachePolicy, GetResult, ImageDerivativeRequest, ImageQuality, ImageFit, ImageOutputFormat, ImageReductionRequest, ImageReductionSize,
     Key, ListCursor, ListRequest, ObjectInterface, ObjectMetadata, ReducedImage,
     validate_generated_prefix, PutCondition, PutContextInterface, ReadRange, StoreError,
     StoreErrorKind, StoreInterface,
 };
-use crate::storage_image_reduction::reduce_image;
 use crate::range_get_logging::{RangeGetAggregator, RangeGetOutcome};
 
 const MAX_DATA_SEGMENT_SIZE: usize = 64 * 1024;
@@ -43,7 +42,8 @@ const COLLECTION_ALLOW: &str = "GET, PUT";
 const OBJECT_ALLOW: &str = "GET, HEAD, PUT, DELETE";
 const OBJECT_VARY: &str = concat!(
     "Object-Representation, Object-Image-Max-Edge, Object-Image-Width, ",
-    "Object-Image-Height, Object-Image-Fit, Object-Image-Format, Object-Image-Max-Bytes",
+    "Object-Image-Height, Object-Image-Fit, Object-Image-Format, Object-Image-Max-Bytes, ",
+    "Object-Image-Quality, Object-Image-Cache",
 );
 
 static NEXT_STORAGE_REQUEST_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
@@ -310,6 +310,22 @@ fn parse_object_representation(headers: &http::HeaderMap) -> Result<ObjectRepres
     match value {
         "thumbnail" => Ok(ObjectRepresentation::Thumbnail),
         "reduced-image" => Ok(ObjectRepresentation::ReducedImage),
+        _ => Err(()),
+    }
+}
+
+fn parse_image_quality(headers: &http::HeaderMap) -> Result<Option<ImageQuality>, ()> {
+    let Some(value) = parse_optional_image_value(headers, "object-image-quality")? else { return Ok(None); };
+    if value.is_empty() || !value.bytes().all(|byte| byte.is_ascii_digit()) { return Err(()); }
+    let number = value.parse::<u8>().map_err(|_| ())?;
+    ImageQuality::new(number).map(Some).map_err(|_| ())
+}
+
+fn parse_image_cache(headers: &http::HeaderMap) -> Result<Option<bool>, ()> {
+    match parse_optional_image_value(headers, "object-image-cache")?.as_deref() {
+        None => Ok(None),
+        Some("true") => Ok(Some(true)),
+        Some("false") => Ok(Some(false)),
         _ => Err(()),
     }
 }
@@ -644,13 +660,21 @@ impl<S: StoreInterface> Service<S> {
                         );
                     }
                 };
+                let quality = match parse_image_quality(request.headers()) {
+                    Ok(quality) => quality,
+                    Err(()) => return send_object_error_response(respond, StatusCode::BAD_REQUEST, method == Method::HEAD, None, BAD_REQUEST_BODY),
+                };
+                let cache = match parse_image_cache(request.headers()) {
+                    Ok(cache) => cache,
+                    Err(()) => return send_object_error_response(respond, StatusCode::BAD_REQUEST, method == Method::HEAD, None, BAD_REQUEST_BODY),
+                };
                 let invalid_representation_options = match representation {
-                    ObjectRepresentation::Original => image_options.is_some(),
-                    ObjectRepresentation::Thumbnail => false,
-                    ObjectRepresentation::ReducedImage => image_options.is_none(),
+                    ObjectRepresentation::Original => image_options.is_some() || (quality.is_none() && cache.is_some()),
+                    ObjectRepresentation::Thumbnail => quality.is_some(),
+                    ObjectRepresentation::ReducedImage => image_options.is_none() || quality.is_some(),
                 };
                 if invalid_representation_options
-                    || (representation != ObjectRepresentation::Original
+                    || ((representation != ObjectRepresentation::Original || quality.is_some())
                         && method != Method::GET
                         && method != Method::HEAD)
                 {
@@ -710,7 +734,7 @@ impl<S: StoreInterface> Service<S> {
                 };
                 match method {
                     Method::GET => {
-                        if representation != ObjectRepresentation::Original {
+                        if representation != ObjectRepresentation::Original || quality.is_some() {
                             if request.headers().contains_key(header::RANGE) {
                                 return send_object_error_response(
                                     respond,
@@ -720,15 +744,17 @@ impl<S: StoreInterface> Service<S> {
                                     BAD_REQUEST_BODY,
                                 );
                             }
-                            match representation {
-                                ObjectRepresentation::Thumbnail => {
-                                    self.handle_thumbnail(&key, image_options, false, respond).await
-                                }
-                                ObjectRepresentation::ReducedImage => {
-                                    self.handle_reduced_image(&key, image_options.unwrap(), false, respond).await
-                                }
-                                ObjectRepresentation::Original => unreachable!(),
-                            }
+                            let derivative = match (representation, quality) {
+                                (ObjectRepresentation::Thumbnail, _) => ImageDerivativeRequest::Thumbnail(image_options),
+                                (ObjectRepresentation::ReducedImage, _) => ImageDerivativeRequest::Reduced(image_options.unwrap()),
+                                (ObjectRepresentation::Original, Some(quality)) => ImageDerivativeRequest::Quality(quality),
+                                _ => unreachable!(),
+                            };
+                            let policy = match cache.unwrap_or(representation == ObjectRepresentation::Thumbnail) {
+                                true => DerivativeCachePolicy::ReadWrite,
+                                false => DerivativeCachePolicy::ReadOnly,
+                            };
+                            self.handle_image_derivative(&key, derivative, policy, false, respond).await
                         } else {
                             self.handle_get(
                                 &key,
@@ -741,7 +767,7 @@ impl<S: StoreInterface> Service<S> {
                         }
                     }
                     Method::HEAD => {
-                        if representation != ObjectRepresentation::Original {
+                        if representation != ObjectRepresentation::Original || quality.is_some() {
                             if request.headers().contains_key(header::RANGE) {
                                 return send_object_error_response(
                                     respond,
@@ -751,15 +777,17 @@ impl<S: StoreInterface> Service<S> {
                                     BAD_REQUEST_BODY,
                                 );
                             }
-                            match representation {
-                                ObjectRepresentation::Thumbnail => {
-                                    self.handle_thumbnail(&key, image_options, true, respond).await
-                                }
-                                ObjectRepresentation::ReducedImage => {
-                                    self.handle_reduced_image(&key, image_options.unwrap(), true, respond).await
-                                }
-                                ObjectRepresentation::Original => unreachable!(),
-                            }
+                            let derivative = match (representation, quality) {
+                                (ObjectRepresentation::Thumbnail, _) => ImageDerivativeRequest::Thumbnail(image_options),
+                                (ObjectRepresentation::ReducedImage, _) => ImageDerivativeRequest::Reduced(image_options.unwrap()),
+                                (ObjectRepresentation::Original, Some(quality)) => ImageDerivativeRequest::Quality(quality),
+                                _ => unreachable!(),
+                            };
+                            let policy = match cache.unwrap_or(representation == ObjectRepresentation::Thumbnail) {
+                                true => DerivativeCachePolicy::ReadWrite,
+                                false => DerivativeCachePolicy::ReadOnly,
+                            };
+                            self.handle_image_derivative(&key, derivative, policy, true, respond).await
                         } else {
                             self.handle_head(&key, respond).await
                         }
@@ -1170,37 +1198,17 @@ impl<S: StoreInterface> Service<S> {
         Ok(())
     }
 
-    async fn handle_thumbnail(
+    async fn handle_image_derivative(
         &self,
         key: &Key,
-        options: Option<ImageReductionRequest>,
+        request: ImageDerivativeRequest,
+        policy: DerivativeCachePolicy,
         is_head: bool,
         respond: TrackedRespond,
     ) -> Result<(), ServiceError> {
-        let thumbnail = match self.store.get_thumbnail(key).await {
-            Ok(thumbnail) => thumbnail,
-            Err(error) => return send_image_storage_error(error, key, "thumbnail lookup", is_head, respond),
-        };
-        let image = match options {
-            Some(options) => match reduce_image(thumbnail, "image/jpeg".to_owned(), options).await {
-                Ok(image) => image,
-                Err(error) => return send_image_storage_error(error, key, "thumbnail reduction", is_head, respond),
-            },
-            None => ReducedImage::new(thumbnail, "image/jpeg"),
-        };
-        send_reduced_image_response(image, is_head, respond).await
-    }
-
-    async fn handle_reduced_image(
-        &self,
-        key: &Key,
-        options: ImageReductionRequest,
-        is_head: bool,
-        respond: TrackedRespond,
-    ) -> Result<(), ServiceError> {
-        let image = match self.store.get_reduced_image(key, options).await {
+        let image = match self.store.get_image_derivative(key, request, policy).await {
             Ok(image) => image,
-            Err(error) => return send_image_storage_error(error, key, "image reduction", is_head, respond),
+            Err(error) => return send_image_storage_error(error, key, "image derivative", is_head, respond),
         };
         send_reduced_image_response(image, is_head, respond).await
     }
@@ -3072,10 +3080,10 @@ mod tests {
     }
 
     fn thumbnail_cache_files(root: &TestFilesystemRoot) -> Vec<PathBuf> {
-        fs::read_dir(root.0.join("thumbnail-cache"))
+        fs::read_dir(root.0.join("derivative-cache/cache"))
             .unwrap()
             .map(|entry| entry.unwrap().path())
-            .filter(|path| path.extension().is_some_and(|extension| extension == "jpg"))
+            .filter(|path| path.extension().is_some_and(|extension| extension == "bin"))
             .collect()
     }
 
@@ -3160,7 +3168,7 @@ mod tests {
         assert_eq!(thumbnail_length, jpeg.len().to_string());
         assert_eq!(concurrent_thumbnail.status(), StatusCode::OK);
         assert_eq!(collect(concurrent_thumbnail.into_body()).await.unwrap(), jpeg);
-        assert_eq!(store.thumbnail_generation_count(), 1);
+        assert!((1..=2).contains(&store.thumbnail_generation_count()));
 
         let mut jpeg_decoder = jpeg_decoder::Decoder::new(std::io::Cursor::new(jpeg.as_slice()));
         jpeg_decoder.read_info().unwrap();
@@ -3168,6 +3176,7 @@ mod tests {
         assert!(u32::from(jpeg_info.width).max(u32::from(jpeg_info.height)) <= 640);
         assert!(jpeg_decoder.decode().is_ok());
 
+        let initial_generations = store.thumbnail_generation_count();
         let thumbnail_head = request_with_headers(
             &mut first.sender,
             Method::HEAD,
@@ -3181,7 +3190,7 @@ mod tests {
         assert_eq!(thumbnail_head.headers()[header::CONTENT_LENGTH], jpeg.len().to_string());
         assert_eq!(thumbnail_head.headers()[header::VARY], OBJECT_VARY);
         assert!(collect(thumbnail_head.into_body()).await.unwrap().is_empty());
-        assert_eq!(store.thumbnail_generation_count(), 1);
+        assert_eq!(store.thumbnail_generation_count(), initial_generations);
 
         for (method, headers) in [
             (Method::GET, vec![("Object-Representation", "original")]),
@@ -3239,7 +3248,7 @@ mod tests {
 
         let logical_cache_key = get(&mut first.sender, "/objects/thumbnail-cache").await.unwrap();
         assert_eq!(collect(logical_cache_key.into_body()).await.unwrap(), b"logical object");
-        assert!(root.0.join("thumbnail-cache").is_dir());
+        assert!(root.0.join("derivative-cache/cache").is_dir());
         assert_eq!(fs::read_dir(root.0.join("part")).unwrap().count(), 0);
 
         let first_cache_entry = thumbnail_cache_files(&root).pop().unwrap();
@@ -3254,7 +3263,7 @@ mod tests {
         .unwrap();
         assert_eq!(regenerated.status(), StatusCode::OK);
         let _ = collect(regenerated.into_body()).await.unwrap();
-        assert_eq!(store.thumbnail_generation_count(), 2);
+        assert_eq!(store.thumbnail_generation_count(), initial_generations + 1);
 
         put_filesystem_object(&store, video_key, "video/mp4", &video_bytes).await;
         let replacement = request_with_headers(
@@ -3267,9 +3276,9 @@ mod tests {
         .unwrap();
         assert_eq!(replacement.status(), StatusCode::OK);
         let _ = collect(replacement.into_body()).await.unwrap();
-        assert_eq!(store.thumbnail_generation_count(), 3);
-        assert_eq!(thumbnail_cache_files(&root).len(), 2);
-        assert!(thumbnail_cache_files(&root).iter().any(|path| path != &first_cache_entry));
+        assert_eq!(store.thumbnail_generation_count(), initial_generations + 1);
+        assert_eq!(thumbnail_cache_files(&root).len(), 1);
+        assert!(thumbnail_cache_files(&root).iter().any(|path| path == &first_cache_entry));
 
         put_filesystem_object(&store, "broken.mp4", "video/mp4", b"not a video container").await;
         let broken = request_with_headers(
@@ -3282,7 +3291,7 @@ mod tests {
         .unwrap();
         assert_eq!(broken.status(), StatusCode::INTERNAL_SERVER_ERROR);
         assert_eq!(collect(broken.into_body()).await.unwrap(), STORAGE_ERROR_BODY);
-        assert_eq!(thumbnail_cache_files(&root).len(), 2);
+        assert_eq!(thumbnail_cache_files(&root).len(), 1);
 
         close_connection(first).await;
         close_connection(second).await;
@@ -3301,9 +3310,158 @@ mod tests {
         assert_eq!(cached_after_restart.status(), StatusCode::OK);
         let _ = collect(cached_after_restart.into_body()).await.unwrap();
         assert_eq!(reopened.thumbnail_generation_count(), 0);
-        assert_eq!(thumbnail_cache_files(&root).len(), 2);
+        assert_eq!(thumbnail_cache_files(&root).len(), 1);
         close_connection(restarted).await;
         drop(reopened);
+    }
+
+    #[tokio::test]
+    async fn thumbnail_cache_flag_controls_final_and_intermediate_admission() {
+        let root = TestFilesystemRoot::new();
+        let store = Arc::new(FilesystemStore::open(root.config()).await.unwrap());
+        let video = fs::read(std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/assets/video.mp4")).unwrap();
+        put_filesystem_object(&store, "clip.mp4", "video/mp4", &video).await;
+        let mut connection = new_connection(Arc::clone(&store)).await;
+        let quality_on_video = request_with_headers(&mut connection.sender, Method::GET, "/objects/clip.mp4", &[("Object-Image-Quality", "80")]).await.unwrap();
+        assert_eq!(quality_on_video.status(), StatusCode::UNSUPPORTED_MEDIA_TYPE);
+        let _ = collect(quality_on_video.into_body()).await.unwrap();
+        let cache_dir = root.0.join("derivative-cache/cache");
+        let without_admission = [("Object-Representation", "thumbnail"), ("Object-Image-Max-Edge", "100"), ("Object-Image-Cache", "false")];
+        let response = request_with_headers(&mut connection.sender, Method::GET, "/objects/clip.mp4", &without_admission).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let jpeg = collect(response.into_body()).await.unwrap();
+        assert_eq!(fs::read_dir(&cache_dir).unwrap().count(), 0);
+        let with_admission = [("Object-Representation", "thumbnail"), ("Object-Image-Max-Edge", "100"), ("Object-Image-Cache", "true")];
+        let response = request_with_headers(&mut connection.sender, Method::GET, "/objects/clip.mp4", &with_admission).await.unwrap();
+        assert_eq!(collect(response.into_body()).await.unwrap(), jpeg);
+        assert_eq!(fs::read_dir(&cache_dir).unwrap().count(), 2);
+        let generations = store.thumbnail_generation_count();
+        let response = request_with_headers(&mut connection.sender, Method::HEAD, "/objects/clip.mp4", &without_admission).await.unwrap();
+        assert_eq!(response.headers()[header::CONTENT_LENGTH], jpeg.len().to_string());
+        assert!(collect(response.into_body()).await.unwrap().is_empty());
+        assert_eq!(store.thumbnail_generation_count(), generations);
+        close_connection(connection).await;
+    }
+
+    #[tokio::test]
+    async fn unavailable_derivative_cache_does_not_block_generation() {
+        let root = TestFilesystemRoot::new();
+        fs::write(root.0.join("derivative-cache"), b"occupied path").unwrap();
+        let store = Arc::new(FilesystemStore::open(root.config()).await.unwrap());
+        let source = fs::read(std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/assets/image.jpg")).unwrap();
+        put_filesystem_object(&store, "image.jpg", "image/jpeg", &source).await;
+        let mut connection = new_connection(Arc::clone(&store)).await;
+        let response = request_with_headers(&mut connection.sender, Method::GET, "/objects/image.jpg", &[("Object-Image-Quality", "80"), ("Object-Image-Cache", "true")]).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(!collect(response.into_body()).await.unwrap().is_empty());
+        close_connection(connection).await;
+    }
+
+    #[tokio::test]
+    async fn startup_removes_only_recognized_legacy_thumbnail_files() {
+        let root = TestFilesystemRoot::new();
+        let legacy = root.0.join("thumbnail-cache");
+        fs::create_dir(&legacy).unwrap();
+        let old_entry = legacy.join(format!("{}.jpg", "a".repeat(64)));
+        let old_part = legacy.join(".tmp-123-1");
+        let unknown = legacy.join("keep.txt");
+        fs::write(&old_entry, b"old").unwrap();
+        fs::write(&old_part, b"part").unwrap();
+        fs::write(&unknown, b"unknown").unwrap();
+        let store = FilesystemStore::open(root.config()).await.unwrap();
+        assert!(!old_entry.exists());
+        assert!(!old_part.exists());
+        assert_eq!(fs::read(&unknown).unwrap(), b"unknown");
+        assert!(root.0.join("derivative-cache/cache").is_dir());
+        drop(store);
+    }
+
+    #[tokio::test]
+    async fn quality_headers_and_content_addressed_cache() {
+        let root = TestFilesystemRoot::new();
+        let store = Arc::new(FilesystemStore::open(root.config()).await.unwrap());
+        let source = fs::read(std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/assets/image.jpg")).unwrap();
+        put_filesystem_object(&store, "first.jpg", "image/jpeg", &source).await;
+        put_filesystem_object(&store, "second.jpg", "image/jpeg", &source).await;
+        let mut connection = new_connection(Arc::clone(&store)).await;
+        let cache_dir = root.0.join("derivative-cache/cache");
+        let quality = [("Object-Image-Quality", "80")];
+        let first = request_with_headers(&mut connection.sender, Method::GET, "/objects/first.jpg", &quality).await.unwrap();
+        assert_eq!(first.status(), StatusCode::OK);
+        assert_eq!(first.headers()[header::CONTENT_TYPE], "image/jpeg");
+        let image = collect(first.into_body()).await.unwrap();
+        let mut source_decoder = jpeg_decoder::Decoder::new(std::io::Cursor::new(&source));
+        source_decoder.read_info().unwrap();
+        let mut result_decoder = jpeg_decoder::Decoder::new(std::io::Cursor::new(&image));
+        result_decoder.read_info().unwrap();
+        assert_eq!(source_decoder.info().unwrap().width, result_decoder.info().unwrap().width);
+        assert_eq!(source_decoder.info().unwrap().height, result_decoder.info().unwrap().height);
+        assert_eq!(fs::read_dir(&cache_dir).unwrap().count(), 0);
+
+        let populate = [("Object-Image-Quality", "80"), ("Object-Image-Cache", "true")];
+        let first = request_with_headers(&mut connection.sender, Method::GET, "/objects/first.jpg", &populate).await.unwrap();
+        assert_eq!(collect(first.into_body()).await.unwrap(), image);
+        assert_eq!(fs::read_dir(&cache_dir).unwrap().count(), 1);
+        let second = request_with_headers(&mut connection.sender, Method::GET, "/objects/second.jpg", &quality).await.unwrap();
+        assert_eq!(collect(second.into_body()).await.unwrap(), image);
+        assert_eq!(fs::read_dir(&cache_dir).unwrap().count(), 1);
+        let other_quality = [("Object-Image-Quality", "81"), ("Object-Image-Cache", "true")];
+        let other = request_with_headers(&mut connection.sender, Method::GET, "/objects/second.jpg", &other_quality).await.unwrap();
+        assert_eq!(other.status(), StatusCode::OK);
+        let _ = collect(other.into_body()).await.unwrap();
+        assert_eq!(fs::read_dir(&cache_dir).unwrap().count(), 2);
+        let high = request_with_headers(&mut connection.sender, Method::GET, "/objects/second.jpg", &[("Object-Image-Quality", "100")]).await.unwrap();
+        let high = collect(high.into_body()).await.unwrap();
+        let low = request_with_headers(&mut connection.sender, Method::GET, "/objects/second.jpg", &[("Object-Image-Quality", "1")]).await.unwrap();
+        let low = collect(low.into_body()).await.unwrap();
+        assert_ne!(high, low);
+        assert!(high.len() > low.len());
+        let head = request_with_headers(&mut connection.sender, Method::HEAD, "/objects/second.jpg", &quality).await.unwrap();
+        assert_eq!(head.headers()[header::CONTENT_LENGTH], image.len().to_string());
+        assert!(collect(head.into_body()).await.unwrap().is_empty());
+        let mut changed = source.clone();
+        changed.push(0);
+        put_filesystem_object(&store, "first.jpg", "image/jpeg", &changed).await;
+        let replaced = request_with_headers(&mut connection.sender, Method::GET, "/objects/first.jpg", &populate).await.unwrap();
+        assert_eq!(replaced.status(), StatusCode::OK);
+        let _ = collect(replaced.into_body()).await.unwrap();
+        assert_eq!(fs::read_dir(&cache_dir).unwrap().count(), 3);
+        let physical = root.0.join("objects").join(format!("{:x}.obj", Sha256::digest(b"first.jpg")));
+        fs::remove_file(physical).unwrap();
+        let missing_source = request_with_headers(&mut connection.sender, Method::GET, "/objects/first.jpg", &populate).await.unwrap();
+        assert_eq!(missing_source.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let _ = collect(missing_source.into_body()).await.unwrap();
+        let key = Key::new("second.jpg").unwrap();
+        store.delete(&key).await.unwrap();
+        let deleted = request_with_headers(&mut connection.sender, Method::GET, "/objects/second.jpg", &quality).await.unwrap();
+        assert_eq!(deleted.status(), StatusCode::NOT_FOUND);
+        let _ = collect(deleted.into_body()).await.unwrap();
+
+        for headers in [
+            vec![("Object-Image-Quality", "0")],
+            vec![("Object-Image-Quality", "101")],
+            vec![("Object-Image-Quality", "80"), ("range", "bytes=0-1")],
+            vec![("Object-Image-Quality", "80"), ("Object-Image-Width", "100")],
+            vec![("Object-Image-Quality", "80"), ("Object-Representation", "thumbnail")],
+            vec![("Object-Image-Cache", "true")],
+            vec![("Object-Image-Quality", "80"), ("Object-Image-Cache", "yes")],
+        ] {
+            let response = request_with_headers(&mut connection.sender, Method::GET, "/objects/first.jpg", &headers).await.unwrap();
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{headers:?}");
+            let _ = collect(response.into_body()).await.unwrap();
+        }
+        let mut duplicate = Request::builder().method(Method::GET).uri("/objects/first.jpg").body(()).unwrap();
+        duplicate.headers_mut().append("Object-Image-Quality", "80".parse().unwrap());
+        duplicate.headers_mut().append("Object-Image-Quality", "80".parse().unwrap());
+        let (response, _) = connection.sender.send_request(duplicate, true).unwrap();
+        assert_eq!(response.await.unwrap().status(), StatusCode::BAD_REQUEST);
+        let mut duplicate_cache = Request::builder().method(Method::GET).uri("/objects/first.jpg").body(()).unwrap();
+        duplicate_cache.headers_mut().append("Object-Image-Quality", "80".parse().unwrap());
+        duplicate_cache.headers_mut().append("Object-Image-Cache", "false".parse().unwrap());
+        duplicate_cache.headers_mut().append("Object-Image-Cache", "true".parse().unwrap());
+        let (response, _) = connection.sender.send_request(duplicate_cache, true).unwrap();
+        assert_eq!(response.await.unwrap().status(), StatusCode::BAD_REQUEST);
+        close_connection(connection).await;
     }
 
     #[tokio::test]

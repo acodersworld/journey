@@ -216,6 +216,34 @@ curl --http2-prior-knowledge \
 cmp crates/journey-storage/examples/assets/image.jpg downloaded.jpg
 ```
 
+For an image at its original display dimensions, request JPEG re-encoding with
+`Object-Image-Quality` (1–100). The scale maps to FFmpeg MJPEG quantizers and
+is not identical to other JPEG encoders. Orientation is applied, transparency
+is composited on white, and only the first frame of animated images is used.
+Quality changes compression but does not promise a smaller file. The original
+object remains unchanged. Quality cannot be combined with reduction headers,
+`Object-Representation`, or `Range`.
+
+```bash
+curl --http2-prior-knowledge \
+  -H 'Object-Image-Quality: 80' \
+  -H 'Object-Image-Cache: true' \
+  http://127.0.0.1:8081/objects/uploaded.jpg \
+  --output reencoded.jpg
+```
+
+`Object-Representation: reduced-image` with image size headers and
+`Object-Representation: thumbnail` continue to work. All three generated
+representations accept `Object-Image-Cache: true|false`. Hits are always read;
+`true` admits misses to disk and `false` leaves misses uncached. Omitted means
+`false` for quality and reduced images, and `true` for thumbnails. `HEAD`
+returns the same generated headers without a body. The filesystem store keeps
+cached derivatives under `derivative-cache/` inside its root. These files are
+disposable and can be regenerated from original objects. The storage service
+configures capacity and eviction with `[derivative_cache]` in its TOML file.
+The example server uses default cache settings; pass
+`--disable-derivative-cache` to turn off disk caching for a local run.
+
 Request and save the first 100 bytes of `image.jpg`:
 
 ```bash

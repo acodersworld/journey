@@ -10,6 +10,14 @@ range_get_summary_interval_seconds = 10
 [diagnostics]
 enabled = false
 
+[derivative_cache]
+enabled = true
+max_bytes = "1GiB"
+max_entry_bytes = "64MiB"
+eviction_interval = "1h"
+eviction_target_percent = 90
+access_timestamp_interval = "1m"
+
 [management]
 bind = "0.0.0.0:8082"
 username = "storage-admin"

@@ -1,249 +1,11 @@
-use std::{
-    collections::HashMap,
-    fs::{self, File, OpenOptions},
-    io::{self, Cursor, Read, Seek, SeekFrom, Write},
-    os::unix::fs::{FileExt, OpenOptionsExt},
-    path::{Path, PathBuf},
-    sync::{
-        Arc, Mutex, Weak,
-        atomic::{AtomicU64, Ordering},
-    },
-};
-#[cfg(test)]
-use std::sync::atomic::AtomicUsize;
-
-use bytes::Bytes;
+use std::{fs::File, io::{self, Read, Seek, SeekFrom}, os::unix::fs::FileExt, sync::Arc};
 use ffmpeg_next as ffmpeg;
-use sha2::{Digest, Sha256};
-use tokio::sync::Mutex as AsyncMutex;
-
 use crate::storage_interface::{StoreError, StoreErrorKind};
-use crate::storage_image_reduction::{
-    MAX_DECODED_IMAGE_PIXELS, acquire_image_reduction_slot, initialize_ffmpeg,
-};
+use crate::storage_image_reduction::{MAX_DECODED_IMAGE_PIXELS, initialize_ffmpeg, normalize_legacy_jpeg_frame};
 
 const MAX_THUMBNAIL_EDGE: u32 = 640;
-const MAX_THUMBNAIL_BYTES: u64 = 16 * 1024 * 1024;
-static NEXT_TEMPORARY_FILE: AtomicU64 = AtomicU64::new(1);
 
-#[derive(Clone, Debug)]
-pub(crate) struct ThumbnailCache {
-    directory: Arc<PathBuf>,
-    time_ms: u64,
-    jobs: Arc<Mutex<HashMap<String, Weak<AsyncMutex<()>>>>>,
-    #[cfg(test)]
-    generation_count: Arc<AtomicUsize>,
-}
-
-impl ThumbnailCache {
-    pub(crate) fn open(directory: impl Into<PathBuf>, time_ms: u64) -> Result<Self, StoreError> {
-        let directory = directory.into();
-        ensure_cache_directory(&directory)?;
-        for entry in fs::read_dir(&directory).map_err(|error| cache_io_error("list thumbnail cache", error))? {
-            let entry = entry.map_err(|error| cache_io_error("read thumbnail cache entry", error))?;
-            if entry.file_name().to_string_lossy().starts_with(".tmp-") {
-                let metadata = entry
-                    .file_type()
-                    .map_err(|error| cache_io_error("inspect thumbnail cache entry", error))?;
-                if metadata.is_file() || metadata.is_symlink() {
-                    fs::remove_file(entry.path())
-                        .map_err(|error| cache_io_error("remove incomplete thumbnail cache entry", error))?;
-                }
-            }
-        }
-
-        Ok(Self {
-            directory: Arc::new(directory),
-            time_ms,
-            jobs: Arc::new(Mutex::new(HashMap::new())),
-            #[cfg(test)]
-            generation_count: Arc::new(AtomicUsize::new(0)),
-        })
-    }
-
-    pub(crate) async fn get_or_generate(
-        &self,
-        file: Arc<File>,
-        metadata_len: u64,
-        payload_len: u64,
-        object_id: String,
-    ) -> Result<Bytes, StoreError> {
-        let cache_name = self.cache_name(&object_id);
-        let job_lock = self.job_lock(&cache_name)?;
-        let _job_guard = job_lock.lock().await;
-        let cache_path = self.directory.join(&cache_name);
-        let read_path = cache_path.clone();
-        let cached = tokio::task::spawn_blocking(move || read_cached_thumbnail(&read_path))
-            .await
-            .map_err(|error| unavailable(format!("Thumbnail cache read task failed: {error}")))??;
-        if let Some(cached) = cached {
-            return Ok(Bytes::from(cached));
-        }
-
-        let permit = acquire_image_reduction_slot().await?;
-        let directory = Arc::clone(&self.directory);
-        let time_ms = self.time_ms;
-        #[cfg(test)]
-        let generation_count = Arc::clone(&self.generation_count);
-        tokio::task::spawn_blocking(move || {
-            let _permit = permit;
-            #[cfg(test)]
-            generation_count.fetch_add(1, Ordering::Relaxed);
-            let jpeg = generate_thumbnail(file, metadata_len, payload_len, time_ms)?;
-            if !is_valid_jpeg(&jpeg) {
-                return Err(internal("FFmpeg produced an invalid JPEG thumbnail"));
-            }
-            write_thumbnail_atomically(&directory, &cache_path, &jpeg)?;
-            Ok(Bytes::from(jpeg))
-        })
-        .await
-        .map_err(|error| unavailable(format!("Thumbnail generation task failed: {error}")))?
-    }
-
-    #[cfg(test)]
-    pub(crate) fn generation_count(&self) -> usize {
-        self.generation_count.load(Ordering::Relaxed)
-    }
-
-    fn cache_name(&self, object_id: &str) -> String {
-        let identity = format!(
-            "thumbnail-v1:{object_id}:{}ms:{MAX_THUMBNAIL_EDGE}px:mjpeg-quality-2",
-            self.time_ms
-        );
-        format!("{}.jpg", lowercase_hex(&Sha256::digest(identity.as_bytes())))
-    }
-
-    fn job_lock(&self, cache_name: &str) -> Result<Arc<AsyncMutex<()>>, StoreError> {
-        let mut jobs = self
-            .jobs
-            .lock()
-            .map_err(|_| internal("Thumbnail job lock is poisoned"))?;
-        jobs.retain(|_, job| job.strong_count() > 0);
-        if let Some(job) = jobs.get(cache_name).and_then(Weak::upgrade) {
-            return Ok(job);
-        }
-        let job = Arc::new(AsyncMutex::new(()));
-        jobs.insert(cache_name.to_owned(), Arc::downgrade(&job));
-        Ok(job)
-    }
-}
-
-fn ensure_cache_directory(directory: &Path) -> Result<(), StoreError> {
-    match fs::symlink_metadata(directory) {
-        Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => Err(unavailable(
-            format!("Thumbnail cache path {} is not a real directory", directory.display()),
-        )),
-        Ok(_) => Ok(()),
-        Err(error) if error.kind() == io::ErrorKind::NotFound => {
-            fs::create_dir(directory).map_err(|error| cache_io_error("create thumbnail cache", error))
-        }
-        Err(error) => Err(cache_io_error("inspect thumbnail cache", error)),
-    }
-}
-
-fn read_cached_thumbnail(path: &Path) -> Result<Option<Vec<u8>>, StoreError> {
-    let metadata = match fs::symlink_metadata(path) {
-        Ok(metadata) => metadata,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
-        Err(error) => return Err(cache_io_error("inspect thumbnail cache entry", error)),
-    };
-    if !metadata.is_file() || metadata.len() == 0 || metadata.len() > MAX_THUMBNAIL_BYTES {
-        return Ok(None);
-    }
-
-    let file = match OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW)
-        .open(path)
-    {
-        Ok(file) => file,
-        Err(error) if error.kind() == io::ErrorKind::NotFound || error.raw_os_error() == Some(libc::ELOOP) => {
-            return Ok(None);
-        }
-        Err(error) => return Err(cache_io_error("open thumbnail cache entry", error)),
-    };
-    let actual_metadata = file
-        .metadata()
-        .map_err(|error| cache_io_error("read thumbnail cache metadata", error))?;
-    if !actual_metadata.is_file()
-        || actual_metadata.len() == 0
-        || actual_metadata.len() > MAX_THUMBNAIL_BYTES
-    {
-        return Ok(None);
-    }
-    let mut bytes = Vec::with_capacity(actual_metadata.len() as usize);
-    file.take(MAX_THUMBNAIL_BYTES + 1)
-        .read_to_end(&mut bytes)
-        .map_err(|error| cache_io_error("read thumbnail cache entry", error))?;
-    if bytes.len() as u64 != actual_metadata.len() || !is_valid_jpeg(&bytes) {
-        return Ok(None);
-    }
-    Ok(Some(bytes))
-}
-
-fn write_thumbnail_atomically(directory: &Path, cache_path: &Path, jpeg: &[u8]) -> Result<(), StoreError> {
-    if jpeg.is_empty() || jpeg.len() as u64 > MAX_THUMBNAIL_BYTES {
-        return Err(internal("Generated JPEG thumbnail has an invalid size"));
-    }
-
-    let mut temporary = None;
-    let mut file = None;
-    for _ in 0..32 {
-        let id = NEXT_TEMPORARY_FILE.fetch_add(1, Ordering::Relaxed);
-        let path = directory.join(format!(".tmp-{}-{id}", std::process::id()));
-        let mut options = OpenOptions::new();
-        options
-            .write(true)
-            .create_new(true)
-            .mode(0o600)
-            .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW);
-        match options.open(&path) {
-            Ok(created) => {
-                temporary = Some(path);
-                file = Some(created);
-                break;
-            }
-            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
-            Err(error) => return Err(cache_io_error("create temporary thumbnail", error)),
-        }
-    }
-    let temporary = temporary.ok_or_else(|| unavailable("Could not allocate a temporary thumbnail file"))?;
-    let mut file = file.unwrap();
-    let write_result = file.write_all(jpeg).and_then(|_| file.sync_all());
-    if let Err(error) = write_result {
-        let _ = fs::remove_file(&temporary);
-        return Err(cache_io_error("write temporary thumbnail", error));
-    }
-    drop(file);
-    if let Err(error) = fs::rename(&temporary, cache_path) {
-        let _ = fs::remove_file(&temporary);
-        return Err(cache_io_error("publish thumbnail cache entry", error));
-    }
-    Ok(())
-}
-
-fn is_valid_jpeg(bytes: &[u8]) -> bool {
-    if bytes.is_empty() || bytes.len() as u64 > MAX_THUMBNAIL_BYTES {
-        return false;
-    }
-    let mut decoder = jpeg_decoder::Decoder::new(Cursor::new(bytes));
-    if decoder.read_info().is_err() {
-        return false;
-    }
-    let Some(info) = decoder.info() else {
-        return false;
-    };
-    if info.width == 0
-        || info.height == 0
-        || u32::from(info.width) > MAX_THUMBNAIL_EDGE
-        || u32::from(info.height) > MAX_THUMBNAIL_EDGE
-    {
-        return false;
-    }
-    decoder.decode().is_ok()
-}
-
-fn generate_thumbnail(
+pub(crate) fn generate_thumbnail(
     file: Arc<File>,
     metadata_len: u64,
     payload_len: u64,
@@ -339,7 +101,7 @@ fn receive_thumbnail_frame(
                     return Err(internal("FFmpeg decoded a corrupt video frame"));
                 }
                 if first_thumbnail.is_none() {
-                    *first_thumbnail = Some(encode_jpeg(&frame)?);
+                    *first_thumbnail = Some(encode_jpeg(&mut frame)?);
                 }
                 if target_ms == 0 {
                     return Ok(first_thumbnail.take());
@@ -350,7 +112,7 @@ fn receive_thumbnail_frame(
                     .and_then(|timestamp| timestamp_to_ms(timestamp, time_base))
                     .is_some_and(|frame_ms| frame_ms >= target_ms)
                 {
-                    return Ok(Some(encode_jpeg(&frame)?));
+                    return Ok(Some(encode_jpeg(&mut frame)?));
                 }
             }
             Err(ffmpeg::Error::Other { errno }) if errno == libc::EAGAIN => return Ok(None),
@@ -371,7 +133,8 @@ fn timestamp_to_ms(timestamp: i64, time_base: ffmpeg::Rational) -> Option<u64> {
     u64::try_from(milliseconds).ok()
 }
 
-fn encode_jpeg(frame: &ffmpeg::frame::Video) -> Result<Vec<u8>, StoreError> {
+fn encode_jpeg(frame: &mut ffmpeg::frame::Video) -> Result<Vec<u8>, StoreError> {
+    normalize_legacy_jpeg_frame(frame);
     let width = frame.width();
     let height = frame.height();
     if width == 0 || height == 0 {
@@ -523,28 +286,10 @@ impl Seek for PayloadReader {
     }
 }
 
-fn lowercase_hex(bytes: &[u8]) -> String {
-    const HEX: &[u8; 16] = b"0123456789abcdef";
-    let mut output = String::with_capacity(bytes.len() * 2);
-    for byte in bytes {
-        output.push(HEX[(byte >> 4) as usize] as char);
-        output.push(HEX[(byte & 0x0f) as usize] as char);
-    }
-    output
-}
-
 fn ffmpeg_error(operation: &str, error: ffmpeg::Error) -> StoreError {
     internal(format!("FFmpeg could not {operation}: {error}"))
 }
 
-fn cache_io_error(operation: &str, error: io::Error) -> StoreError {
-    unavailable(format!("Could not {operation}: {error}"))
-}
-
 fn internal(detail: impl Into<String>) -> StoreError {
     StoreError::new(StoreErrorKind::Internal, detail)
-}
-
-fn unavailable(detail: impl Into<String>) -> StoreError {
-    StoreError::new(StoreErrorKind::Unavailable, detail)
 }

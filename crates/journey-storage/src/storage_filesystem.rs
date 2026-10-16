@@ -13,7 +13,12 @@ use crate::storage_interface::{
     ListPage, ListRequest, ObjectInterface, ObjectMetadata, ObjectName, PutCondition, PutKey,
     PutContextInterface, ReadObject, ReadRange, ReadSpan, StoreError, StoreErrorKind, StoreInterface,
 };
-use crate::storage_thumbnail::ThumbnailCache;
+use crate::storage_derivative_cache::{DerivativeCache, DerivativeCacheSettings};
+use crate::storage_interface::{DerivativeCachePolicy, ImageDerivativeRequest, ReducedImage};
+use crate::storage_image_reduction::{MAX_IMAGE_SOURCE_BYTES, acquire_image_reduction_slot, reduce_image_with_slot, reencode_image_with_slot};
+use crate::storage_thumbnail::generate_thumbnail;
+#[cfg(test)]
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 const FIXED_METADATA_LEN: usize = 84;
 const MIN_METADATA_LEN: usize = 86;
@@ -29,6 +34,7 @@ pub struct FilesystemStoreConfig {
     journal_path: PathBuf,
     max_list_page_size: NonZeroUsize,
     thumbnail_time_ms: u64,
+    derivative_cache: DerivativeCacheSettings,
 }
 
 impl FilesystemStoreConfig {
@@ -39,6 +45,7 @@ impl FilesystemStoreConfig {
             root,
             max_list_page_size: NonZeroUsize::new(1_000).unwrap(),
             thumbnail_time_ms: 0,
+            derivative_cache: DerivativeCacheSettings::default(),
         }
     }
 
@@ -54,6 +61,11 @@ impl FilesystemStoreConfig {
 
     pub fn with_thumbnail_time_ms(mut self, thumbnail_time_ms: u64) -> Self {
         self.thumbnail_time_ms = thumbnail_time_ms;
+        self
+    }
+
+    pub fn with_derivative_cache(mut self, settings: DerivativeCacheSettings) -> Self {
+        self.derivative_cache = settings;
         self
     }
 
@@ -75,10 +87,13 @@ pub struct FilesystemStore {
     config: FilesystemStoreConfig,
     objects_dir: PathBuf,
     part_dir: PathBuf,
-    thumbnail_cache: ThumbnailCache,
+    derivative_cache: Arc<DerivativeCache>,
+    #[cfg(test)]
+    thumbnail_generations: Arc<AtomicUsize>,
     index: Arc<RwLock<BTreeMap<Key, IndexEntry>>>,
     // Keep the flock descriptor alive so this process retains exclusive root ownership.
     _root_lock_file: Arc<File>,
+    cache_maintenance: tokio::task::JoinHandle<()>,
 }
 
 #[derive(Clone, Debug)]
@@ -88,6 +103,7 @@ enum IndexEntry {
         metadata_len: u64,
         file: Arc<File>,
         object_id: String,
+        payload_digest: [u8; 32],
     },
     Corrupt {
         physical_name: String,
@@ -105,19 +121,35 @@ impl FilesystemStore {
             .map_err(|error| unavailable(format!("Storage startup task failed: {error}")))??;
         let mut config = config;
         config.root = output.root;
+        let cache = Arc::downgrade(&output.derivative_cache);
+        let interval = output.derivative_cache.interval();
+        let cache_maintenance = tokio::spawn(async move {
+            let mut timer = tokio::time::interval(interval);
+            timer.tick().await;
+            loop {
+                timer.tick().await;
+                let Some(cache) = cache.upgrade() else { break; };
+                if let Err(error) = tokio::task::spawn_blocking(move || cache.evict()).await {
+                    log::warn!("derivative cache maintenance task failed: {error}");
+                }
+            }
+        });
         Ok(Self {
             config,
             objects_dir: output.objects_dir,
             part_dir: output.part_dir,
-            thumbnail_cache: output.thumbnail_cache,
+            derivative_cache: output.derivative_cache,
+            #[cfg(test)]
+            thumbnail_generations: Arc::new(AtomicUsize::new(0)),
             index: Arc::new(RwLock::new(output.index)),
             _root_lock_file: output.root_lock_file,
+            cache_maintenance,
         })
     }
 
     #[cfg(test)]
     pub(crate) fn thumbnail_generation_count(&self) -> usize {
-        self.thumbnail_cache.generation_count()
+        self.thumbnail_generations.load(Ordering::Relaxed)
     }
 
     fn object_path(&self, key: &Key) -> PathBuf {
@@ -170,6 +202,10 @@ impl FilesystemStore {
     }
 }
 
+impl Drop for FilesystemStore {
+    fn drop(&mut self) { self.cache_maintenance.abort(); }
+}
+
 impl StoreInterface for FilesystemStore {
     type Object = FilesystemObjectReader;
     type PutContextWithKey = FilesystemPutContextWithKey;
@@ -184,7 +220,7 @@ impl StoreInterface for FilesystemStore {
             StoreError::new(StoreErrorKind::NotFound, format!("Object not found: {key}"))
         })?;
         let (metadata, metadata_len, file, object_id) = match entry {
-            IndexEntry::Healthy { metadata, metadata_len, file, object_id } => {
+            IndexEntry::Healthy { metadata, metadata_len, file, object_id, .. } => {
                 (metadata, metadata_len, file, object_id)
             }
             IndexEntry::Corrupt { physical_name, reason, object_id } => {
@@ -215,7 +251,7 @@ impl StoreInterface for FilesystemStore {
             StoreError::new(StoreErrorKind::NotFound, format!("Object not found: {key}"))
         })?;
         match entry {
-            IndexEntry::Healthy { metadata, metadata_len, file, object_id } => {
+            IndexEntry::Healthy { metadata, metadata_len, file, object_id, .. } => {
                 let physical_name = format!("{}.obj", key_digest(key.as_str()));
                 self.verify_file_length(key, &metadata, metadata_len, file, &physical_name, &object_id)
                     .await?;
@@ -231,32 +267,121 @@ impl StoreInterface for FilesystemStore {
     }
 
     async fn get_thumbnail(&self, key: &Key) -> Result<Bytes, StoreError> {
+        Ok(self.get_image_derivative(key, ImageDerivativeRequest::Thumbnail(None), DerivativeCachePolicy::ReadWrite).await?.bytes().clone())
+    }
+
+    async fn get_image_derivative(
+        &self,
+        key: &Key,
+        request: ImageDerivativeRequest,
+        cache_policy: DerivativeCachePolicy,
+    ) -> Result<ReducedImage, StoreError> {
         let entry = self.index.read().await.get(key).cloned().ok_or_else(|| {
             StoreError::new(StoreErrorKind::NotFound, format!("Object not found: {key}"))
         })?;
-        let (metadata, metadata_len, file, object_id) = match entry {
-            IndexEntry::Healthy { metadata, metadata_len, file, object_id } => {
-                (metadata, metadata_len, file, object_id)
-            }
-            IndexEntry::Corrupt { physical_name, reason, object_id } => {
-                return Err(self.corrupt_error(key, &physical_name, &reason, object_id.as_deref()));
-            }
+        let (metadata, metadata_len, file, object_id, payload_digest) = match entry {
+            IndexEntry::Healthy { metadata, metadata_len, file, object_id, payload_digest } =>
+                (metadata, metadata_len, file, object_id, payload_digest),
+            IndexEntry::Corrupt { physical_name, reason, object_id } =>
+                return Err(self.corrupt_error(key, &physical_name, &reason, object_id.as_deref())),
         };
         let physical_name = format!("{}.obj", key_digest(key.as_str()));
-        self.verify_file_length(key, &metadata, metadata_len, Arc::clone(&file), &physical_name, &object_id)
-            .await?;
-        let content_type = metadata.content_type().as_header_value().as_bytes();
-        if !content_type.eq_ignore_ascii_case(b"video/mp4")
-            && !content_type.eq_ignore_ascii_case(b"video/quicktime")
-        {
-            return Err(StoreError::new(
-                StoreErrorKind::UnsupportedMediaType,
-                format!("Object {key} is not a supported video content type"),
-            ));
+        self.verify_file_length(key, &metadata, metadata_len, Arc::clone(&file), &physical_name, &object_id).await?;
+        let path = self.object_path(key);
+        let exists = tokio::task::spawn_blocking(move || fs::symlink_metadata(path).map(|metadata| metadata.is_file() && !metadata.file_type().is_symlink()))
+            .await.map_err(|error| unavailable(format!("Object path inspection task failed: {error}")))?;
+        if !exists.unwrap_or(false) {
+            return Err(self.corrupt_error(key, &physical_name, "published object path is missing or invalid", Some(&object_id)));
         }
-        self.thumbnail_cache
-            .get_or_generate(file, metadata_len, metadata.payload_length(), object_id)
-            .await
+        let content_type = metadata.content_type().as_header_value().to_str()
+            .map_err(|error| StoreError::new(StoreErrorKind::Corrupt, format!("Invalid stored content type: {error}")))?.to_owned();
+        let media_type = content_type.split(';').next().unwrap_or("").trim().to_ascii_lowercase();
+        match &request {
+            ImageDerivativeRequest::Thumbnail(_) if media_type != "video/mp4" && media_type != "video/quicktime" =>
+                return Err(StoreError::new(StoreErrorKind::UnsupportedMediaType, format!("Object {key} is not a supported video content type"))),
+            ImageDerivativeRequest::Quality(_) | ImageDerivativeRequest::Reduced(_) if !media_type.starts_with("image/") =>
+                return Err(StoreError::new(StoreErrorKind::UnsupportedMediaType, format!("Object {key} is not an image"))),
+            _ => {}
+        }
+        if !matches!(request, ImageDerivativeRequest::Thumbnail(_)) && metadata.payload_length() > MAX_IMAGE_SOURCE_BYTES {
+            return Err(StoreError::new(StoreErrorKind::Capacity, "Source image exceeds the decoding limit"));
+        }
+        let identity_text = match &request {
+            ImageDerivativeRequest::Quality(quality) => format!("quality:{}:jpeg", quality.value()),
+            ImageDerivativeRequest::Reduced(options) => format!("reduced:{options:?}"),
+            ImageDerivativeRequest::Thumbnail(options) => format!("thumbnail:{}:{options:?}", self.config.thumbnail_time_ms),
+        };
+        let identity = DerivativeCache::identity(&payload_digest, &media_type, &identity_text);
+        let cache = Arc::clone(&self.derivative_cache);
+        let cached = match tokio::task::spawn_blocking(move || cache.read(&identity)).await {
+            Ok(cached) => cached,
+            Err(error) => { log::warn!("Derivative cache lookup task failed: {error}"); None }
+        };
+        if let Some(image) = cached { return Ok(image); }
+        let permit = acquire_image_reduction_slot().await?;
+        let image = match request {
+            ImageDerivativeRequest::Thumbnail(options) => {
+                let intermediate_identity = DerivativeCache::identity(
+                    &payload_digest, &media_type, &format!("thumbnail:{}:None", self.config.thumbnail_time_ms)
+                );
+                let intermediate = if options.is_some() {
+                    let cache = Arc::clone(&self.derivative_cache);
+                    match tokio::task::spawn_blocking(move || cache.read(&intermediate_identity)).await {
+                        Ok(cached) => cached,
+                        Err(error) => { log::warn!("Thumbnail cache lookup task failed: {error}"); None }
+                    }
+                } else { None };
+                let thumbnail = match intermediate {
+                    Some(image) => { drop(permit); image.bytes().clone() }
+                    None => {
+                        let time_ms = self.config.thumbnail_time_ms;
+                        let payload_len = metadata.payload_length();
+                        #[cfg(test)]
+                        let generations = Arc::clone(&self.thumbnail_generations);
+                        let thumbnail = tokio::task::spawn_blocking(move || {
+                            let _permit = permit;
+                            #[cfg(test)]
+                            generations.fetch_add(1, Ordering::Relaxed);
+                            generate_thumbnail(file, metadata_len, payload_len, time_ms).map(Bytes::from)
+                        }).await.map_err(|error| unavailable(format!("Thumbnail generation task failed: {error}")))??;
+                        if options.is_some() && cache_policy == DerivativeCachePolicy::ReadWrite {
+                            let cache = Arc::clone(&self.derivative_cache);
+                            let image = ReducedImage::new(thumbnail.clone(), "image/jpeg");
+                            if let Err(error) = tokio::task::spawn_blocking(move || cache.write(&intermediate_identity, &image)).await {
+                                log::warn!("Thumbnail cache fill task failed: {error}");
+                            }
+                        }
+                        thumbnail
+                    }
+                };
+                match options {
+                    Some(options) => crate::storage_image_reduction::reduce_image(thumbnail, "image/jpeg".to_owned(), options).await?,
+                    None => ReducedImage::new(thumbnail, "image/jpeg"),
+                }
+            }
+            image_request @ (ImageDerivativeRequest::Reduced(_) | ImageDerivativeRequest::Quality(_)) => {
+                let payload_len = metadata.payload_length();
+                let bytes = tokio::task::spawn_blocking(move || {
+                    let length = usize::try_from(payload_len).map_err(|error| StoreError::new(StoreErrorKind::Capacity, error.to_string()))?;
+                    let mut bytes = vec![0; length];
+                    read_exact_at(&file, &mut bytes, metadata_len).map_err(|error| io_error("read image payload", error))?;
+                    Ok::<Bytes, StoreError>(Bytes::from(bytes))
+                }).await.map_err(|error| unavailable(format!("Image payload task failed: {error}")))??;
+                match image_request {
+                    ImageDerivativeRequest::Reduced(options) => reduce_image_with_slot(bytes, media_type, options, permit).await?,
+                    ImageDerivativeRequest::Quality(quality) => reencode_image_with_slot(bytes, media_type, quality, permit).await?,
+                    _ => unreachable!(),
+                }
+            }
+        };
+        if cache_policy == DerivativeCachePolicy::ReadWrite {
+            let cache = Arc::clone(&self.derivative_cache);
+            let image_for_cache = image.clone();
+            if let Err(error) = tokio::task::spawn_blocking(move || cache.write(&identity, &image_for_cache)).await {
+                log::warn!("Derivative cache fill task failed: {error}");
+            }
+        }
+        Ok(image)
     }
 
     async fn list(&self, request: ListRequest) -> Result<ListPage, StoreError> {
@@ -538,6 +663,7 @@ async fn publish_upload(
             metadata_len,
             file: finalized.file,
             object_id: finalized.object_id,
+            payload_digest: finalized.payload_digest,
         },
     );
     context.publication_state = PublicationState::Published;
@@ -562,6 +688,7 @@ struct FinalizedUpload {
     file: Arc<File>,
     object_id: String,
     object_name: Option<ObjectName>,
+    payload_digest: [u8; 32],
 }
 
 fn finalize_upload(
@@ -616,6 +743,7 @@ fn finalize_upload(
         file: Arc::new(file),
         object_id,
         object_name,
+        payload_digest: digest,
     })
 }
 
@@ -690,7 +818,7 @@ struct InitOutput {
     root: PathBuf,
     objects_dir: PathBuf,
     part_dir: PathBuf,
-    thumbnail_cache: ThumbnailCache,
+    derivative_cache: Arc<DerivativeCache>,
     index: BTreeMap<Key, IndexEntry>,
     root_lock_file: Arc<File>,
 }
@@ -734,7 +862,19 @@ fn initialize_store(
     }
     let root_lock = Arc::new(lock_file);
 
-    let thumbnail_cache = ThumbnailCache::open(root.join("thumbnail-cache"), config.thumbnail_time_ms)?;
+    config.derivative_cache.validate().map_err(|error| unavailable(error))?;
+    let derivative_cache = match DerivativeCache::open(&root, config.derivative_cache.clone()) {
+        Ok(cache) => {
+            if let Err(error) = cleanup_legacy_thumbnail_cache(&root.join("thumbnail-cache")) {
+                log::warn!("legacy thumbnail cache cleanup failed: {error}");
+            }
+            cache
+        }
+        Err(error) => {
+            log::warn!("derivative cache initialization failed: {error}");
+            DerivativeCache::disabled(&root, config.derivative_cache.clone())
+        }
+    };
     clear_part_directory(&part_dir, &config.journal_path)?;
     let (index, skipped) = scan_objects(&objects_dir, &config.journal_path)?;
     log::info!("filesystem_object_store_ready indexed_objects={} skipped_files={skipped}", index.len());
@@ -742,10 +882,32 @@ fn initialize_store(
         root,
         objects_dir,
         part_dir,
-        thumbnail_cache,
+        derivative_cache,
         index,
         root_lock_file: root_lock,
     })
+}
+
+fn cleanup_legacy_thumbnail_cache(directory: &Path) -> Result<(), StoreError> {
+    let entries = match fs::read_dir(directory) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(io_error("list legacy thumbnail cache", error)),
+    };
+    for entry in entries {
+        let entry = entry.map_err(|error| io_error("read legacy thumbnail cache", error))?;
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        let recognized = (name.len() == 68 && name.ends_with(".jpg") && name.as_bytes()[..64].iter().all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(byte)))
+            || name.strip_prefix(".tmp-").is_some_and(|suffix| {
+                let Some((pid, id)) = suffix.split_once('-') else { return false; };
+                !pid.is_empty() && !id.is_empty() && pid.bytes().all(|byte| byte.is_ascii_digit()) && id.bytes().all(|byte| byte.is_ascii_digit())
+            });
+        if recognized && (entry.file_type().map_err(|error| io_error("inspect legacy thumbnail", error))?.is_file()) {
+            fs::remove_file(entry.path()).map_err(|error| io_error("remove legacy thumbnail", error))?;
+        }
+    }
+    Ok(())
 }
 
 fn ensure_directory(path: &Path) -> Result<(), StoreError> {
@@ -860,12 +1022,13 @@ fn scan_objects(
             }
         };
         match parse_object_file(&file, &physical_name, file_metadata.len()) {
-            ParsedObject::Healthy { key, metadata, metadata_len, object_id } => {
+            ParsedObject::Healthy { key, metadata, metadata_len, object_id, payload_digest } => {
                 index.insert(key, IndexEntry::Healthy {
                     metadata,
                     metadata_len: metadata_len as u64,
                     file: Arc::new(file),
                     object_id,
+                    payload_digest,
                 });
             }
             ParsedObject::Corrupt { key: Some(key), reason, object_id } => {
@@ -894,6 +1057,7 @@ enum ParsedObject {
         metadata: ObjectMetadata,
         metadata_len: usize,
         object_id: String,
+        payload_digest: [u8; 32],
     },
     Corrupt {
         key: Option<Key>,
@@ -1036,6 +1200,7 @@ fn parse_object_file(file: &File, physical_name: &str, file_len: u64) -> ParsedO
         metadata: ObjectMetadata::new(key, content_type, payload_len),
         metadata_len,
         object_id,
+        payload_digest: fixed[32..64].try_into().unwrap(),
     }
 }
 

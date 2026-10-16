@@ -296,6 +296,28 @@ impl ImageReductionRequest {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ImageQuality(u8);
+
+impl ImageQuality {
+    pub fn new(value: u8) -> Result<Self, String> {
+        if (1..=100).contains(&value) { Ok(Self(value)) } else { Err("Image quality must be between 1 and 100".to_owned()) }
+    }
+
+    pub fn value(self) -> u8 { self.0 }
+    pub fn quantizer(self) -> usize { (2.0 + 29.0 * (100 - self.0) as f64 / 99.0).round() as usize }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DerivativeCachePolicy { ReadOnly, ReadWrite }
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ImageDerivativeRequest {
+    Quality(ImageQuality),
+    Reduced(ImageReductionRequest),
+    Thumbnail(Option<ImageReductionRequest>),
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ReducedImage {
     bytes: Bytes,
@@ -566,6 +588,59 @@ pub trait StoreInterface: Send + Sync + Sized + 'static {
                 return Err(StoreError::new(StoreErrorKind::Corrupt, "Image payload ended before its stored length"));
             }
             reduce_image_with_slot(Bytes::from(bytes), media_type.to_owned(), request, permit).await
+        }
+    }
+
+    fn get_image_derivative(
+        &self,
+        key: &Key,
+        request: ImageDerivativeRequest,
+        _cache_policy: DerivativeCachePolicy,
+    ) -> impl Future<Output = Result<ReducedImage, StoreError>> + Send {
+        async move {
+            match request {
+                ImageDerivativeRequest::Reduced(options) => self.get_reduced_image(key, options).await,
+                ImageDerivativeRequest::Thumbnail(options) => {
+                    let jpeg = self.get_thumbnail(key).await?;
+                    match options {
+                        Some(options) => crate::storage_image_reduction::reduce_image(jpeg, "image/jpeg".to_owned(), options).await,
+                        None => Ok(ReducedImage::new(jpeg, "image/jpeg")),
+                    }
+                }
+                ImageDerivativeRequest::Quality(quality) => {
+                    let read = self.get(key, None).await?;
+                    let mut object = match read {
+                        GetResult::Found(object) => object,
+                        GetResult::Unsatisfiable { .. } => return Err(StoreError::new(StoreErrorKind::Internal, "Complete image read was unsatisfiable")),
+                    };
+                    let metadata = object.metadata().clone();
+                    let content_type = metadata.content_type().as_header_value().to_str()
+                        .map_err(|error| StoreError::new(StoreErrorKind::Corrupt, format!("Invalid stored content type: {error}")))?;
+                    let media_type = content_type.split(';').next().unwrap_or("").trim();
+                    if !media_type.get(..6).is_some_and(|prefix| prefix.eq_ignore_ascii_case("image/")) {
+                        return Err(StoreError::new(StoreErrorKind::UnsupportedMediaType, format!("Object {key} is not an image")));
+                    }
+                    use crate::storage_image_reduction::{MAX_IMAGE_SOURCE_BYTES, acquire_image_reduction_slot, reencode_image_with_slot};
+                    if metadata.payload_length() > MAX_IMAGE_SOURCE_BYTES {
+                        return Err(StoreError::new(StoreErrorKind::Capacity, "Source image exceeds the decoding limit"));
+                    }
+                    let permit = acquire_image_reduction_slot().await?;
+                    let mut bytes = Vec::with_capacity(metadata.payload_length() as usize);
+                    let mut buffer = BytesMut::from(vec![0_u8; 1024 * 1024].as_slice());
+                    loop {
+                        let count = object.object_mut().read(&mut buffer).await?;
+                        if count == 0 { break; }
+                        if count > buffer.len() || bytes.len().checked_add(count).is_none_or(|length| length > metadata.payload_length() as usize) {
+                            return Err(StoreError::new(StoreErrorKind::Corrupt, "Image payload exceeded its stored length"));
+                        }
+                        bytes.extend_from_slice(&buffer[..count]);
+                    }
+                    if bytes.len() != metadata.payload_length() as usize {
+                        return Err(StoreError::new(StoreErrorKind::Corrupt, "Image payload ended before its stored length"));
+                    }
+                    reencode_image_with_slot(Bytes::from(bytes), media_type.to_owned(), quality, permit).await
+                }
+            }
         }
     }
 

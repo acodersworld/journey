@@ -58,6 +58,7 @@ async fn main() -> AppResult<()> {
         config.storage.initial_connection_window_size,
     )?;
     config.storage.validate_range_get_summary_interval()?;
+    let derivative_cache = config.derivative_cache.settings()?;
     let credentials = WebCredentials::new(
         config.management.username.clone(),
         config.management.password.clone(),
@@ -80,7 +81,8 @@ async fn main() -> AppResult<()> {
     let store = Arc::new(
         FilesystemStore::open(
             FilesystemStoreConfig::new(config.storage.object_dir)
-                .with_thumbnail_time_ms(config.storage.thumbnail_time_ms),
+                .with_thumbnail_time_ms(config.storage.thumbnail_time_ms)
+                .with_derivative_cache(derivative_cache),
         )
             .await
             .map_err(|error| format!("could not open object store at {object_dir_display}: {error}"))?,
