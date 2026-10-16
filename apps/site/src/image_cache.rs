@@ -156,6 +156,7 @@ fn parse_interval(value: &str, name: &str) -> Result<Duration, String> {
 #[serde(tag = "representation", rename_all = "snake_case")]
 enum Representation {
     Original,
+    QualityImage { quality: u8 },
     Thumbnail,
     ReducedImage { max_edge: u32, max_bytes: Option<u64>, video_thumbnail: bool },
 }
@@ -173,6 +174,10 @@ impl Identity {
 
     pub fn thumbnail(storage_key: &str) -> Self {
         Self { storage_key: storage_key.to_owned(), representation: Representation::Thumbnail }
+    }
+
+    pub fn quality_image(storage_key: &str, quality: crate::storage::ImageQuality) -> Self {
+        Self { storage_key: storage_key.to_owned(), representation: Representation::QualityImage { quality: quality.value() } }
     }
 
     pub fn reduced_image(
@@ -316,6 +321,7 @@ impl ImageCache {
             && metadata.identity == *identity
             && metadata.payload_length > 0
             && is_image_content_type(&metadata.content_type)
+            && (!matches!(identity.representation, Representation::QualityImage { .. }) || metadata.content_type == "image/jpeg")
             && HeaderValueCheck::valid(&metadata.content_type)
             && header_length.checked_add(metadata.payload_length) == Some(file_length);
         if !valid {
@@ -1048,6 +1054,8 @@ mod tests {
         let reopened = ImageCache::open(&settings).await.unwrap();
         let hit = reopened.lookup(&identity, false).await.unwrap();
         assert_eq!(collect_body(hit.body).await.unwrap(), b"data");
+        let quality = Identity::quality_image("media/complete", crate::storage::ImageQuality::new(80).unwrap());
+        assert!(reopened.lookup(&quality, false).await.is_none());
     }
 
     #[tokio::test]
@@ -1352,6 +1360,10 @@ mod tests {
     #[test]
     fn identities_distinguish_all_representations_and_options() {
         assert_ne!(identity_filename(&Identity::original("media/a")), identity_filename(&Identity::thumbnail("media/a")));
+        let quality_80 = Identity::quality_image("media/a", crate::storage::ImageQuality::new(80).unwrap());
+        let quality_81 = Identity::quality_image("media/a", crate::storage::ImageQuality::new(81).unwrap());
+        assert_ne!(identity_filename(&Identity::original("media/a")), identity_filename(&quality_80));
+        assert_ne!(identity_filename(&quality_80), identity_filename(&quality_81));
         assert_ne!(
             identity_filename(&Identity::reduced_image("media/a", 1200, Some(500), false)),
             identity_filename(&Identity::reduced_image("media/a", 1200, Some(500), true)),

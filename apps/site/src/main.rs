@@ -573,7 +573,8 @@ async fn main() -> AppResult<()> {
                 }
             });
 
-            let mut app_state = web::state_with_security(database, storage.clone(), security);
+            let mut app_state = web::state_with_security(database, storage.clone(), security)
+                .with_image_quality(storage::ImageQuality::new(config.site.image_quality).map_err(std::io::Error::other)?);
             if let Some(image_cache) = image_cache {
                 app_state = app_state.with_image_cache(image_cache);
             }

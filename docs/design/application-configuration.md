@@ -18,6 +18,10 @@ credentials, and HTTP/2 window sizes before opening persistent storage or
 binding service listeners. CLI options such as `--window-size` override the
 corresponding TOML values for one invocation.
 
+The site's `image_quality` setting defaults to 80 and accepts integers from 1
+through 100. It controls storage-generated JPEGs for displayed images, without
+changing original downloads or the dimensions of displayed media.
+
 Relative database, control-socket, object-directory, and explicitly configured
 image-cache paths are resolved relative to the selected configuration file.
 The default image-cache directory is `image-cache/` beside the site database.

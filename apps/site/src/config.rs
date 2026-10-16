@@ -49,6 +49,7 @@ pub struct SiteSettings {
     pub session_ttl_seconds: i64,
     pub whatsapp_preview_image_ttl_seconds: i64,
     pub max_media_upload_bytes: u64,
+    pub image_quality: u8,
 }
 
 #[derive(Debug, Deserialize)]
@@ -86,6 +87,7 @@ impl Default for SiteSettings {
             session_ttl_seconds: 7 * 24 * 60 * 60,
             whatsapp_preview_image_ttl_seconds: 10,
             max_media_upload_bytes: crate::web::DEFAULT_MAX_MEDIA_UPLOAD_BYTES,
+            image_quality: 80,
         }
     }
 }
@@ -116,6 +118,7 @@ impl AppConfig {
         })?;
         crate::backup::parse_daily(&config.backup.daily_utc)?;
         config.image_cache.validate()?;
+        crate::storage::ImageQuality::new(config.site.image_quality)?;
         let base = path
             .parent()
             .filter(|parent| !parent.as_os_str().is_empty())
@@ -155,6 +158,23 @@ mod tests {
         assert!(!config.diagnostics.enabled);
         assert_eq!(config.logging.queue_capacity, 65_536);
         assert_eq!(config.logging.slow_enqueue_warning_ms, 100);
+        assert_eq!(config.site.image_quality, 80);
+    }
+
+    #[test]
+    fn image_quality_configuration_validates_range() {
+        let directory = std::env::temp_dir().join(format!("journey-config-quality-{}-{}", std::process::id(), NEXT_CONFIG_TEST.fetch_add(1, Ordering::Relaxed)));
+        fs::create_dir_all(&directory).unwrap();
+        let path = directory.join("site.toml");
+        for value in [1, 80, 100] {
+            fs::write(&path, format!("[site]\nimage_quality = {value}\n")).unwrap();
+            assert_eq!(AppConfig::load(Some(path.clone())).unwrap().site.image_quality, value);
+        }
+        for value in [0, 101, 256] {
+            fs::write(&path, format!("[site]\nimage_quality = {value}\n")).unwrap();
+            assert!(AppConfig::load(Some(path.clone())).is_err());
+        }
+        fs::remove_dir_all(directory).unwrap();
     }
 
     #[test]

@@ -1,7 +1,8 @@
 # Website image disk cache
 
 The optional site image cache stores complete image responses on the site host.
-It is disabled by default. When enabled, it caches original images, video
+It is disabled by default. When enabled, it caches quality JPEGs for displayed
+images, original images requested for download, video
 thumbnails, and the reduced JPEG images used by WhatsApp previews. Raw video
 playback, byte ranges, partial responses, errors, and images over the configured
 entry limit continue to stream directly from storage.
@@ -27,7 +28,9 @@ hold the default cache when the database is stored there.
 
 Entries contain versioned identity metadata and the image payload in one file.
 The entry filename is a SHA-256 digest of its storage key, representation, and
-reduction options. Cache contents are populated on request. There is no TTL or
+reduction options. Quality JPEG entries include the configured quality value,
+so changing it cannot reuse an original or a JPEG at another quality. Existing
+cache files remain readable. Cache contents are populated on request. There is no TTL or
 prefetching. Site media keys are assumed to identify immutable bytes; after
 manually replacing content under an existing key, or changing derivative
 generation behavior, clear the affected entries so old bytes are not reused.

@@ -19,7 +19,7 @@ use std::{
 use crate::{
     auth,
     db::{AccountRole, AuthenticatedAccount, Database, FeedCursor, MediaReference, NewBlock, Post, PostAccess, PublishedTextBlock, SaveDraftResult, SavePublishedTextResult, ShareAccess, SidebarData},
-    storage::{StorageBody, StorageClient, UPLOAD_LIMIT_ERROR},
+    storage::{ImageQuality, StorageBody, StorageClient, UPLOAD_LIMIT_ERROR},
 };
 
 const DEFAULT_FEED_LIMIT: usize = 10;
@@ -38,6 +38,7 @@ pub struct AppState<S: StorageClient> {
     security: SiteSecurity,
     preview_image_authorizations: whatsapp_preview::PreviewImageAuthorizations,
     image_cache: Option<std::sync::Arc<crate::image_cache::ImageCache>>,
+    image_quality: ImageQuality,
     performance: Option<std::sync::Arc<journey_performance::Sample>>,
     performance_token: Option<String>,
 }
@@ -586,6 +587,7 @@ async fn shared_media<S: StorageClient>(
     };
     no_store(proxy_media(
         state.image_cache.as_ref(),
+        state.image_quality,
         &state.storage,
         media,
         method,
@@ -2878,6 +2880,7 @@ async fn media<S: StorageClient>(
     };
     proxy_media(
         state.image_cache.as_ref(),
+        state.image_quality,
         &state.storage,
         media,
         method,
@@ -2898,6 +2901,7 @@ fn has_query_flag(query: Option<&str>, name: &str) -> bool {
 
 async fn proxy_media<S: StorageClient>(
     image_cache: Option<&std::sync::Arc<crate::image_cache::ImageCache>>,
+    image_quality: ImageQuality,
     storage: &S,
     media: MediaReference,
     method: Method,
@@ -2910,6 +2914,7 @@ async fn proxy_media<S: StorageClient>(
         return StatusCode::BAD_REQUEST.into_response();
     }
     let head = method == Method::HEAD;
+    let quality_image = is_media_type(&media.content_type, "image/") && !download && !thumbnail;
     let range = if media.content_type.starts_with("video/") && !head && !thumbnail {
         let mut values = headers.get_all(header::RANGE).iter();
         let value = values.next();
@@ -2929,6 +2934,8 @@ async fn proxy_media<S: StorageClient>(
 
     let cache_identity = if thumbnail {
         Some(crate::image_cache::Identity::thumbnail(&media.storage_key))
+    } else if quality_image {
+        Some(crate::image_cache::Identity::quality_image(&media.storage_key, image_quality))
     } else if is_media_type(&media.content_type, "image/") {
         Some(crate::image_cache::Identity::original(&media.storage_key))
     } else {
@@ -2948,7 +2955,7 @@ async fn proxy_media<S: StorageClient>(
             if download {
                 builder = builder.header(header::CONTENT_DISPOSITION, media_download_disposition(&media.content_type, block_id));
             }
-            if !thumbnail {
+            if !thumbnail && !quality_image {
                 builder = builder.header(header::ACCEPT_RANGES, "bytes");
             }
             if head {
@@ -2958,14 +2965,37 @@ async fn proxy_media<S: StorageClient>(
         }
     }
 
-    let stored = match storage.get(&media.storage_key, range, head, thumbnail).await {
+    let stored = if quality_image {
+        storage.get_quality_image(&media.storage_key, image_quality, head).await
+    } else {
+        storage.get(&media.storage_key, range, head, thumbnail).await
+    };
+    let stored = match stored {
         Ok(stored) => stored,
         Err(error) => {
             log::error!("website storage request failed: {error}");
             return StatusCode::BAD_GATEWAY.into_response();
         }
     };
-    let response_content_type = if thumbnail {
+    if quality_image && (stored.status == StatusCode::PAYLOAD_TOO_LARGE || stored.status == StatusCode::UNSUPPORTED_MEDIA_TYPE) {
+        return proxy_original_image(storage, &media, head).await;
+    }
+    if quality_image && stored.status.is_success() && stored.status != StatusCode::OK {
+        log::error!("website quality image response has invalid status key={} status={}", media.storage_key, stored.status);
+        return StatusCode::BAD_GATEWAY.into_response();
+    }
+    if quality_image && stored.status == StatusCode::OK {
+        let valid_type = stored.headers.get(header::CONTENT_TYPE).is_some_and(|value| value == "image/jpeg");
+        let valid_length = stored.headers.get(header::CONTENT_LENGTH)
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.parse::<u64>().ok())
+            .is_some_and(|length| length > 0);
+        if !valid_type || !valid_length {
+            log::error!("website quality image response has invalid metadata key={}", media.storage_key);
+            return StatusCode::BAD_GATEWAY.into_response();
+        }
+    }
+    let response_content_type = if thumbnail || (quality_image && stored.status == StatusCode::OK) {
         "image/jpeg".to_owned()
     } else {
         media.content_type.clone()
@@ -2980,7 +3010,7 @@ async fn proxy_media<S: StorageClient>(
     if let Some(value) = stored.headers.get(header::CONTENT_LENGTH) {
         builder = builder.header(header::CONTENT_LENGTH, value);
     }
-    if !thumbnail {
+    if !thumbnail && !quality_image {
         for name in [header::ACCEPT_RANGES, header::CONTENT_RANGE] {
             if let Some(value) = stored.headers.get(&name) {
                 builder = builder.header(name, value);
@@ -3006,6 +3036,27 @@ async fn proxy_media<S: StorageClient>(
     })
 }
 
+async fn proxy_original_image<S: StorageClient>(storage: &S, media: &MediaReference, head: bool) -> Response {
+    let stored = match storage.get(&media.storage_key, None, head, false).await {
+        Ok(stored) => stored,
+        Err(error) => {
+            log::error!("website original image fallback failed: {error}");
+            return StatusCode::BAD_GATEWAY.into_response();
+        }
+    };
+    let mut builder = Response::builder()
+        .status(stored.status)
+        .header(header::CONTENT_TYPE, &media.content_type)
+        .header(header::X_CONTENT_TYPE_OPTIONS, "nosniff");
+    for name in [header::CONTENT_LENGTH, header::ACCEPT_RANGES, header::CONTENT_RANGE] {
+        if let Some(value) = stored.headers.get(&name) {
+            builder = builder.header(name, value);
+        }
+    }
+    let body = if head { Body::empty() } else { Body::from_stream(stored.body) };
+    builder.body(body).unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
+}
+
 fn media_download_disposition(content_type: &str, block_id: i64) -> String {
     let extension = match content_type {
         "image/jpeg" => "jpg",
@@ -3027,6 +3078,7 @@ pub fn state<S: StorageClient>(database: Database, storage: S) -> AppState<S> {
         database,
         storage,
         image_cache: None,
+        image_quality: ImageQuality::new(80).unwrap(),
         preview_image_authorizations: whatsapp_preview::PreviewImageAuthorizations::default(),
         performance: None,
         performance_token: None,
@@ -3051,12 +3103,18 @@ pub fn state_with_security<S: StorageClient>(
         security,
         preview_image_authorizations: whatsapp_preview::PreviewImageAuthorizations::default(),
         image_cache: None,
+        image_quality: ImageQuality::new(80).unwrap(),
         performance: None,
         performance_token: None,
     }
 }
 
 impl<S: StorageClient> AppState<S> {
+    pub fn with_image_quality(mut self, image_quality: ImageQuality) -> Self {
+        self.image_quality = image_quality;
+        self
+    }
+
     pub fn with_image_cache(mut self, image_cache: std::sync::Arc<crate::image_cache::ImageCache>) -> Self {
         self.image_cache = Some(image_cache);
         self
@@ -3090,13 +3148,13 @@ mod tests {
         auth,
         db::{AccountRole, Database, NewPost, Post, PostAccess, PostBlock, PostSummary, ShareAccess, SidebarData},
         image_cache::{ByteLimit, ImageCache, Settings as ImageCacheSettings},
-        storage::{StorageBody, StorageClient, StorageResponse},
+        storage::{ImageQuality, StorageBody, StorageClient, StorageResponse},
     };
     use bytes::Bytes;
     use axum::{
         body::{to_bytes, Body},
         extract::{ConnectInfo, Extension, Query, State},
-        http::{header, Request, StatusCode},
+        http::{header, HeaderMap, Method, Request, StatusCode},
         response::Response,
     };
     use tower::ServiceExt;
@@ -3179,6 +3237,13 @@ mod tests {
                 headers,
                 body,
             })
+        }
+
+        async fn get_quality_image(&self, key: &str, _quality: ImageQuality, head: bool) -> Result<StorageResponse, String> {
+            let mut response = self.get(key, None, head, false).await?;
+            response.headers.insert(header::CONTENT_TYPE, http::HeaderValue::from_static("image/jpeg"));
+            response.headers.remove(header::ACCEPT_RANGES);
+            Ok(response)
         }
     }
 
@@ -3263,56 +3328,151 @@ mod tests {
 
         let first = media_request(&app, "GET", "/posts/1/blocks/2/media", Some(&cookie), None).await;
         assert_eq!(first.status(), StatusCode::OK);
+        assert_eq!(first.headers()[header::CONTENT_TYPE], "image/jpeg");
+        assert!(first.headers().get(header::ACCEPT_RANGES).is_none());
         assert_eq!(to_bytes(first.into_body(), usize::MAX).await.unwrap(), "data");
         assert_eq!(get_calls.load(Ordering::Relaxed), 1);
 
         let reused = media_request(&app, "GET", "/posts/1/blocks/3/media?download=1", Some(&cookie), None).await;
         assert_eq!(reused.headers()[header::CONTENT_DISPOSITION], "attachment; filename=\"media-3.jpg\"");
+        assert_eq!(reused.headers()[header::CONTENT_TYPE], "image/jpeg");
         assert_eq!(to_bytes(reused.into_body(), usize::MAX).await.unwrap(), "data");
-        assert_eq!(get_calls.load(Ordering::Relaxed), 1);
+        assert_eq!(get_calls.load(Ordering::Relaxed), 2);
 
         let cached_head = media_request(&app, "HEAD", "/posts/1/blocks/3/media", Some(&cookie), None).await;
         assert_eq!(cached_head.headers()[header::CONTENT_LENGTH], "4");
         assert!(to_bytes(cached_head.into_body(), usize::MAX).await.unwrap().is_empty());
-        assert_eq!(get_calls.load(Ordering::Relaxed), 1);
+        assert_eq!(get_calls.load(Ordering::Relaxed), 2);
 
         let head_miss = media_request(&app, "HEAD", "/posts/1/blocks/4/media", Some(&cookie), None).await;
         assert_eq!(head_miss.headers()[header::CONTENT_LENGTH], "4");
-        assert_eq!(get_calls.load(Ordering::Relaxed), 2);
+        assert_eq!(head_miss.headers()[header::CONTENT_TYPE], "image/jpeg");
+        assert_eq!(get_calls.load(Ordering::Relaxed), 3);
         let first_after_head = media_request(&app, "GET", "/posts/1/blocks/4/media", Some(&cookie), None).await;
         assert_eq!(to_bytes(first_after_head.into_body(), usize::MAX).await.unwrap(), "data");
-        assert_eq!(get_calls.load(Ordering::Relaxed), 3);
+        assert_eq!(get_calls.load(Ordering::Relaxed), 4);
 
         for _ in 0..2 {
             let video = media_request(&app, "GET", "/posts/1/blocks/5/media", Some(&cookie), None).await;
             assert_eq!(to_bytes(video.into_body(), usize::MAX).await.unwrap(), "data");
         }
-        assert_eq!(get_calls.load(Ordering::Relaxed), 5);
+        assert_eq!(get_calls.load(Ordering::Relaxed), 6);
         for _ in 0..2 {
             let partial = media_request(&app, "GET", "/posts/1/blocks/5/media", Some(&cookie), Some("bytes=0-3")).await;
             assert_eq!(partial.status(), StatusCode::PARTIAL_CONTENT);
             let _ = to_bytes(partial.into_body(), usize::MAX).await.unwrap();
         }
-        assert_eq!(get_calls.load(Ordering::Relaxed), 7);
+        assert_eq!(get_calls.load(Ordering::Relaxed), 8);
 
         let thumbnail = media_request(&app, "GET", "/posts/1/blocks/5/media?thumbnail=1", Some(&cookie), None).await;
         assert_eq!(to_bytes(thumbnail.into_body(), usize::MAX).await.unwrap(), "data");
         let thumbnail_hit = media_request(&app, "GET", "/posts/1/blocks/5/media?thumbnail=1", Some(&cookie), None).await;
         assert_eq!(to_bytes(thumbnail_hit.into_body(), usize::MAX).await.unwrap(), "data");
-        assert_eq!(get_calls.load(Ordering::Relaxed), 8);
+        assert_eq!(get_calls.load(Ordering::Relaxed), 9);
 
         for _ in 0..2 {
             let oversized = media_request(&app, "GET", "/posts/1/blocks/6/media", Some(&cookie), None).await;
             assert_eq!(to_bytes(oversized.into_body(), usize::MAX).await.unwrap(), "12345678");
         }
-        assert_eq!(get_calls.load(Ordering::Relaxed), 10);
+        assert_eq!(get_calls.load(Ordering::Relaxed), 11);
         let unauthorized_cached = media_request(&app, "GET", "/posts/1/blocks/2/media", None, None).await;
         assert_eq!(unauthorized_cached.status(), StatusCode::UNAUTHORIZED);
-        assert_eq!(get_calls.load(Ordering::Relaxed), 10);
+        assert_eq!(get_calls.load(Ordering::Relaxed), 11);
 
         drop(app);
         drop(cache);
         std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[derive(Clone)]
+    struct QualityScenarioStorage {
+        status: StatusCode,
+        content_type: Option<&'static str>,
+        content_length: Option<&'static str>,
+        quality_calls: Arc<AtomicUsize>,
+        original_calls: Arc<AtomicUsize>,
+        fail_transport: bool,
+    }
+
+    impl StorageClient for QualityScenarioStorage {
+        async fn put_file(&self, _content_type: &str, _path: &Path) -> Result<String, String> { unreachable!() }
+        async fn put_stream(&self, _content_type: &str, _content_length: Option<u64>, _body: StorageBody, _max_bytes: u64) -> Result<(String, u64), String> { unreachable!() }
+        async fn get(&self, _key: &str, _range: Option<&str>, head: bool, _thumbnail: bool) -> Result<StorageResponse, String> {
+            self.original_calls.fetch_add(1, Ordering::Relaxed);
+            let mut headers = http::HeaderMap::new();
+            headers.insert(header::CONTENT_TYPE, http::HeaderValue::from_static("image/png"));
+            headers.insert(header::CONTENT_LENGTH, http::HeaderValue::from_static("8"));
+            headers.insert(header::ACCEPT_RANGES, http::HeaderValue::from_static("bytes"));
+            let body: StorageBody = if head { Box::pin(futures_util::stream::empty()) } else { Box::pin(futures_util::stream::once(async { Ok(Bytes::from_static(b"original")) })) };
+            Ok(StorageResponse { status: StatusCode::OK, headers, body })
+        }
+        async fn get_quality_image(&self, _key: &str, quality: ImageQuality, head: bool) -> Result<StorageResponse, String> {
+            assert_eq!(quality.value(), 80);
+            self.quality_calls.fetch_add(1, Ordering::Relaxed);
+            if self.fail_transport { return Err("storage disconnected".to_owned()); }
+            let mut headers = http::HeaderMap::new();
+            if let Some(value) = self.content_type { headers.insert(header::CONTENT_TYPE, http::HeaderValue::from_static(value)); }
+            if let Some(value) = self.content_length { headers.insert(header::CONTENT_LENGTH, http::HeaderValue::from_static(value)); }
+            headers.insert(header::ACCEPT_RANGES, http::HeaderValue::from_static("bytes"));
+            let body: StorageBody = if head { Box::pin(futures_util::stream::empty()) } else { Box::pin(futures_util::stream::once(async { Ok(Bytes::from_static(b"jpeg")) })) };
+            Ok(StorageResponse { status: self.status, headers, body })
+        }
+    }
+
+    #[tokio::test]
+    async fn quality_proxy_uses_jpeg_metadata_and_only_falls_back_for_unsupported_conversion() {
+        for source_type in ["image/png", "image/webp", "image/gif"] {
+            let storage = QualityScenarioStorage {
+                status: StatusCode::OK,
+                content_type: Some("image/jpeg"),
+                content_length: Some("4"),
+                quality_calls: Arc::new(AtomicUsize::new(0)),
+                original_calls: Arc::new(AtomicUsize::new(0)),
+                fail_transport: false,
+            };
+            let media = crate::db::MediaReference { storage_key: "media/image".to_owned(), content_type: source_type.to_owned() };
+            let response = super::proxy_media(None, ImageQuality::new(80).unwrap(), &storage, media.clone(), Method::GET, HeaderMap::new(), false, false, 7).await;
+            assert_eq!(response.status(), StatusCode::OK);
+            assert_eq!(response.headers()[header::CONTENT_TYPE], "image/jpeg");
+            assert_eq!(response.headers()[header::CONTENT_LENGTH], "4");
+            assert!(response.headers().get(header::ACCEPT_RANGES).is_none());
+            assert_eq!(to_bytes(response.into_body(), usize::MAX).await.unwrap(), "jpeg");
+            let original = super::proxy_media(None, ImageQuality::new(80).unwrap(), &storage, media, Method::GET, HeaderMap::new(), true, false, 7).await;
+            assert_eq!(original.headers()[header::CONTENT_TYPE], source_type);
+            assert!(original.headers()[header::CONTENT_DISPOSITION].to_str().unwrap().starts_with("attachment;"));
+            assert_eq!(to_bytes(original.into_body(), usize::MAX).await.unwrap(), "original");
+            assert_eq!(storage.quality_calls.load(Ordering::Relaxed), 1);
+            assert_eq!(storage.original_calls.load(Ordering::Relaxed), 1);
+        }
+        for status in [StatusCode::PAYLOAD_TOO_LARGE, StatusCode::UNSUPPORTED_MEDIA_TYPE, StatusCode::NOT_FOUND, StatusCode::INTERNAL_SERVER_ERROR, StatusCode::PARTIAL_CONTENT] {
+            let storage = QualityScenarioStorage {
+                status,
+                content_type: None,
+                content_length: None,
+                quality_calls: Arc::new(AtomicUsize::new(0)),
+                original_calls: Arc::new(AtomicUsize::new(0)),
+                fail_transport: false,
+            };
+            let media = crate::db::MediaReference { storage_key: "media/image".to_owned(), content_type: "image/png".to_owned() };
+            let response = super::proxy_media(None, ImageQuality::new(80).unwrap(), &storage, media, Method::GET, HeaderMap::new(), false, false, 7).await;
+            let fallback = status == StatusCode::PAYLOAD_TOO_LARGE || status == StatusCode::UNSUPPORTED_MEDIA_TYPE;
+            assert_eq!(response.status(), if fallback { StatusCode::OK } else if status.is_success() { StatusCode::BAD_GATEWAY } else { status });
+            assert_eq!(storage.original_calls.load(Ordering::Relaxed), usize::from(fallback));
+            if fallback {
+                assert_eq!(response.headers()[header::CONTENT_TYPE], "image/png");
+                assert_eq!(to_bytes(response.into_body(), usize::MAX).await.unwrap(), "original");
+            }
+        }
+        for (content_type, content_length, transport_error) in [(Some("image/png"), Some("4"), false), (Some("image/jpeg"), Some("0"), false), (None, Some("4"), false), (Some("image/jpeg"), Some("4"), true)] {
+            let storage = QualityScenarioStorage {
+                status: StatusCode::OK, content_type, content_length,
+                quality_calls: Arc::new(AtomicUsize::new(0)), original_calls: Arc::new(AtomicUsize::new(0)), fail_transport: transport_error,
+            };
+            let media = crate::db::MediaReference { storage_key: "media/image".to_owned(), content_type: "image/png".to_owned() };
+            let response = super::proxy_media(None, ImageQuality::new(80).unwrap(), &storage, media, Method::GET, HeaderMap::new(), false, false, 7).await;
+            assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+            assert_eq!(storage.original_calls.load(Ordering::Relaxed), 0);
+        }
     }
 
     #[tokio::test]

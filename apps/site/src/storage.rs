@@ -28,6 +28,17 @@ const MEDIA_KEY_PREFIX: &str = "media/";
 pub type StorageBody = Pin<Box<dyn Stream<Item = Result<Bytes, std::io::Error>> + Send>>;
 pub const UPLOAD_LIMIT_ERROR: &str = "media file exceeds configured size limit";
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ImageQuality(u8);
+
+impl ImageQuality {
+    pub fn new(value: u8) -> Result<Self, String> {
+        if (1..=100).contains(&value) { Ok(Self(value)) } else { Err("site.image_quality must be between 1 and 100".to_owned()) }
+    }
+
+    pub fn value(self) -> u8 { self.0 }
+}
+
 pub struct StorageResponse {
     pub status: StatusCode,
     pub headers: http::HeaderMap,
@@ -104,6 +115,18 @@ pub trait StorageClient: Clone + Send + Sync + 'static {
         async move {
             let _ = (key, options, video_thumbnail, head);
             Err("Reduced image requests are unavailable for this storage client".to_owned())
+        }
+    }
+
+    fn get_quality_image(
+        &self,
+        key: &str,
+        quality: ImageQuality,
+        head: bool,
+    ) -> impl Future<Output = Result<StorageResponse, String>> + Send {
+        async move {
+            let _ = (key, quality, head);
+            Err("Quality image requests are unavailable for this storage client".to_owned())
         }
     }
 }
@@ -440,6 +463,10 @@ macro_rules! impl_storage_client {
             ) -> Result<StorageResponse, String> {
                 get_reduced_image(self, key, options, video_thumbnail, head).await
             }
+
+            async fn get_quality_image(&self, key: &str, quality: ImageQuality, head: bool) -> Result<StorageResponse, String> {
+                get_quality_image(self, key, quality, head).await
+            }
         }
     };
 }
@@ -506,6 +533,13 @@ impl StorageClient for SiteStorageClient {
         match self {
             Self::H2c(client) => get_reduced_image(client, key, options, video_thumbnail, head).await,
             Self::WebSocket(client) => get_reduced_image(client, key, options, video_thumbnail, head).await,
+        }
+    }
+
+    async fn get_quality_image(&self, key: &str, quality: ImageQuality, head: bool) -> Result<StorageResponse, String> {
+        match self {
+            Self::H2c(client) => get_quality_image(client, key, quality, head).await,
+            Self::WebSocket(client) => get_quality_image(client, key, quality, head).await,
         }
     }
 }
@@ -646,7 +680,10 @@ async fn get<T: StorageRequestTransport>(
 ) -> Result<StorageResponse, String> {
     let method = if head { Method::HEAD } else { Method::GET };
     let representation = thumbnail.then_some("thumbnail");
-    let request = storage_request(method, key, range, None, None, false, false, representation)?;
+    let mut request = storage_request(method, key, range, None, None, false, false, representation)?;
+    if thumbnail {
+        request.headers_mut().insert("Object-Image-Cache", http::HeaderValue::from_static("true"));
+    }
     get_response(transport, request, head).await
 }
 
@@ -701,6 +738,20 @@ async fn get_reduced_image<T: StorageRequestTransport>(
             value,
         );
     }
+    headers.insert("Object-Image-Cache", http::HeaderValue::from_static("true"));
+    get_response(transport, request, head).await
+}
+
+async fn get_quality_image<T: StorageRequestTransport>(
+    transport: &T,
+    key: &str,
+    quality: ImageQuality,
+    head: bool,
+) -> Result<StorageResponse, String> {
+    let method = if head { Method::HEAD } else { Method::GET };
+    let mut request = storage_request(method, key, None, None, None, false, false, None)?;
+    request.headers_mut().insert("Object-Image-Quality", quality.value().to_string().parse().map_err(|error| format!("invalid image quality header: {error}"))?);
+    request.headers_mut().insert("Object-Image-Cache", http::HeaderValue::from_static("true"));
     get_response(transport, request, head).await
 }
 
@@ -858,6 +909,89 @@ mod tests {
         }
         assert_eq!(received, b"test");
         client.close().await;
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn image_requests_send_exact_derivative_headers() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut connection = h2::server::handshake(stream).await.unwrap();
+            for (method, quality) in [(Method::HEAD, true), (Method::GET, true), (Method::GET, false), (Method::GET, false)] {
+                let (request, mut respond) = connection.accept().await.unwrap().unwrap();
+                assert_eq!(request.method(), method);
+                assert_eq!(request.uri().path(), "/objects/media/example");
+                assert_eq!(request.headers()["object-image-cache"], "true");
+                assert!(request.headers().get(header::RANGE).is_none());
+                if quality {
+                    assert_eq!(request.headers()["object-image-quality"], "80");
+                    for name in ["object-representation", "object-image-max-edge", "object-image-max-bytes", "object-image-fit", "object-image-format"] {
+                        assert!(request.headers().get(name).is_none(), "{name}");
+                    }
+                } else if request.headers().get("object-image-max-edge").is_some() {
+                    assert!(request.headers().get("object-image-quality").is_none());
+                    assert_eq!(request.headers()["object-representation"], "reduced-image");
+                    assert_eq!(request.headers()["object-image-max-edge"], "1200");
+                    assert_eq!(request.headers()["object-image-max-bytes"], "500");
+                } else {
+                    assert!(request.headers().get("object-image-quality").is_none());
+                    assert_eq!(request.headers()["object-representation"], "thumbnail");
+                }
+                let response = http::Response::builder().status(StatusCode::OK).body(()).unwrap();
+                respond.send_response(response, true).unwrap();
+            }
+            let _ = connection.accept().await;
+        });
+        let client = H2cStorageClient::connect(address, 512 * 1024, 4 * 1024 * 1024).await.unwrap();
+        let quality = ImageQuality::new(80).unwrap();
+        client.get_quality_image("media/example", quality, true).await.unwrap();
+        client.get_quality_image("media/example", quality, false).await.unwrap();
+        client.get_reduced_image("media/example", ImageReductionOptions::new(1200, Some(500)).unwrap(), false, false).await.unwrap();
+        client.get("media/example", None, false, true).await.unwrap();
+        client.close().await;
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn websocket_image_requests_use_the_same_headers() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut session = journey_websocket::accept_server(stream, Config::default()).await.unwrap();
+            for method in [Method::HEAD, Method::GET] {
+                let (request, mut respond) = session.accept().await.unwrap().unwrap();
+                assert_eq!(request.method(), method);
+                assert_eq!(request.uri().path(), "/objects/media/example");
+                assert_eq!(request.headers()["object-image-quality"], "80");
+                assert_eq!(request.headers()["object-image-cache"], "true");
+                for name in ["object-representation", "object-image-max-edge", "object-image-max-bytes", "object-image-fit", "object-image-format", "range"] {
+                    assert!(request.headers().get(name).is_none(), "{name}");
+                }
+                let response = http::Response::builder().status(StatusCode::OK).body(()).unwrap();
+                respond.send_response(response, true).unwrap();
+            }
+            let _ = session.accept().await;
+        });
+        let client = WebSocketStorageClient::new(512 * 1024, 4 * 1024 * 1024);
+        let request = journey_websocket::tungstenite::ClientRequestBuilder::new(format!("ws://{address}").parse().unwrap())
+            .with_header("Sec-WebSocket-Protocol", journey_websocket::SUBPROTOCOL);
+        let (websocket, _) = tokio_tungstenite::connect_async(request).await.unwrap();
+        let serving = tokio::spawn({
+            let client = client.clone();
+            async move { client.serve_connection(websocket, crate::shutdown::listen()).await }
+        });
+        for _ in 0..1_000 {
+            if client.connection.lock().await.sender.is_some() { break; }
+            tokio::task::yield_now().await;
+        }
+        let quality = ImageQuality::new(80).unwrap();
+        client.get_quality_image("media/example", quality, true).await.unwrap();
+        client.get_quality_image("media/example", quality, false).await.unwrap();
+        serving.abort();
+        let _ = serving.await;
         server.await.unwrap();
     }
 
