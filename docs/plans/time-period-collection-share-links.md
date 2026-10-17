@@ -3,8 +3,8 @@
 ## Summary
 
 Allow an external script to submit a title and time bounds, receive a share
-link, and email it. Recipients see a compact mosaic with one tile per post and
-open individual posts in an overlay.
+link, and email it. Recipients see a compact paginated list of posts and open
+individual posts in the shared full-post viewer overlay.
 
 The website handles collection creation and guest access. Scheduling and email
 delivery remain in the external script.
@@ -55,7 +55,7 @@ delivery remain in the external script.
 - Opening `/collection-share/{id}/{secret}` issues a link-scoped guest cookie
   and redirects to `/collection-share/{id}`.
 - Revalidate session, expiry, revocation, membership, and publication state on
-  every collection, post, cover, and media request. Collection guests gain no
+  every collection, post, and media request. Collection guests gain no
   access to other posts or drafts.
 - Add CLI listing and revocation for collection links. Revocation invalidates
   access through existing guest sessions.
@@ -63,27 +63,25 @@ delivery remain in the external script.
   existing accounts, posts, media references, links, and sessions; do not
   recreate the database.
 
-## Compact mosaic and post overlay
+## Collection list and viewer integration
 
-- Use the existing dark theme and responsive CSS Grid, with one tile per
-  selected post. Show the supplied collection title, post title, author, and
-  publication time converted to the visitor's local time.
-- Use the first image or video in post order as the cover. Request a reduced
-  image or video thumbnail through existing storage capabilities, with a fixed
-  640-pixel maximum edge. Text-only posts and failed covers use a text
-  placeholder.
-- Load tiles in pages of 24, with on-demand loading and a Load more fallback.
-  Lazy-load cover images.
-- Clicking a tile fetches the authorized post fragment into a native modal
-  [`<dialog>`](https://developer.mozilla.org/en-US/docs/Web/HTML/Reference/Elements/dialog).
-  Keep the mosaic and its scroll position underneath.
-- Provide a persistent top-right close button and Escape dismissal, restore
-  focus to the selected tile, and use the available viewport on mobile.
-- Reuse post rendering, galleries, thumbnails, and video controls. Closing the
-  post pauses its videos, clears media sources, and cancels pending loading.
-  Closing a nested gallery returns to the post overlay.
-- Provide an authorized standalone post page as the tile link fallback. Show
-  loading and retryable error states in the overlay.
+- Use the existing dark theme and a compact list with one entry per selected
+  post. Show the supplied collection title, post titles, summaries, authors,
+  and publication times converted to the visitor's local time.
+- Load entries in pages of 24, with on-demand loading and a Load more fallback.
+  No mosaic or cover-image generation is required.
+- Reuse the viewer behavior defined in
+  [Full-post viewer overlay](full-post-viewer-overlay.md), including its
+  same-origin iframe, dismissal, focus restoration, retained underlying scroll
+  position, loading/error states, nested galleries, and media cleanup. Do not
+  implement a second overlay.
+- Add collection-authorized inline post URLs and wire collection entries to
+  that shared viewer. These routes must use the collection guest session and
+  revalidate expiry, revocation, membership, and publication state; the
+  account-authenticated viewer route does not authorize collection guests.
+- Provide those inline post pages as real link fallbacks for modified clicks
+  and JavaScript-disabled navigation. Render full posts without mosaics,
+  retaining captions and collection-authorized media URLs.
 - Apply existing guest caching and logging policies, adding safe route
   templates for the new endpoints. Never log credentials or share secrets.
 
@@ -95,8 +93,10 @@ delivery remain in the external script.
   cross-collection access, unrelated media, and unpublished posts.
 - Verify migration preserves populated deployed data and existing single-post
   sharing.
-- Check desktop and mobile mosaics, pagination, overlay dismissal, focus
-  restoration, retained scroll position, nested galleries, and video cleanup.
+- Check desktop and mobile collection lists, pagination, collection-authorized
+  inline post pages, real link fallbacks, and integration with the shared
+  viewer. Verify dismissal, focus restoration, retained scroll position,
+  nested galleries, and video cleanup in the collection guest context.
 - Document provisioning and an example API request/response. Explicit post
   selections, collection editing, and specialized email/WhatsApp previews are
   deferred.
