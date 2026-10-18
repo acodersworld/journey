@@ -1506,7 +1506,8 @@ if (feed) {
         nextCursor = null;
       } else {
         const post = page.posts[0];
-        const postResponse = await fetch(`/posts/${encodeURIComponent(post.id)}/fragment`);
+        const fragmentQuery = feed.hasAttribute('data-mosaic') ? '?mosaic=true' : '';
+        const postResponse = await fetch(`/posts/${encodeURIComponent(post.id)}/fragment${fragmentQuery}`);
         if (postResponse.status === 401) {
           redirectToLogin();
           return;
@@ -1704,10 +1705,12 @@ if (galleryPanel) {
   }
 
   function openGalleryPanel(item) {
-    const galleryId = item.dataset.gallery;
-    const items = Array.from(document.querySelectorAll('.gallery-item[data-gallery]'))
-      .filter(candidate => candidate.dataset.gallery === galleryId);
-    const selectedIndex = items.indexOf(item);
+    const mosaic = item.closest('.media-mosaic');
+    const items = mosaic
+      ? Array.from(mosaic.querySelector('template[data-gallery-items]').content.children)
+      : Array.from(document.querySelectorAll('.gallery-item[data-gallery]'))
+        .filter(candidate => candidate.dataset.gallery === item.dataset.gallery);
+    const selectedIndex = mosaic ? Number(item.dataset.mediaIndex) : items.indexOf(item);
     if (selectedIndex < 0) return;
 
     openingItem = item;
@@ -1728,7 +1731,7 @@ if (galleryPanel) {
 
   document.addEventListener('click', event => {
     if (!(event.target instanceof Element)) return;
-    const item = event.target.closest('.gallery-item[data-gallery]');
+    const item = event.target.closest('.gallery-item[data-gallery], .media-mosaic-tile');
     if (item) openGalleryPanel(item);
   });
 

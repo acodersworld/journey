@@ -50,6 +50,7 @@ pub struct SiteSettings {
     pub whatsapp_preview_image_ttl_seconds: i64,
     pub max_media_upload_bytes: u64,
     pub image_quality: u8,
+    pub mosaic_max_tiles: usize,
 }
 
 #[derive(Debug, Deserialize)]
@@ -88,6 +89,7 @@ impl Default for SiteSettings {
             whatsapp_preview_image_ttl_seconds: 10,
             max_media_upload_bytes: crate::web::DEFAULT_MAX_MEDIA_UPLOAD_BYTES,
             image_quality: 80,
+            mosaic_max_tiles: 8,
         }
     }
 }
@@ -119,6 +121,9 @@ impl AppConfig {
         crate::backup::parse_daily(&config.backup.daily_utc)?;
         config.image_cache.validate()?;
         crate::storage::ImageQuality::new(config.site.image_quality)?;
+        if config.site.mosaic_max_tiles == 0 {
+            return Err("site.mosaic_max_tiles must be a positive integer".into());
+        }
         let base = path
             .parent()
             .filter(|parent| !parent.as_os_str().is_empty())
@@ -159,6 +164,7 @@ mod tests {
         assert_eq!(config.logging.queue_capacity, 65_536);
         assert_eq!(config.logging.slow_enqueue_warning_ms, 100);
         assert_eq!(config.site.image_quality, 80);
+        assert_eq!(config.site.mosaic_max_tiles, 8);
     }
 
     #[test]
@@ -172,6 +178,20 @@ mod tests {
         }
         for value in [0, 101, 256] {
             fs::write(&path, format!("[site]\nimage_quality = {value}\n")).unwrap();
+            assert!(AppConfig::load(Some(path.clone())).is_err());
+        }
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn mosaic_tile_limit_requires_a_positive_integer() {
+        let directory = std::env::temp_dir().join(format!("journey-config-mosaic-{}-{}", std::process::id(), NEXT_CONFIG_TEST.fetch_add(1, Ordering::Relaxed)));
+        fs::create_dir_all(&directory).unwrap();
+        let path = directory.join("site.toml");
+        fs::write(&path, "[site]\nmosaic_max_tiles = 3\n").unwrap();
+        assert_eq!(AppConfig::load(Some(path.clone())).unwrap().site.mosaic_max_tiles, 3);
+        for invalid in ["0", "-1", "1.5", "\"eight\""] {
+            fs::write(&path, format!("[site]\nmosaic_max_tiles = {invalid}\n")).unwrap();
             assert!(AppConfig::load(Some(path.clone())).is_err());
         }
         fs::remove_dir_all(directory).unwrap();

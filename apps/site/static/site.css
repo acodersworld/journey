@@ -1328,6 +1328,58 @@ figcaption {
   margin: 1.5rem 0 2rem;
 }
 
+.media-mosaic {
+  margin: 1.5rem 0 2rem;
+}
+
+.media-mosaic-tiles {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 0.4rem;
+}
+
+.media-mosaic-tile {
+  position: relative;
+  display: block;
+  width: 100%;
+  aspect-ratio: 1;
+  padding: 0;
+  overflow: hidden;
+  border: 1px solid #343934;
+  border-radius: 0.25rem;
+  background: #191c19;
+  color: #ecece6;
+  cursor: zoom-in;
+}
+
+.media-mosaic-tile:hover,
+.media-mosaic-tile:focus-visible {
+  border-color: #d2b17b;
+}
+
+.media-mosaic-tile > img,
+.media-mosaic-tile > .video-preview-frame {
+  width: 100%;
+  height: 100%;
+  aspect-ratio: 1;
+  object-fit: cover;
+}
+
+.media-mosaic-tile > .video-preview-frame {
+  min-height: 0;
+}
+
+.media-mosaic-more {
+  position: absolute;
+  inset: 0;
+  display: grid;
+  place-items: center;
+  background: rgb(0 0 0 / 65%);
+  color: white;
+  font-size: clamp(1.3rem, 4vw, 2.4rem);
+  font-weight: 700;
+}
+
 .gallery-entry {
   display: flex;
   min-width: 0;
@@ -1701,6 +1753,10 @@ figcaption {
   .gallery {
     grid-template-columns: repeat(auto-fit, minmax(min(100%, 10rem), 1fr));
     gap: 0.65rem;
+  }
+
+  .media-mosaic-tiles {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
   }
 
   .video-preview-frame {

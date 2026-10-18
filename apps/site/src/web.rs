@@ -39,6 +39,7 @@ pub struct AppState<S: StorageClient> {
     preview_image_authorizations: whatsapp_preview::PreviewImageAuthorizations,
     image_cache: Option<std::sync::Arc<crate::image_cache::ImageCache>>,
     image_quality: ImageQuality,
+    mosaic_max_tiles: usize,
     performance: Option<std::sync::Arc<journey_performance::Sample>>,
     performance_token: Option<String>,
 }
@@ -87,6 +88,11 @@ struct LoginPageQuery {
 #[derive(Deserialize)]
 struct CreatedPostQuery {
     created: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct PostFragmentQuery {
+    mosaic: Option<bool>,
 }
 
 #[derive(Serialize)]
@@ -1691,6 +1697,7 @@ async fn home<S: StorageClient>(
                 &principal.username,
                 principal.role,
                 principal.share_access().as_ref(),
+                state.mosaic_max_tiles,
             ))
             .into_response()
         }
@@ -1893,13 +1900,15 @@ async fn edit_published_post_page<S: StorageClient>(
 async fn post_fragment<S: StorageClient>(
     State(state): State<AppState<S>>,
     Path(id): Path<i64>,
+    Query(query): Query<PostFragmentQuery>,
     Extension(principal): Extension<AuthPrincipal>,
 ) -> Response {
     match state.database.post_with_access(id, principal.post_access()).await {
-        Ok(Some(post)) => Html(pretty_html(&render_post(
+        Ok(Some(post)) => Html(pretty_html(&render_post_mode(
             &post,
             false,
             principal.share_access().as_ref().is_some_and(|access| can_share_post(&post, access)),
+            query.mosaic.unwrap_or(false).then_some(state.mosaic_max_tiles),
         )))
         .into_response(),
         Ok(None) => StatusCode::NOT_FOUND.into_response(),
@@ -1996,16 +2005,18 @@ fn render_home(
     username: &str,
     role: AccountRole,
     share_access: Option<&ShareAccess>,
+    mosaic_max_tiles: usize,
 ) -> String {
     let mut feed = format!(
-        "<section id=\"feed\" aria-label=\"Posts\" data-next-cursor=\"{}\">",
+        "<section id=\"feed\" aria-label=\"Posts\" data-mosaic data-next-cursor=\"{}\">",
         escape_html(next_cursor.unwrap_or("")),
     );
     if let Some(post) = initial_post {
-        feed.push_str(&render_post(
+        feed.push_str(&render_post_mode(
             post,
             true,
             share_access.is_some_and(|access| can_share_post(post, access)),
+            Some(mosaic_max_tiles),
         ));
     } else {
         feed.push_str("<p class=\"empty-feed\">No published posts yet.</p>");
@@ -2384,7 +2395,11 @@ fn encode_url_component(value: &str) -> String {
 }
 
 fn render_post(post: &Post, prioritize_first_image: bool, can_manage_shares: bool) -> String {
-    render_post_with_media_prefix(post, prioritize_first_image, None, can_manage_shares)
+    render_post_mode(post, prioritize_first_image, can_manage_shares, None)
+}
+
+fn render_post_mode(post: &Post, prioritize_first_image: bool, can_manage_shares: bool, mosaic_max_tiles: Option<usize>) -> String {
+    render_post_with_media_prefix_mode(post, prioritize_first_image, None, can_manage_shares, mosaic_max_tiles)
 }
 
 fn render_post_with_media_prefix(
@@ -2392,6 +2407,16 @@ fn render_post_with_media_prefix(
     prioritize_first_image: bool,
     media_prefix: Option<&str>,
     can_manage_shares: bool,
+) -> String {
+    render_post_with_media_prefix_mode(post, prioritize_first_image, media_prefix, can_manage_shares, None)
+}
+
+fn render_post_with_media_prefix_mode(
+    post: &Post,
+    prioritize_first_image: bool,
+    media_prefix: Option<&str>,
+    can_manage_shares: bool,
+    mosaic_max_tiles: Option<usize>,
 ) -> String {
     let share_control = if can_manage_shares && post.published {
         format!(
@@ -2430,7 +2455,7 @@ fn render_post_with_media_prefix(
         share_control,
         escape_html(&post.summary.summary),
         render_tags_html(&post.tags, media_prefix.is_some()),
-        render_post_blocks_html(post, prioritize_first_image, media_prefix),
+        render_post_blocks_html(post, prioritize_first_image, media_prefix, mosaic_max_tiles),
     )
 }
 
@@ -2477,6 +2502,7 @@ fn render_post_blocks_html(
     post: &Post,
     prioritize_first_image: bool,
     media_prefix: Option<&str>,
+    mosaic_max_tiles: Option<usize>,
 ) -> String {
     let mut prioritize_first_image = prioritize_first_image;
     render_blocks_html(
@@ -2484,6 +2510,7 @@ fn render_post_blocks_html(
         post.summary.id,
         &mut prioritize_first_image,
         media_prefix,
+        mosaic_max_tiles,
     )
 }
 
@@ -2492,13 +2519,18 @@ fn render_blocks_html(
     post_id: i64,
     prioritize_first_image: &mut bool,
     media_prefix: Option<&str>,
+    mosaic_max_tiles: Option<usize>,
 ) -> String {
     let mut html = String::new();
     for block in blocks {
         if block.children.is_empty() {
-            html.push_str(&render_standalone_block(block, post_id, prioritize_first_image, media_prefix));
+            if let Some(max_tiles) = mosaic_max_tiles && is_media_block(block) {
+                html.push_str(&render_mosaic(std::slice::from_ref(block), post_id, prioritize_first_image, media_prefix, max_tiles));
+            } else {
+                html.push_str(&render_standalone_block(block, post_id, prioritize_first_image, media_prefix));
+            }
         } else {
-            html.push_str(&render_group(block, post_id, prioritize_first_image, media_prefix));
+            html.push_str(&render_group(block, post_id, prioritize_first_image, media_prefix, mosaic_max_tiles));
         }
     }
     html
@@ -2566,6 +2598,7 @@ fn render_group(
     post_id: i64,
     prioritize_first_image: &mut bool,
     media_prefix: Option<&str>,
+    mosaic_max_tiles: Option<usize>,
 ) -> String {
     let mut html = String::from("<section class=\"post-group\">");
     if let Some(header) = &group.header {
@@ -2583,12 +2616,12 @@ fn render_group(
             while index < group.children.len() && is_media_block(&group.children[index]) {
                 index += 1;
             }
-            html.push_str(&render_gallery(
-                &group.children[start..index],
-                post_id,
-                prioritize_first_image,
-                media_prefix,
-            ));
+            let media = &group.children[start..index];
+            if let Some(max_tiles) = mosaic_max_tiles {
+                html.push_str(&render_mosaic(media, post_id, prioritize_first_image, media_prefix, max_tiles));
+            } else {
+                html.push_str(&render_gallery(media, post_id, prioritize_first_image, media_prefix));
+            }
         } else {
             if child.header.is_some() || child.body.is_some() {
                 html.push_str("<div class=\"group-note\">");
@@ -2660,6 +2693,71 @@ fn render_gallery(
         ));
     }
     html.push_str("</div>");
+    html
+}
+
+fn render_mosaic(
+    blocks: &[crate::db::PostBlock],
+    post_id: i64,
+    prioritize_first_image: &mut bool,
+    media_prefix: Option<&str>,
+    max_tiles: usize,
+) -> String {
+    let gallery_id = format!("gallery-{post_id}-{}", blocks[0].id);
+    let visible = blocks.len().min(max_tiles);
+    let mut html = format!("<div class=\"media-mosaic\" data-gallery-run=\"{gallery_id}\"><div class=\"media-mosaic-tiles\">");
+    for (index, block) in blocks.iter().take(visible).enumerate() {
+        let content_type = block.content_type.as_deref().unwrap_or("");
+        let media_url = media_url(media_prefix, post_id, block.id);
+        let label = media_accessible_label(block.header.as_deref(), block.body.as_deref(), block.alt.as_deref().unwrap_or(""));
+        let omitted = if index + 1 == visible { blocks.len() - visible } else { 0 };
+        let accessible_label = if omitted > 0 {
+            format!("Open media: {label}; {omitted} more items")
+        } else {
+            format!("Open media: {label}")
+        };
+        html.push_str(&format!(
+            "<button class=\"media-mosaic-tile\" type=\"button\" data-media-index=\"{index}\" aria-label=\"{}\">",
+            escape_html(&accessible_label),
+        ));
+        if content_type.starts_with("image/") {
+            let loading = image_loading(prioritize_first_image);
+            html.push_str(&format!(
+                "<img src=\"{}\" alt=\"\" loading=\"{}\"{}>",
+                media_url,
+                loading,
+                image_fetch_priority(loading),
+            ));
+        } else {
+            html.push_str(&format!(
+                "<span class=\"video-preview-frame\" data-video-preview-frame aria-hidden=\"true\"><img class=\"video-thumbnail\" src=\"{}\" alt=\"\" loading=\"lazy\" data-video-thumbnail><span class=\"video-placeholder\"><span class=\"play-icon\">▶</span><span>Video</span></span></span>",
+                escape_html(&video_thumbnail_url(&media_url)),
+            ));
+        }
+        if omitted > 0 {
+            html.push_str(&format!("<span class=\"media-mosaic-more\" aria-hidden=\"true\">+{omitted}</span>"));
+        }
+        html.push_str("</button>");
+    }
+    html.push_str("</div><template data-gallery-items>");
+    for block in blocks {
+        let content_type = block.content_type.as_deref().unwrap_or("");
+        let media_url = media_url(media_prefix, post_id, block.id);
+        html.push_str(&format!(
+            "<span data-media-type=\"{}\" data-media-src=\"{}\" data-alt=\"{}\" data-label=\"{}\" data-caption=\"{}\"{}></span>",
+            escape_html(content_type),
+            media_url,
+            escape_html(block.alt.as_deref().unwrap_or("")),
+            escape_html(block.header.as_deref().unwrap_or("")),
+            escape_html(block.body.as_deref().unwrap_or("")),
+            if content_type.starts_with("video/") {
+                format!(" data-thumbnail-src=\"{}\"", escape_html(&video_thumbnail_url(&media_url)))
+            } else {
+                String::new()
+            },
+        ));
+    }
+    html.push_str("</template></div>");
     html
 }
 
@@ -3079,6 +3177,7 @@ pub fn state<S: StorageClient>(database: Database, storage: S) -> AppState<S> {
         storage,
         image_cache: None,
         image_quality: ImageQuality::new(80).unwrap(),
+        mosaic_max_tiles: 8,
         preview_image_authorizations: whatsapp_preview::PreviewImageAuthorizations::default(),
         performance: None,
         performance_token: None,
@@ -3104,12 +3203,18 @@ pub fn state_with_security<S: StorageClient>(
         preview_image_authorizations: whatsapp_preview::PreviewImageAuthorizations::default(),
         image_cache: None,
         image_quality: ImageQuality::new(80).unwrap(),
+        mosaic_max_tiles: 8,
         performance: None,
         performance_token: None,
     }
 }
 
 impl<S: StorageClient> AppState<S> {
+    pub fn with_mosaic_max_tiles(mut self, mosaic_max_tiles: usize) -> Self {
+        self.mosaic_max_tiles = mosaic_max_tiles;
+        self
+    }
+
     pub fn with_image_quality(mut self, image_quality: ImageQuality) -> Self {
         self.image_quality = image_quality;
         self
@@ -4477,8 +4582,115 @@ mod tests {
         ));
         assert!(!html.contains("data-post-id=\"11\""));
         assert!(html.contains("id=\"load-more\""));
+        assert!(html.contains("data-mosaic"));
 
         std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn mosaics_limit_visible_tiles_and_keep_ordered_gallery_metadata() {
+        use crate::db::PostBlock;
+        let media = (1..=10).map(|id| PostBlock {
+            id,
+            position: id,
+            header: Some(format!("Heading {id}")),
+            body: Some(format!("Caption {id}")),
+            content_type: Some(if id == 3 { "video/mp4" } else { "image/jpeg" }.to_owned()),
+            storage_key: Some(format!("media/{id}")),
+            alt: Some(format!("Alt {id}")),
+            children: Vec::new(),
+        }).collect::<Vec<_>>();
+        let mut eager = true;
+        let html = super::render_mosaic(&media, 42, &mut eager, None, 8);
+        assert_eq!(html.matches("class=\"media-mosaic-tile\"").count(), 8);
+        assert_eq!(html.matches("data-media-type=").count(), 10);
+        assert!(html.contains("data-media-index=\"7\""));
+        assert!(html.contains("class=\"media-mosaic-more\" aria-hidden=\"true\">+2"));
+        assert!(html.contains("data-media-src=\"/posts/42/blocks/10/media\""));
+        assert!(!html.contains("<img src=\"/posts/42/blocks/9/media\""));
+        assert!(!html.contains("<img src=\"/posts/42/blocks/10/media\""));
+        assert!(html.contains("src=\"/posts/42/blocks/3/media?thumbnail=1\""));
+        assert!(!html.contains("<video"));
+        assert!(!html.contains("class=\"media-label\""));
+        assert!(!html.contains("class=\"gallery-caption\""));
+        assert!(html.contains("data-caption=\"Caption 10\""));
+
+        let mut eager = true;
+        let limited = super::render_mosaic(&media, 42, &mut eager, None, 2);
+        assert_eq!(limited.matches("class=\"media-mosaic-tile\"").count(), 2);
+        assert!(limited.contains(">+8</span>"));
+        let mut eager = true;
+        let exact = super::render_mosaic(&media[..8], 42, &mut eager, None, 8);
+        assert!(!exact.contains("media-mosaic-more"));
+
+        let mut eager = true;
+        let two = super::render_mosaic(&media[..2], 42, &mut eager, None, 8);
+        assert_eq!(two.matches("class=\"media-mosaic-tile\"").count(), 2);
+        assert!(!two.contains("media-mosaic-more"));
+
+        let group = |id, children| PostBlock {
+            id,
+            position: id,
+            header: Some(format!("Group {id}")),
+            body: Some(format!("Description {id}")),
+            content_type: None,
+            storage_key: None,
+            alt: None,
+            children,
+        };
+        let mut eager = true;
+        let empty = super::render_group(&group(50, vec![]), 42, &mut eager, None, Some(8));
+        assert!(!empty.contains("media-mosaic"));
+        let single = super::render_group(&group(51, media[..1].to_vec()), 42, &mut eager, None, Some(8));
+        assert!(single.contains("class=\"media-mosaic\""));
+        assert_eq!(single.matches("class=\"media-mosaic-tile\"").count(), 1);
+        assert!(single.contains("data-label=\"Heading 1\""));
+        assert!(single.contains("data-caption=\"Caption 1\""));
+        assert!(!single.contains("class=\"single-media\""));
+        let standalone = super::render_blocks_html(&media[..1], 42, &mut eager, None, Some(8));
+        assert!(standalone.contains("class=\"media-mosaic\""));
+        assert_eq!(standalone.matches("class=\"media-mosaic-tile\"").count(), 1);
+        assert!(standalone.contains("data-caption=\"Caption 1\""));
+        let legacy_standalone = super::render_blocks_html(&media[..1], 42, &mut eager, None, None);
+        assert!(legacy_standalone.contains("class=\"single-media\""));
+        let video = super::render_group(&group(52, vec![media[2].clone()]), 42, &mut eager, None, Some(8));
+        assert!(video.contains("class=\"media-mosaic\""));
+        assert_eq!(video.matches("class=\"media-mosaic-tile\"").count(), 1);
+        assert!(video.contains("src=\"/posts/42/blocks/3/media?thumbnail=1\""));
+        assert!(video.contains("data-media-type=\"video/mp4\""));
+        assert!(!video.contains("<video"));
+        let standalone_video = super::render_blocks_html(&media[2..3], 42, &mut eager, None, Some(8));
+        assert!(standalone_video.contains("class=\"media-mosaic\""));
+        assert_eq!(standalone_video.matches("class=\"media-mosaic-tile\"").count(), 1);
+        assert!(standalone_video.contains("data-thumbnail-src=\"/posts/42/blocks/3/media?thumbnail=1\""));
+        assert!(!standalone_video.contains("<video"));
+        let legacy_video = super::render_blocks_html(&media[2..3], 42, &mut eager, None, None);
+        assert!(legacy_video.contains("<video"));
+        let legacy = super::render_group(&group(53, media[..2].to_vec()), 42, &mut eager, None, None);
+        assert!(legacy.contains("class=\"gallery\""));
+        assert!(!legacy.contains("media-mosaic"));
+        let groups = super::render_group(&group(54, media[..2].to_vec()), 42, &mut eager, None, Some(8))
+            + &super::render_group(&group(55, media[2..4].to_vec()), 42, &mut eager, None, Some(8));
+        assert_eq!(groups.matches("class=\"media-mosaic\"").count(), 2);
+        assert!(groups.contains("Group 54"));
+        assert!(groups.contains("Description 55"));
+
+        let post = Post {
+            summary: crate::db::PostSummary { id: 42, title: "Media".to_owned(), published_at: None, summary: String::new() },
+            published: true,
+            author_username: "author".to_owned(),
+            tags: Vec::new(),
+            revision: 1,
+            blocks: vec![group(56, media)],
+        };
+        let home = super::render_home(&SidebarData::default(), Some(&post), None, "reader", AccountRole::Read, None, 2);
+        assert!(home.contains("data-mosaic"));
+        assert!(home.contains(">+8</span>"));
+        let fragment = super::render_post_mode(&post, false, false, Some(2));
+        assert!(fragment.contains(">+8</span>"));
+        let default_fragment = super::render_post(&post, false, false);
+        assert!(default_fragment.contains("class=\"gallery\""));
+        assert!(!default_fragment.contains("media-mosaic"));
     }
 
     #[test]

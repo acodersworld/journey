@@ -2,6 +2,7 @@
 
 [site]
 image_quality = 80
+mosaic_max_tiles = 8
 bind = "0.0.0.0:8080"
 database_path = "/home/ben/src/journey/deploy/data/journey-site.sqlite3"
 #public_origin = "http://192.168.0.48"

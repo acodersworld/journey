@@ -7,6 +7,7 @@ session_ttl_seconds = 604800
 whatsapp_preview_image_ttl_seconds = 10
 max_media_upload_bytes = 2147483648
 image_quality = 80
+mosaic_max_tiles = 8
 
 [image_cache]
 enabled = false

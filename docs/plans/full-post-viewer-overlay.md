@@ -7,7 +7,7 @@ dismissible overlay while preserving the underlying feed and scroll position.
 
 Reuse the existing share-preview-style rendering inside a same-origin iframe.
 This feature can be implemented independently of
-[All posts media mosaics](all-posts-media-mosaics.md).
+[All posts media mosaics](../design/all-posts-media-mosaics.md).
 
 ## Inline post page
 
