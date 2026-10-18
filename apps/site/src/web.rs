@@ -8,6 +8,7 @@ use axum::{
     Json, Router,
 };
 use futures_util::{StreamExt, TryStreamExt};
+use base64::{Engine, engine::general_purpose::STANDARD};
 use serde::{Deserialize, Serialize};
 use std::{
     io,
@@ -48,6 +49,7 @@ pub struct AppState<S: StorageClient> {
 pub struct SiteSecurity {
     public_origin: Option<ParsedOrigin>,
     secure_cookie: bool,
+    allow_insecure_lan_http: bool,
     session_lifetime: Duration,
     whatsapp_preview: whatsapp_preview::Config,
     max_media_upload_bytes: u64,
@@ -115,6 +117,26 @@ struct CreateShareLinkRequest {
     additional_post_ids: Vec<i64>,
     title: Option<String>,
 }
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CollectionShareLinkRequest {
+    title: String,
+    from: String,
+    until: String,
+}
+
+#[derive(Serialize)]
+struct CollectionShareLinkResponse {
+    id: Option<String>,
+    url: Option<String>,
+    post_count: usize,
+    expires_at_unix: Option<i64>,
+    truncated: bool,
+}
+
+#[derive(Serialize)]
+struct AutomationErrorResponse { error: &'static str }
 
 #[derive(Deserialize)]
 struct FeedQuery {
@@ -247,6 +269,7 @@ impl SiteSecurity {
         Ok(Self {
             public_origin,
             secure_cookie,
+            allow_insecure_lan_http,
             session_lifetime: Duration::from_secs(session_lifetime_seconds as u64),
             whatsapp_preview,
             max_media_upload_bytes,
@@ -310,6 +333,7 @@ pub fn router<S: StorageClient>(state: AppState<S>) -> Router {
         .route("/api/auth/login", post(login::<S>))
         .route("/api/auth/current", get(current_account::<S>))
         .route("/api/auth/logout", post(logout::<S>))
+        .route("/api/automation/collection-share-links", post(create_collection_share_link::<S>))
         .route("/share/{share_link_id}/{secret}", get(open_share_link::<S>))
         .route("/share/{share_link_id}", get(shared_feed_page::<S>))
         .route("/share/{share_link_id}/feed", get(shared_feed_api::<S>))
@@ -457,6 +481,7 @@ fn safe_route_template(path: &str) -> &'static str {
                 ["api", "posts", _, "share-links"] => "/api/posts/{id}/share-links",
                 ["api", "posts", _] => "/api/posts/{id}",
                 ["api", "share-links", _] => "/api/share-links/{id}",
+                ["api", "automation", "collection-share-links"] => "/api/automation/collection-share-links",
                 _ => "unmatched",
             }
         }
@@ -765,6 +790,128 @@ async fn create_share_link<S: StorageClient>(
         Err(error) => {
             log::error!("website share-link creation failed: {error}");
             no_store(StatusCode::INTERNAL_SERVER_ERROR.into_response())
+        }
+    }
+}
+
+fn automation_error(status: StatusCode, error: &'static str) -> Response {
+    let mut response = no_store((status, Json(AutomationErrorResponse { error })).into_response());
+    if status == StatusCode::UNAUTHORIZED {
+        response.headers_mut().insert(header::WWW_AUTHENTICATE, HeaderValue::from_static("Basic realm=\"Journey automation\""));
+    }
+    response
+}
+
+fn utc_milliseconds(value: &str) -> Option<i64> {
+    let bytes = value.as_bytes();
+    if !(bytes.len() == 20 || (22..=24).contains(&bytes.len())) || bytes.last() != Some(&b'Z') {
+        return None;
+    }
+    if bytes[4] != b'-' || bytes[7] != b'-' || bytes[10] != b'T' || bytes[13] != b':' || bytes[16] != b':' {
+        return None;
+    }
+    if bytes.len() > 20 && bytes[19] != b'.' { return None; }
+    if !bytes.iter().enumerate().all(|(index, byte)|
+        matches!(index, 4 | 7 | 10 | 13 | 16) || index == bytes.len() - 1
+            || (index == 19 && bytes.len() > 20) || byte.is_ascii_digit()) {
+        return None;
+    }
+    let timestamp = value.parse::<jiff::Timestamp>().ok()?;
+    Some(timestamp.as_millisecond())
+}
+
+async fn create_collection_share_link<S: StorageClient>(
+    State(state): State<AppState<S>>,
+    headers: HeaderMap,
+    ConnectInfo(peer_address): ConnectInfo<SocketAddr>,
+    body: axum::body::Bytes,
+) -> Response {
+    let credentials = headers.get(header::AUTHORIZATION).and_then(|value| value.to_str().ok())
+        .and_then(|value| value.split_once(' ').filter(|(scheme, _)| scheme.eq_ignore_ascii_case("Basic")).map(|(_, encoded)| encoded))
+        .and_then(|value| STANDARD.decode(value).ok())
+        .and_then(|value| String::from_utf8(value).ok())
+        .and_then(|value| value.split_once(':').map(|(username, password)| (username.to_owned(), password.to_owned())));
+    let Some((username, password)) = credentials else {
+        return automation_error(StatusCode::UNAUTHORIZED, "invalid_credentials");
+    };
+    if username.len() > 64 || password.len() > 1024 {
+        return automation_error(StatusCode::UNAUTHORIZED, "invalid_credentials");
+    }
+    let username_key = auth::username_throttle_key(&format!("automation:{username}"));
+    let address_key = auth::address_throttle_key(&format!("automation:{}", peer_address.ip()));
+    for (key, limit) in [(username_key.clone(), 5), (address_key.clone(), 30)] {
+        match state.database.record_login_attempt(key, unix_time(), Duration::from_secs(15 * 60), limit).await {
+            Ok(true) => {}
+            Ok(false) => return automation_error(StatusCode::TOO_MANY_REQUESTS, "too_many_attempts"),
+            Err(error) => {
+                log::error!("automation throttle failed: {error}");
+                return automation_error(StatusCode::INTERNAL_SERVER_ERROR, "internal_error");
+            }
+        }
+    }
+    let account = match state.database.automation_account(username.clone()).await {
+        Ok(account) => account,
+        Err(error) => {
+            log::error!("automation account lookup failed: {error}");
+            return automation_error(StatusCode::INTERNAL_SERVER_ERROR, "internal_error");
+        }
+    };
+    let authenticated = match account.as_ref() {
+        Some(account) => auth::validate_username(&username).is_ok() && account.enabled
+            && auth::verify_password(&password, &account.password_hash),
+        None => { auth::dummy_verify_password(&password); false }
+    };
+    if !authenticated {
+        return automation_error(StatusCode::UNAUTHORIZED, "invalid_credentials");
+    }
+    for key in [username_key, address_key] {
+        if let Err(error) = state.database.clear_login_attempts(key).await {
+            log::error!("automation throttle reset failed: {error}");
+            return automation_error(StatusCode::INTERNAL_SERVER_ERROR, "internal_error");
+        }
+    }
+    let request: CollectionShareLinkRequest = match serde_json::from_slice(&body) {
+        Ok(request) => request,
+        Err(_) => return automation_error(StatusCode::BAD_REQUEST, "invalid_request"),
+    };
+    let title = request.title.trim();
+    if title.is_empty() || title.chars().count() > 200 {
+        return automation_error(StatusCode::BAD_REQUEST, "invalid_title");
+    }
+    let (Some(from), Some(until)) = (utc_milliseconds(&request.from), utc_milliseconds(&request.until)) else {
+        return automation_error(StatusCode::BAD_REQUEST, "invalid_time_bounds");
+    };
+    if from >= until {
+        return automation_error(StatusCode::BAD_REQUEST, "invalid_time_bounds");
+    }
+    let Some(origin) = state.security.public_origin.as_ref() else {
+        log::error!("automation share-link creation requires site.public_origin");
+        return automation_error(StatusCode::INTERNAL_SERVER_ERROR, "internal_error");
+    };
+    if origin.scheme != "https" && !state.security.allow_insecure_lan_http {
+        log::error!("automation share-link creation requires HTTPS or site.allow_insecure_lan_http");
+        return automation_error(StatusCode::INTERNAL_SERVER_ERROR, "internal_error");
+    }
+    let id = auth::new_share_link_id();
+    let secret = auth::new_share_link_secret();
+    match state.database.create_collection_share_link(id, title.to_owned(), auth::session_token_digest(&secret),
+        unix_time(), from, until).await {
+        Ok(created) => {
+            let (status, id, url, post_count, expires_at_unix) = match created.link {
+                Some(link) => {
+                    log::info!("automation_share_link_created actor={:?} share_link_id={} post_count={} truncated={}",
+                        account.unwrap().username, link.id, link.post_count, created.truncated);
+                    let url = format!("{}/share/{}/{}", origin.key, link.id, secret);
+                    (StatusCode::CREATED, Some(link.id), Some(url), link.post_count, Some(link.expires_at_unix))
+                }
+                None => (StatusCode::OK, None, None, 0, None),
+            };
+            no_store((status, Json(CollectionShareLinkResponse { id, url, post_count, expires_at_unix,
+                truncated: created.truncated })).into_response())
+        }
+        Err(error) => {
+            log::error!("automation share-link creation failed: {error}");
+            automation_error(StatusCode::INTERNAL_SERVER_ERROR, "internal_error")
         }
     }
 }
@@ -3276,6 +3423,7 @@ pub fn state<S: StorageClient>(database: Database, storage: S) -> AppState<S> {
         security: SiteSecurity {
             public_origin: None,
             secure_cookie: false,
+            allow_insecure_lan_http: true,
             session_lifetime: Duration::from_secs(7 * 24 * 60 * 60),
             whatsapp_preview: whatsapp_preview::Config::default(),
             max_media_upload_bytes: DEFAULT_MAX_MEDIA_UPLOAD_BYTES,
@@ -3355,6 +3503,7 @@ mod tests {
         response::Response,
     };
     use tower::ServiceExt;
+    use base64::Engine;
 
     #[derive(Clone)]
     struct UnusedStorage;
@@ -5037,6 +5186,85 @@ mod tests {
         assert!(newest < fifth);
         assert!(fifth < sixth);
         assert!(html.find("sidebar-drafts-heading").unwrap() < html.find("sidebar-recent-heading").unwrap());
+    }
+
+    #[test]
+    fn automation_bounds_require_precise_utc_rfc3339() {
+        for value in ["2026-10-05T00:00:00Z", "2026-10-05T00:00:00.1Z", "2026-10-05T00:00:00.123Z"] {
+            assert!(super::utc_milliseconds(value).is_some(), "{value}");
+        }
+        for value in ["1760000000", "2026-10-05T00:00:00", "2026-10-05T00:00:00+00:00",
+            "2026-10-05T00:00:00.1234Z", "2026-02-30T00:00:00Z", "2026-10-05t00:00:00Z"] {
+            assert!(super::utc_milliseconds(value).is_none(), "{value}");
+        }
+    }
+
+    #[tokio::test]
+    async fn automation_route_authenticates_separately_and_handles_empty_and_single_collections() {
+        let path = std::env::temp_dir().join(format!("journey-automation-{}-{}.sqlite3", std::process::id(),
+            SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos()));
+        let database = Database::new(path.clone());
+        database.initialize().await.unwrap();
+        database.create_account("website".to_owned(), AccountRole::Write, auth::hash_password("website-secret").unwrap()).await.unwrap();
+        database.create_automation_account("script".to_owned(), auth::hash_password("script-secret").unwrap()).await.unwrap();
+        let connection = Connection::open(&path).unwrap();
+        connection.execute("INSERT INTO posts (author_id, title, published_at, summary) VALUES (1, 'Post', 1767225600, '')", []).unwrap();
+        drop(connection);
+        let security = super::SiteSecurity::from_config(SocketAddr::from(([127, 0, 0, 1], 3000)),
+            Some("https://example.com"), 3600, 1024, 3600, false).unwrap();
+        let app = router(super::state_with_security(database.clone(), UnusedStorage, security));
+        async fn send(app: &axum::Router, credentials: &str, body: &str) -> Response {
+            let request = Request::builder().method("POST").uri("/api/automation/collection-share-links")
+                .header(header::AUTHORIZATION, format!("Basic {}", base64::engine::general_purpose::STANDARD.encode(credentials)))
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(body.to_owned())).unwrap();
+            let mut request = request;
+            request.extensions_mut().insert(ConnectInfo(SocketAddr::from(([127, 0, 0, 1], 2000))));
+            app.clone().oneshot(request).await.unwrap()
+        }
+        let body = r#"{"title":"New year","from":"2026-01-01T00:00:00Z","until":"2026-01-02T00:00:00Z"}"#;
+        assert_eq!(send(&app, "website:website-secret", body).await.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(send(&app, "script:bad", body).await.status(), StatusCode::UNAUTHORIZED);
+        let mut login = Request::builder().method("POST").uri("/api/auth/login")
+            .header(header::ORIGIN, "https://example.com")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(r#"{"username":"script","password":"script-secret"}"#)).unwrap();
+        login.extensions_mut().insert(ConnectInfo(SocketAddr::from(([127, 0, 0, 1], 2000))));
+        assert_eq!(app.clone().oneshot(login).await.unwrap().status(), StatusCode::UNAUTHORIZED);
+        let created = send(&app, "script:script-secret", body).await;
+        assert_eq!(created.status(), StatusCode::CREATED);
+        assert_eq!(created.headers()[header::CACHE_CONTROL], "private, no-store");
+        let payload: serde_json::Value = serde_json::from_slice(&to_bytes(created.into_body(), usize::MAX).await.unwrap()).unwrap();
+        assert_eq!(payload["post_count"], 1);
+        assert_eq!(payload["truncated"], false);
+        assert!(payload["url"].as_str().unwrap().starts_with("https://example.com/share/"));
+        let guest_path = payload["url"].as_str().unwrap().strip_prefix("https://example.com").unwrap();
+        let guest = get_route(&app, guest_path).await;
+        assert_eq!(guest.status(), StatusCode::SEE_OTHER);
+        assert!(guest.headers().get(header::SET_COOKIE).is_some());
+        let empty = send(&app, "script:script-secret", r#"{"title":"Empty","from":"2026-01-02T00:00:00Z","until":"2026-01-03T00:00:00Z"}"#).await;
+        assert_eq!(empty.status(), StatusCode::OK);
+        let payload: serde_json::Value = serde_json::from_slice(&to_bytes(empty.into_body(), usize::MAX).await.unwrap()).unwrap();
+        assert!(payload["id"].is_null());
+        assert_eq!(payload["post_count"], 0);
+        assert_eq!(send(&app, "script:script-secret", r#"{"title":"Bad","from":"2026-01-02T00:00:00Z","until":"2026-01-01T00:00:00Z"}"#).await.status(), StatusCode::BAD_REQUEST);
+        let local_origin = Some("http://127.0.0.1:3000");
+        let secure_only = super::SiteSecurity::from_config(SocketAddr::from(([127, 0, 0, 1], 3000)),
+            local_origin, 3600, 1024, 3600, false).unwrap();
+        let secure_only_app = router(super::state_with_security(database.clone(), UnusedStorage, secure_only));
+        assert_eq!(send(&secure_only_app, "script:script-secret", body).await.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let local_dev = super::SiteSecurity::from_config(SocketAddr::from(([127, 0, 0, 1], 3000)),
+            local_origin, 3600, 1024, 3600, true).unwrap();
+        let local_dev_app = router(super::state_with_security(database.clone(), UnusedStorage, local_dev));
+        let local_response = send(&local_dev_app, "script:script-secret", body).await;
+        assert_eq!(local_response.status(), StatusCode::CREATED);
+        let local_payload: serde_json::Value = serde_json::from_slice(&to_bytes(local_response.into_body(), usize::MAX).await.unwrap()).unwrap();
+        assert!(local_payload["url"].as_str().unwrap().starts_with("http://127.0.0.1:3000/share/"));
+        database.set_automation_account_enabled("script".to_owned(), false).await.unwrap();
+        assert_eq!(send(&app, "script:script-secret", body).await.status(), StatusCode::UNAUTHORIZED);
+        for _ in 0..4 { assert_eq!(send(&app, "script:bad", body).await.status(), StatusCode::UNAUTHORIZED); }
+        assert_eq!(send(&app, "script:bad", body).await.status(), StatusCode::TOO_MANY_REQUESTS);
+        std::fs::remove_file(path).unwrap();
     }
 
 

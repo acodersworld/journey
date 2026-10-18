@@ -13,6 +13,7 @@ const PASSWORD_ITERATIONS: u32 = 2;
 const PASSWORD_LANES: u32 = 1;
 const SESSION_TOKEN_BYTES: usize = 32;
 const SHARE_LINK_ID_BYTES: usize = 16;
+const AUTOMATION_PASSWORD_BYTES: usize = 48;
 
 pub(crate) fn validate_username(username: &str) -> Result<(), &'static str> {
     if !(3..=32).contains(&username.len())
@@ -68,6 +69,12 @@ pub(crate) fn new_share_link_secret() -> String {
     new_session_token()
 }
 
+pub(crate) fn new_automation_password() -> String {
+    let mut bytes = [0_u8; AUTOMATION_PASSWORD_BYTES];
+    rand::rngs::OsRng.fill_bytes(&mut bytes);
+    URL_SAFE_NO_PAD.encode(bytes)
+}
+
 pub(crate) fn new_share_link_id() -> String {
     let mut bytes = [0_u8; SHARE_LINK_ID_BYTES];
     rand::rngs::OsRng.fill_bytes(&mut bytes);
@@ -108,4 +115,19 @@ fn hex_digest(bytes: &[u8]) -> String {
         encoded.push(HEX[(byte & 0x0f) as usize] as char);
     }
     encoded
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn automation_passwords_are_long_random_url_safe_secrets() {
+        let first = super::new_automation_password();
+        let second = super::new_automation_password();
+        assert_eq!(first.len(), 64);
+        assert_ne!(first, second);
+        assert!(first.bytes().all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-')));
+        let hash = super::hash_password(&first).unwrap();
+        assert!(super::verify_password(&first, &hash));
+        assert!(!super::verify_password(&second, &hash));
+    }
 }

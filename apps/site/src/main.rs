@@ -60,6 +60,11 @@ enum Commands {
         #[command(subcommand)]
         command: UserCommands,
     },
+    #[command(name = "automation-accounts")]
+    AutomationAccounts {
+        #[command(subcommand)]
+        command: AutomationAccountCommands,
+    },
     #[command(name = "share-links")]
     ShareLinks {
         #[command(subcommand)]
@@ -146,6 +151,15 @@ enum UserCommands {
         #[arg(value_parser = ["read", "write", "admin"])]
         role: String,
     },
+    List,
+    Password { username: String },
+    Disable { username: String },
+    Enable { username: String },
+}
+
+#[derive(Subcommand)]
+enum AutomationAccountCommands {
+    Create { username: String },
     List,
     Password { username: String },
     Disable { username: String },
@@ -318,6 +332,41 @@ async fn main() -> AppResult<()> {
                     set_account_enabled(&database, username, true).await
                 }
             }
+        }
+        Commands::AutomationAccounts { command } => {
+            database.initialize().await.map_err(std::io::Error::other)?;
+            match command {
+                AutomationAccountCommands::Create { username } => {
+                    auth::validate_username(&username)?;
+                    let password = auth::new_automation_password();
+                    let hash = auth::hash_password(&password).map_err(std::io::Error::other)?;
+                    database.create_automation_account(username.clone(), hash).await.map_err(std::io::Error::other)?;
+                    println!("created automation account {username}\npassword: {password}");
+                }
+                AutomationAccountCommands::List => {
+                    for (username, enabled) in database.automation_accounts().await.map_err(std::io::Error::other)? {
+                        println!("{}\t{}", username, if enabled { "enabled" } else { "disabled" });
+                    }
+                }
+                AutomationAccountCommands::Password { username } => {
+                    auth::validate_username(&username)?;
+                    let password = auth::new_automation_password();
+                    let hash = auth::hash_password(&password).map_err(std::io::Error::other)?;
+                    database.change_automation_password(username.clone(), hash).await.map_err(std::io::Error::other)?;
+                    println!("changed automation password for {username}\npassword: {password}");
+                }
+                AutomationAccountCommands::Disable { username } => {
+                    auth::validate_username(&username)?;
+                    database.set_automation_account_enabled(username.clone(), false).await.map_err(std::io::Error::other)?;
+                    println!("disabled automation account {username}");
+                }
+                AutomationAccountCommands::Enable { username } => {
+                    auth::validate_username(&username)?;
+                    database.set_automation_account_enabled(username.clone(), true).await.map_err(std::io::Error::other)?;
+                    println!("enabled automation account {username}");
+                }
+            }
+            Ok(())
         }
         Commands::ShareLinks { command } => {
             database.initialize().await.map_err(std::io::Error::other)?;

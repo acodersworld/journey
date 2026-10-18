@@ -1,6 +1,6 @@
 use std::{collections::HashMap, path::PathBuf, sync::Arc, time::Duration};
 
-use rusqlite::{params, types::Type, Connection, OptionalExtension, TransactionBehavior};
+use rusqlite::{params, types::Type, Connection, OptionalExtension, Transaction, TransactionBehavior};
 use serde::{Deserialize, Serialize};
 
 const POSTS_SCHEMA: &str = "\
@@ -99,7 +99,7 @@ CREATE TABLE IF NOT EXISTS login_throttles (
 );
 ";
 
-pub(crate) const CURRENT_SCHEMA_VERSION: i64 = 11;
+pub(crate) const CURRENT_SCHEMA_VERSION: i64 = 12;
 const UNSUPPORTED_SCHEMA_MESSAGE: &str = "unsupported site database schema version; no data was changed";
 
 const SHARE_SCHEMA: &str = "\
@@ -136,6 +136,15 @@ CREATE TABLE IF NOT EXISTS share_sessions (
 );
 CREATE INDEX IF NOT EXISTS share_sessions_expiry ON share_sessions(expires_at);
 CREATE INDEX IF NOT EXISTS share_sessions_link ON share_sessions(share_link_id);
+";
+
+const AUTOMATION_SCHEMA: &str = "\
+CREATE TABLE IF NOT EXISTS automation_accounts (
+    username TEXT PRIMARY KEY COLLATE NOCASE CHECK (length(username) BETWEEN 3 AND 32),
+    password_hash TEXT NOT NULL,
+    enabled INTEGER NOT NULL DEFAULT 1 CHECK (enabled IN (0, 1)),
+    created_at INTEGER NOT NULL
+);
 ";
 
 #[derive(Clone)]
@@ -360,6 +369,19 @@ pub struct ShareLinkCreated {
 }
 
 #[derive(Clone, Debug)]
+pub struct CollectionShareLinkCreated {
+    pub link: Option<ShareLinkCreated>,
+    pub truncated: bool,
+}
+
+#[derive(Clone, Debug)]
+pub struct AutomationAccount {
+    pub username: String,
+    pub password_hash: String,
+    pub enabled: bool,
+}
+
+#[derive(Clone, Debug)]
 pub struct ShareLinkView {
     pub id: String,
     pub post_ids: Vec<i64>,
@@ -385,6 +407,7 @@ impl Database {
                 || table_exists(connection, "share_links")?
                 || table_exists(connection, "share_sessions")?
                 || table_exists(connection, "site_settings")?
+                || table_exists(connection, "automation_accounts")?
                 || table_exists(connection, "media_assets")?;
             let published_at_type = if table_exists(connection, "posts")? {
                 connection.query_row(
@@ -400,7 +423,7 @@ impl Database {
         if published_at_type.is_some_and(|column_type| !column_type.eq_ignore_ascii_case("INTEGER")) {
             return Err(UNSUPPORTED_SCHEMA_MESSAGE.to_owned());
         }
-        if (user_version != 0 && user_version != 10 && user_version != CURRENT_SCHEMA_VERSION)
+        if (user_version != 0 && user_version != 10 && user_version != 11 && user_version != CURRENT_SCHEMA_VERSION)
             || (user_version == 0 && has_site_tables)
         {
             return Err(UNSUPPORTED_SCHEMA_MESSAGE.to_owned());
@@ -900,6 +923,45 @@ impl Database {
         .await
     }
 
+    pub async fn create_automation_account(&self, username: String, password_hash: String) -> Result<(), String> {
+        self.run(move |connection| {
+            connection.execute("INSERT INTO automation_accounts (username, password_hash, created_at) VALUES (?1, ?2, ?3)",
+                params![username, password_hash, unix_seconds(unix_time())])?;
+            Ok(())
+        }).await
+    }
+
+    pub async fn automation_accounts(&self) -> Result<Vec<(String, bool)>, String> {
+        self.run(|connection| {
+            let mut statement = connection.prepare("SELECT username, enabled FROM automation_accounts ORDER BY username COLLATE NOCASE")?;
+            statement.query_map([], |row| Ok((row.get(0)?, row.get::<_, i64>(1)? != 0)))?.collect()
+        }).await
+    }
+
+    pub async fn automation_account(&self, username: String) -> Result<Option<AutomationAccount>, String> {
+        self.run(move |connection| {
+            connection.query_row("SELECT username, password_hash, enabled FROM automation_accounts WHERE username = ?1 COLLATE NOCASE",
+                [username], |row| Ok(AutomationAccount { username: row.get(0)?, password_hash: row.get(1)?, enabled: row.get::<_, i64>(2)? != 0 }))
+                .optional()
+        }).await
+    }
+
+    pub async fn change_automation_password(&self, username: String, password_hash: String) -> Result<(), String> {
+        self.run(move |connection| {
+            if connection.execute("UPDATE automation_accounts SET password_hash = ?2 WHERE username = ?1 COLLATE NOCASE",
+                params![username, password_hash])? == 0 { return Err(rusqlite::Error::QueryReturnedNoRows); }
+            Ok(())
+        }).await
+    }
+
+    pub async fn set_automation_account_enabled(&self, username: String, enabled: bool) -> Result<(), String> {
+        self.run(move |connection| {
+            if connection.execute("UPDATE automation_accounts SET enabled = ?2 WHERE username = ?1 COLLATE NOCASE",
+                params![username, enabled])? == 0 { return Err(rusqlite::Error::QueryReturnedNoRows); }
+            Ok(())
+        }).await
+    }
+
     pub async fn issue_session(
         &self,
         user_id: i64,
@@ -1021,34 +1083,45 @@ impl Database {
                 selected.push((post_id, published_at));
             }
             selected.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| b.0.cmp(&a.0)));
-            let post_count = selected.len();
-            let kind = if post_count == 1 { "single" } else { "multi" };
-            let title = if kind == "multi" { Some(title.unwrap_or_else(|| "Shared posts".to_owned())) } else { None };
-            let lifetime_seconds = transaction.query_row(
-                "SELECT integer_value FROM site_settings WHERE name = 'share_link_lifetime_seconds'",
-                [],
-                |row| row.get::<_, i64>(0),
-            )?;
-            let expires_at_seconds = created_at_seconds
-                .checked_add(lifetime_seconds)
-                .ok_or(rusqlite::Error::IntegralValueOutOfRange(0, lifetime_seconds))?;
-            transaction.execute(
-                "INSERT INTO share_links (id, kind, title, creator_id, token_digest, created_at, expires_at) \
-                 VALUES (?1, ?2, ?3, (SELECT id FROM users WHERE username = ?4 COLLATE NOCASE), ?5, ?6, ?7)",
-                params![id, kind, title, author_username, token_digest, created_at_seconds, expires_at_seconds],
-            )?;
-            for (position, (post_id, _)) in selected.iter().enumerate() {
-                transaction.execute("INSERT INTO share_link_posts (share_link_id, post_id, position) VALUES (?1, ?2, ?3)",
-                    params![id, post_id, position as i64])?;
-            }
+            let created = insert_share_link(&transaction, id, selected, title, token_digest, created_at_seconds, author_username)?;
             transaction.commit()?;
-            Ok(Some(ShareLinkCreated {
-                id,
-                expires_at_unix: expires_at_seconds,
-                post_count,
-            }))
+            Ok(Some(created))
         })
         .await
+    }
+
+    pub async fn create_collection_share_link(
+        &self,
+        id: String,
+        title: String,
+        token_digest: String,
+        created_at: Duration,
+        from_millis: i64,
+        until_millis: i64,
+    ) -> Result<CollectionShareLinkCreated, String> {
+        self.run(move |connection| {
+            let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let first_second = ceil_millis_to_seconds(from_millis);
+            let last_second = ceil_millis_to_seconds(until_millis);
+            let mut selected = {
+                let mut statement = transaction.prepare(
+                    "SELECT id, published_at FROM posts WHERE published = 1 \
+                     AND published_at >= ?1 AND published_at < ?2 \
+                     ORDER BY published_at DESC, id DESC LIMIT 101",
+                )?;
+                let rows = statement.query_map(params![first_second, last_second], |row| Ok((row.get(0)?, row.get(1)?)))?;
+                rows.collect::<rusqlite::Result<Vec<(i64, i64)>>>()?
+            };
+            let truncated = selected.len() > 100;
+            selected.truncate(100);
+            let link = if selected.is_empty() {
+                None
+            } else {
+                Some(insert_share_link(&transaction, id, selected, Some(title), token_digest, unix_seconds(created_at), None)?)
+            };
+            transaction.commit()?;
+            Ok(CollectionShareLinkCreated { link, truncated })
+        }).await
     }
 
     pub async fn share_links(&self) -> Result<Vec<ShareLinkView>, String> {
@@ -1711,8 +1784,41 @@ fn initialize_schema(connection: &mut Connection, version: i64) -> rusqlite::Res
     transaction.execute_batch(POST_BLOCKS_SCHEMA)?;
     transaction.execute_batch(AUTH_SCHEMA)?;
     transaction.execute_batch(SHARE_SCHEMA)?;
+    transaction.execute_batch(AUTOMATION_SCHEMA)?;
+    transaction.prepare("SELECT username, password_hash, enabled, created_at FROM automation_accounts LIMIT 0")?;
     transaction.pragma_update(None, "user_version", CURRENT_SCHEMA_VERSION)?;
     transaction.commit()
+}
+
+fn ceil_millis_to_seconds(millis: i64) -> i64 {
+    millis.div_euclid(1000) + i64::from(millis.rem_euclid(1000) != 0)
+}
+
+fn insert_share_link(
+    transaction: &Transaction<'_>,
+    id: String,
+    selected: Vec<(i64, i64)>,
+    title: Option<String>,
+    token_digest: String,
+    created_at_seconds: i64,
+    author_username: Option<&str>,
+) -> rusqlite::Result<ShareLinkCreated> {
+    let post_count = selected.len();
+    let kind = if post_count == 1 { "single" } else { "multi" };
+    let title = if kind == "multi" { Some(title.unwrap_or_else(|| "Shared posts".to_owned())) } else { None };
+    let lifetime_seconds = transaction.query_row(
+        "SELECT integer_value FROM site_settings WHERE name = 'share_link_lifetime_seconds'", [], |row| row.get::<_, i64>(0))?;
+    let expires_at_seconds = created_at_seconds.checked_add(lifetime_seconds)
+        .ok_or(rusqlite::Error::IntegralValueOutOfRange(0, lifetime_seconds))?;
+    transaction.execute(
+        "INSERT INTO share_links (id, kind, title, creator_id, token_digest, created_at, expires_at) \
+         VALUES (?1, ?2, ?3, (SELECT id FROM users WHERE username = ?4 COLLATE NOCASE), ?5, ?6, ?7)",
+        params![id, kind, title, author_username, token_digest, created_at_seconds, expires_at_seconds])?;
+    for (position, (post_id, _)) in selected.iter().enumerate() {
+        transaction.execute("INSERT INTO share_link_posts (share_link_id, post_id, position) VALUES (?1, ?2, ?3)",
+            params![id, post_id, position as i64])?;
+    }
+    Ok(ShareLinkCreated { id, expires_at_unix: expires_at_seconds, post_count })
 }
 
 pub(crate) fn local_month_bounds(month: &str, timezone: &str) -> Result<(i64, i64), String> {
@@ -2697,6 +2803,93 @@ mod tests {
         drop(connection);
         let (_, page) = database.shared_feed("multi".to_owned(), "e".repeat(64), None, 10, now).await.unwrap().unwrap();
         assert_eq!(page.posts.iter().map(|post| post.id).collect::<Vec<_>>(), vec![1]);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn version_eleven_upgrade_preserves_links_sessions_and_settings() {
+        let path = test_database_path();
+        let database = Database::new(path.clone());
+        database.initialize().await.unwrap();
+        database.create_account("author".to_owned(), super::AccountRole::Write, "hash".to_owned()).await.unwrap();
+        let connection = Connection::open(&path).unwrap();
+        connection.execute_batch("INSERT INTO posts (author_id, title, published_at, summary) VALUES (1, 'Kept', 100, ''); \
+            INSERT INTO sessions VALUES ('aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', 1, 1, 9999999999); \
+            INSERT INTO share_links VALUES ('kept-link', 'single', NULL, 1, 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb', 1, 9999999999, NULL); \
+            INSERT INTO share_link_posts VALUES ('kept-link', 1, 0); \
+            INSERT INTO share_sessions VALUES ('cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc', 'kept-link', 1, 9999999999); \
+            UPDATE site_settings SET integer_value = 172800 WHERE name = 'share_link_lifetime_seconds'; \
+            PRAGMA user_version = 11;").unwrap();
+        drop(connection);
+        database.initialize().await.unwrap();
+        let connection = Connection::open(&path).unwrap();
+        assert_eq!(connection.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0)).unwrap(), 12);
+        for table in ["posts", "sessions", "share_links", "share_link_posts", "share_sessions"] {
+            assert_eq!(connection.query_row(&format!("SELECT count(*) FROM {table}"), [], |row| row.get::<_, i64>(0)).unwrap(), 1);
+        }
+        assert_eq!(connection.query_row("SELECT integer_value FROM site_settings WHERE name = 'share_link_lifetime_seconds'", [], |row| row.get::<_, i64>(0)).unwrap(), 172800);
+        assert_eq!(connection.query_row("PRAGMA foreign_key_check", [], |row| row.get::<_, Option<String>>(0)).optional().unwrap(), None);
+        drop(connection);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn failed_version_eleven_upgrade_rolls_back() {
+        let path = test_database_path();
+        let database = Database::new(path.clone());
+        database.initialize().await.unwrap();
+        let connection = Connection::open(&path).unwrap();
+        connection.execute_batch("DROP TABLE automation_accounts; \
+            CREATE VIEW automation_accounts AS SELECT 'kept' AS username; PRAGMA user_version = 11;").unwrap();
+        drop(connection);
+        assert!(database.initialize().await.is_err());
+        let connection = Connection::open(&path).unwrap();
+        assert_eq!(connection.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0)).unwrap(), 11);
+        assert_eq!(connection.query_row("SELECT username FROM automation_accounts", [], |row| row.get::<_, String>(0)).unwrap(), "kept");
+        drop(connection);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn collection_selection_has_precise_bounds_and_frozen_newest_membership() {
+        let path = test_database_path();
+        let database = Database::new(path.clone());
+        database.initialize().await.unwrap();
+        database.create_account("one".to_owned(), super::AccountRole::Write, "hash".to_owned()).await.unwrap();
+        database.create_account("two".to_owned(), super::AccountRole::Write, "hash".to_owned()).await.unwrap();
+        let connection = Connection::open(&path).unwrap();
+        for id in 1..=104 {
+            connection.execute("INSERT INTO posts (author_id, title, published_at, summary, published) VALUES (?1, '', ?2, '', ?3)",
+                rusqlite::params![if id % 2 == 0 { 1 } else { 2 }, if id <= 2 { 100 } else { 101 }, if id == 104 { 0 } else { 1 }]).unwrap();
+        }
+        drop(connection);
+        let now = Duration::from_secs(1_800_000_000);
+        let empty = database.create_collection_share_link("empty".to_owned(), "Empty".to_owned(), "a".repeat(64), now, 100001, 101000).await.unwrap();
+        assert!(empty.link.is_none());
+        assert!(!empty.truncated);
+        let one = database.create_collection_share_link("one".to_owned(), "One".to_owned(), "b".repeat(64), now, 99000, 100001).await.unwrap();
+        assert_eq!(one.link.unwrap().post_count, 2);
+        let boundary = database.create_collection_share_link("boundary".to_owned(), "Boundary".to_owned(), "f".repeat(64), now, 100000, 100001).await.unwrap();
+        assert_eq!(boundary.link.unwrap().post_count, 2);
+        let many = database.create_collection_share_link("many".to_owned(), "Many".to_owned(), "c".repeat(64), now, 100000, 102000).await.unwrap();
+        assert_eq!(many.link.unwrap().post_count, 100);
+        assert!(many.truncated);
+        let connection = Connection::open(&path).unwrap();
+        let ids = connection.prepare("SELECT post_id FROM share_link_posts WHERE share_link_id = 'many' ORDER BY position").unwrap()
+            .query_map([], |row| row.get::<_, i64>(0)).unwrap().collect::<rusqlite::Result<Vec<_>>>().unwrap();
+        assert_eq!(ids[0], 103);
+        assert_eq!(ids[99], 4);
+        assert!(!ids.contains(&1) && !ids.contains(&2) && !ids.contains(&3) && !ids.contains(&104));
+        assert_eq!(connection.query_row("SELECT count(*) FROM share_links WHERE id = 'empty'", [], |row| row.get::<_, i64>(0)).unwrap(), 0);
+        drop(connection);
+        database.issue_share_session("many".to_owned(), "c".repeat(64), "e".repeat(64), now).await.unwrap().unwrap();
+        assert!(database.shared_post("many".to_owned(), "e".repeat(64), 3, now).await.unwrap().is_none());
+        let connection = Connection::open(&path).unwrap();
+        connection.execute("UPDATE posts SET published = 0 WHERE id = 3", []).unwrap();
+        drop(connection);
+        let exactly = database.create_collection_share_link("exactly".to_owned(), "Exactly".to_owned(), "d".repeat(64), now, 100001, 102000).await.unwrap();
+        assert_eq!(exactly.link.unwrap().post_count, 100);
+        assert!(!exactly.truncated);
         std::fs::remove_file(path).unwrap();
     }
 }

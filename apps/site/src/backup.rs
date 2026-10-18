@@ -247,7 +247,7 @@ mod tests {
         zstd(&source, &compressed, false).unwrap();
         verify_file(&compressed, &output).await.unwrap();
         let restored = Connection::open(&output).unwrap();
-        assert_eq!(restored.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0)).unwrap(), 11);
+        assert_eq!(restored.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0)).unwrap(), crate::db::CURRENT_SCHEMA_VERSION);
         assert_eq!(restored.query_row("SELECT value FROM sample", [], |row| row.get::<_, String>(0)).unwrap(), "kept");
         let original = Connection::open(&source).unwrap();
         assert_eq!(original.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0)).unwrap(), 10);
