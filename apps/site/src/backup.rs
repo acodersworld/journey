@@ -100,6 +100,9 @@ pub async fn verify_file(input: &Path, output: &Path) -> Result<()> {
         if output.exists() { return Err("output file already exists".into()); }
         let staged = Temporary::near(&output)?;
         zstd(&input, &staged.0, true)?;
+        let staged_database = crate::db::Database::new(staged.0.clone());
+        tokio::runtime::Handle::current().block_on(staged_database.initialize())
+            .map_err(std::io::Error::other)?;
         validate(&staged.0)?;
         use std::os::unix::fs::PermissionsExt;
         fs::set_permissions(&staged.0, fs::Permissions::from_mode(0o600))?;
@@ -206,8 +209,9 @@ mod tests {
         let source = directory.join("source.sqlite3");
         let compressed = directory.join("source.zst");
         let output = directory.join("restored.sqlite3");
+        crate::db::Database::new(source.clone()).initialize().await.unwrap();
         let db = Connection::open(&source).unwrap();
-        db.execute_batch("PRAGMA user_version = 10; CREATE TABLE sample (value TEXT); INSERT INTO sample VALUES ('before');").unwrap();
+        db.execute_batch("CREATE TABLE sample (value TEXT); INSERT INTO sample VALUES ('before');").unwrap();
         drop(db);
         zstd(&source, &compressed, false).unwrap();
         verify_file(&compressed, &output).await.unwrap();
@@ -225,12 +229,41 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn verify_upgrades_a_version_ten_backup_on_the_restored_file() {
+        let directory = std::env::temp_dir().join(format!("journey-backup-test-{}", hex(&rand::random::<[u8; 16]>())));
+        fs::create_dir(&directory).unwrap();
+        let source = directory.join("source.sqlite3");
+        let compressed = directory.join("source.zst");
+        let output = directory.join("restored.sqlite3");
+        crate::db::Database::new(source.clone()).initialize().await.unwrap();
+        let db = Connection::open(&source).unwrap();
+        db.execute_batch("CREATE TABLE sample (value TEXT); INSERT INTO sample VALUES ('kept'); \
+            DROP TABLE share_sessions; DROP TABLE share_link_posts; DROP TABLE share_links; \
+            CREATE TABLE share_links (id TEXT PRIMARY KEY, post_id INTEGER NOT NULL REFERENCES posts(id) ON DELETE CASCADE, \
+            token_digest TEXT NOT NULL, created_at INTEGER NOT NULL, expires_at INTEGER NOT NULL, revoked_at INTEGER); \
+            CREATE TABLE share_sessions (token_digest TEXT PRIMARY KEY, share_link_id TEXT NOT NULL REFERENCES share_links(id) ON DELETE CASCADE, \
+            created_at INTEGER NOT NULL, expires_at INTEGER NOT NULL); PRAGMA user_version = 10;").unwrap();
+        drop(db);
+        zstd(&source, &compressed, false).unwrap();
+        verify_file(&compressed, &output).await.unwrap();
+        let restored = Connection::open(&output).unwrap();
+        assert_eq!(restored.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0)).unwrap(), 11);
+        assert_eq!(restored.query_row("SELECT value FROM sample", [], |row| row.get::<_, String>(0)).unwrap(), "kept");
+        let original = Connection::open(&source).unwrap();
+        assert_eq!(original.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0)).unwrap(), 10);
+        drop(original);
+        drop(restored);
+        let _ = fs::remove_dir_all(directory);
+    }
+
+    #[tokio::test]
     async fn backups_replace_one_key_and_failed_upload_preserves_previous_snapshot() {
         let directory = std::env::temp_dir().join(format!("journey-backup-test-{}", hex(&rand::random::<[u8; 16]>())));
         fs::create_dir(&directory).unwrap();
         let source = directory.join("live.sqlite3");
+        crate::db::Database::new(source.clone()).initialize().await.unwrap();
         let db = Connection::open(&source).unwrap();
-        db.execute_batch("PRAGMA user_version = 10; CREATE TABLE sample (value TEXT); INSERT INTO sample VALUES ('first');").unwrap();
+        db.execute_batch("CREATE TABLE sample (value TEXT); INSERT INTO sample VALUES ('first');").unwrap();
         drop(db);
         let storage = MemoryStorage::default();
         let jobs = Jobs::default();

@@ -1309,6 +1309,111 @@ if (shareDialog) {
   let shareBusy = false;
   let panelGeneration = 0;
   let copiedMessageTimer = null;
+  let selectedPosts = new Map();
+  let selectedIds = [];
+  const reviewArea = document.createElement('div');
+  reviewArea.className = 'share-review-area';
+  reviewArea.hidden = true;
+  reviewArea.innerHTML = '<button type="button" data-share-back>Back to selection</button><ul data-share-review-list></ul><div data-share-title><label for="share-multi-title">Title</label><input id="share-multi-title" maxlength="200" placeholder="Shared posts"></div>';
+  shareHeading.after(reviewArea);
+  const titleInput = reviewArea.querySelector('#share-multi-title');
+  const selectionStart = document.querySelector('#share-posts-start');
+  const selectionBar = document.querySelector('#share-selection-bar');
+  const selectionCount = document.querySelector('#share-selected-count');
+  const selectionReview = document.querySelector('#share-selection-review');
+  const selectionCancel = document.querySelector('#share-selection-cancel');
+
+  function updateSelection() {
+    if (!selectionBar) return;
+    selectionCount.textContent = `${selectedPosts.size} selected`;
+    selectionReview.disabled = selectedPosts.size === 0;
+    document.querySelectorAll('.post[data-post-id]').forEach(post => {
+      const eligible = Boolean(post.querySelector('[data-share-post]'));
+      let checkbox = post.querySelector('.share-select-checkbox');
+      if (selectionBar.hidden || !eligible) { checkbox?.remove(); return; }
+      if (!checkbox) {
+        checkbox = document.createElement('input');
+        checkbox.type = 'checkbox';
+        checkbox.className = 'share-select-checkbox';
+        checkbox.setAttribute('aria-label', `Select ${post.querySelector('h1')?.textContent || 'post'}`);
+        post.querySelector('.post-header')?.prepend(checkbox);
+      }
+      checkbox.checked = selectedPosts.has(post.dataset.postId);
+    });
+  }
+
+  function renderReview() {
+    const list = reviewArea.querySelector('[data-share-review-list]');
+    list.replaceChildren();
+    selectedIds.forEach(id => {
+      const post = selectedPosts.get(id);
+      if (!post) return;
+      const item = document.createElement('li');
+      const label = document.createElement('span');
+      label.textContent = `${post.title} · ${post.date}`;
+      const remove = document.createElement('button');
+      remove.type = 'button';
+      remove.textContent = 'Remove';
+      remove.addEventListener('click', () => {
+        selectedPosts.delete(id);
+        selectedIds = selectedIds.filter(value => value !== id);
+        currentPostId = selectedIds[0] || null;
+        currentLink = null;
+        expiryLabel.hidden = true;
+        updateShareControls();
+        renderReview();
+        updateSelection();
+        if (!selectedIds.length) shareDialog.close();
+      });
+      item.append(label, remove);
+      list.append(item);
+    });
+  }
+
+  if (selectionStart) {
+    document.addEventListener('journey:feed-post-added', updateSelection);
+    selectionStart.addEventListener('click', () => { selectionStart.hidden = true; selectionBar.hidden = false; updateSelection(); });
+    selectionCancel.addEventListener('click', () => {
+      selectedPosts.clear(); selectedIds = []; titleInput.value = '';
+      selectionBar.hidden = true; selectionStart.hidden = false; updateSelection();
+    });
+    document.addEventListener('change', event => {
+      if (!event.target.matches('.share-select-checkbox')) return;
+      const post = event.target.closest('.post');
+      const id = post?.dataset.postId;
+      if (!id) return;
+      if (event.target.checked) {
+        if (selectedPosts.size >= 100) { event.target.checked = false; return; }
+        selectedPosts.set(id, { title: post.querySelector('h1')?.textContent?.trim() || 'Untitled', date: post.querySelector('time')?.textContent?.trim() || '',
+          timestamp: Date.parse(post.querySelector('time')?.dateTime || '') || 0 });
+        selectedIds.push(id);
+      } else {
+        selectedPosts.delete(id); selectedIds = selectedIds.filter(value => value !== id);
+      }
+      updateSelection();
+    });
+    selectionReview.addEventListener('click', () => {
+      selectedIds = [...selectedPosts.keys()];
+      if (!selectedIds.length) return;
+      if (selectedIds.length === 1) {
+        document.querySelector(`.post[data-post-id="${selectedIds[0]}"] [data-share-post]`)?.click();
+        return;
+      }
+      selectedIds.sort((a, b) => selectedPosts.get(b).timestamp - selectedPosts.get(a).timestamp || Number(b) - Number(a));
+      panelGeneration += 1; resetSharePanel();
+      currentPostId = selectedIds[0];
+      reviewArea.hidden = false;
+      previewFrame.closest('.share-preview-frame').hidden = true;
+      fullPreviewLink.closest('.share-preview-actions').hidden = true;
+      titleInput.parentElement.hidden = selectedIds.length === 1;
+      shareHeading.textContent = selectedIds.length === 1 ? 'Share post' : 'Share posts';
+      renderReview(); shareDialog.showModal();
+    });
+    reviewArea.querySelector('[data-share-back]').addEventListener('click', () => shareDialog.close());
+    titleInput.addEventListener('input', () => {
+      currentLink = null; expiryLabel.hidden = true; updateShareControls();
+    });
+  }
 
   function clearShareStatus() {
     if (copiedMessageTimer) window.clearTimeout(copiedMessageTimer);
@@ -1371,10 +1476,15 @@ if (shareDialog) {
     updateShareControls();
 
     try {
+      if (currentLink && Number(currentLink.expires_at_unix) <= Date.now() / 1000) {
+        currentLink = null;
+        expiryLabel.hidden = true;
+      }
       if (!currentLink) {
         const response = await fetch(`/api/posts/${encodeURIComponent(currentPostId)}/share-links`, {
           method: 'POST',
-          headers: { Accept: 'application/json' },
+          headers: selectedIds.length > 1 ? { Accept: 'application/json', 'Content-Type': 'application/json' } : { Accept: 'application/json' },
+          body: selectedIds.length > 1 ? JSON.stringify({ additional_post_ids: selectedIds.slice(1).map(Number), title: titleInput.value }) : undefined,
         });
         if (generation !== panelGeneration) return;
         if (response.status === 401) {
@@ -1448,6 +1558,10 @@ if (shareDialog) {
     resetSharePanel();
     activeShareButton = shareButton;
     currentPostId = shareButton.dataset.sharePost;
+    selectedIds = [];
+    reviewArea.hidden = true;
+    previewFrame.closest('.share-preview-frame').hidden = false;
+    fullPreviewLink.closest('.share-preview-actions').hidden = false;
     const post = shareButton.closest('.post');
     const title = post?.querySelector('h1')?.textContent?.trim();
     shareHeading.textContent = title ? `Share “${title}”` : 'Share post';
@@ -1470,6 +1584,7 @@ if (shareDialog) {
     resetSharePanel();
     if (activeShareButton?.isConnected) activeShareButton.focus({ preventScroll: true });
     activeShareButton = null;
+    selectedIds = [];
   });
 }
 
@@ -1493,8 +1608,9 @@ if (feed) {
       const feedQuery = new URLSearchParams({ limit: '1', after: nextCursor });
       if (feed.hasAttribute('data-tag')) feedQuery.set('tag', feed.dataset.tag);
       if (feed.hasAttribute('data-month')) feedQuery.set('month', feed.dataset.month);
-      const feedResponse = await fetch(`/api/posts?${feedQuery}`);
-      if (feedResponse.status === 401) {
+      const guestFeed = feed.dataset.shareFeed;
+      const feedResponse = await fetch(`${guestFeed ? `${guestFeed}/feed` : '/api/posts'}?${feedQuery}`);
+      if (feedResponse.status === 401 && !guestFeed) {
         redirectToLogin();
         return;
       }
@@ -1507,8 +1623,8 @@ if (feed) {
       } else {
         const post = page.posts[0];
         const fragmentQuery = feed.hasAttribute('data-mosaic') ? '?mosaic=true' : '';
-        const postResponse = await fetch(`/posts/${encodeURIComponent(post.id)}/fragment${fragmentQuery}`);
-        if (postResponse.status === 401) {
+        const postResponse = await fetch(`${guestFeed || ''}/posts/${encodeURIComponent(post.id)}/fragment${fragmentQuery}`);
+        if (postResponse.status === 401 && !guestFeed) {
           redirectToLogin();
           return;
         }
@@ -1519,6 +1635,7 @@ if (feed) {
         const article = template.content.firstElementChild;
         if (!article || !article.matches('article.post')) throw new Error('Invalid post fragment');
         feed.append(article);
+        document.dispatchEvent(new Event('journey:feed-post-added'));
         formatLocalTimes(article);
         initializeGalleryMediaImages(article);
         nextCursor = typeof page.next_cursor === 'string' ? page.next_cursor : null;

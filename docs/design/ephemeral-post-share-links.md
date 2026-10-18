@@ -1,6 +1,6 @@
 # Ephemeral post share links
 
-Share links provide guest access to one published post and its media. A `write`
+Single-post share links provide guest access to one published post and its media. A `write`
 account can create and revoke links for its own published posts; an `admin` can
 manage links for any published post. The CLI also creates, lists, and revokes
 links.
@@ -11,8 +11,10 @@ links.
 defaults to 86,400 seconds. Link creation copies that duration into an absolute
 expiry, so later setting changes affect only new links.
 
-`share_links` stores a random public ID, post ID, SHA-256 digest of the link
-secret, creation and expiry times, and an optional revocation time. The raw
+`share_links` stores a random public ID, kind, optional title, creator, SHA-256
+digest of the link secret, creation and expiry times, and an optional
+revocation time. `share_link_posts` stores ordered membership; see
+[manual multi-post share links](manual-multi-post-share-links.md). The raw
 secret is shown only by the create command. `share_sessions` stores a digest of
 an independently generated session token, its link ID, creation time, and an
 expiry no later than the link's fixed expiry. Routine database operations
@@ -37,7 +39,7 @@ default, including account cookies. `journey-site serve --allow-insecure-cookies
 disables `Secure` only when the listener binds to loopback.
 
 The `journey-site share-links` commands manage the SQLite lifetime and links.
-Link listing contains public IDs, post IDs, expiry as epoch seconds and an ISO
+Link listing contains public IDs, member post IDs, expiry as epoch seconds and an ISO
 8601 UTC date-time, and revocation status; it never returns link secrets.
 
 ## Account sharing controls

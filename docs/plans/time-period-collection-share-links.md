@@ -9,7 +9,7 @@ multi-post guest feed, using mosaics and the media scroller.
 The website handles collection creation and guest access. Scheduling and email
 delivery remain in the external script.
 
-Build on [Manual multi-post sharing](manual-multi-post-share-links.md). This
+Build on [Manual multi-post sharing](../design/manual-multi-post-share-links.md). This
 plan adds automation credentials and time-bound selection to that common
 sharing mechanism; it does not introduce separate collection links, sessions,
 or guest rendering.

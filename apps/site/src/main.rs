@@ -368,7 +368,7 @@ async fn main() -> AppResult<()> {
                 }
                 ShareLinkCommands::List => {
                     let now = unix_time();
-                    println!("Link ID\tPost ID\tExpires (epoch seconds)\tExpires (UTC)\tRevocation status");
+                    println!("Link ID\tPost IDs\tExpires (epoch seconds)\tExpires (UTC)\tRevocation status");
                     for link in database.share_links().await.map_err(std::io::Error::other)? {
                         let status = match link.revoked_at {
                             Some(revoked_at) => format!("revoked at {}", revoked_at.as_secs()),
@@ -378,7 +378,7 @@ async fn main() -> AppResult<()> {
                         println!(
                             "{}\t{}\t{}\t{}\t{}",
                             link.id,
-                            link.post_id,
+                            link.post_ids.iter().map(ToString::to_string).collect::<Vec<_>>().join(","),
                             link.expires_at.as_secs(),
                             link.expires_at_utc.as_deref().unwrap_or("out of range"),
                             status,

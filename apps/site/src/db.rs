@@ -99,8 +99,8 @@ CREATE TABLE IF NOT EXISTS login_throttles (
 );
 ";
 
-pub(crate) const CURRENT_SCHEMA_VERSION: i64 = 10;
-const REBUILD_DATABASE_MESSAGE: &str = "site database schema is outdated; recreate the SQLite database and run the destructive importer again";
+pub(crate) const CURRENT_SCHEMA_VERSION: i64 = 11;
+const UNSUPPORTED_SCHEMA_MESSAGE: &str = "unsupported site database schema version; no data was changed";
 
 const SHARE_SCHEMA: &str = "\
 CREATE TABLE IF NOT EXISTS site_settings (
@@ -111,14 +111,23 @@ INSERT OR IGNORE INTO site_settings (name, integer_value)
 VALUES ('share_link_lifetime_seconds', 86400);
 CREATE TABLE IF NOT EXISTS share_links (
     id TEXT PRIMARY KEY,
-    post_id INTEGER NOT NULL REFERENCES posts(id) ON DELETE CASCADE,
+    kind TEXT NOT NULL CHECK (kind IN ('single', 'multi')),
+    title TEXT,
+    creator_id INTEGER REFERENCES users(id) ON DELETE SET NULL,
     token_digest TEXT NOT NULL UNIQUE CHECK (length(token_digest) = 64),
     created_at INTEGER NOT NULL,
     expires_at INTEGER NOT NULL CHECK (expires_at > created_at),
     revoked_at INTEGER
 );
-CREATE INDEX IF NOT EXISTS share_links_post ON share_links(post_id, created_at DESC);
 CREATE INDEX IF NOT EXISTS share_links_expiry ON share_links(expires_at);
+CREATE TABLE IF NOT EXISTS share_link_posts (
+    share_link_id TEXT NOT NULL REFERENCES share_links(id) ON DELETE CASCADE,
+    post_id INTEGER NOT NULL REFERENCES posts(id) ON DELETE CASCADE,
+    position INTEGER NOT NULL CHECK (position >= 0),
+    PRIMARY KEY (share_link_id, post_id),
+    UNIQUE (share_link_id, position)
+);
+CREATE INDEX IF NOT EXISTS share_link_posts_post ON share_link_posts(post_id);
 CREATE TABLE IF NOT EXISTS share_sessions (
     token_digest TEXT PRIMARY KEY CHECK (length(token_digest) = 64),
     share_link_id TEXT NOT NULL REFERENCES share_links(id) ON DELETE CASCADE,
@@ -350,12 +359,13 @@ pub struct PublishedTextBlock {
 pub struct ShareLinkCreated {
     pub id: String,
     pub expires_at_unix: i64,
+    pub post_count: usize,
 }
 
 #[derive(Clone, Debug)]
 pub struct ShareLinkView {
     pub id: String,
-    pub post_id: i64,
+    pub post_ids: Vec<i64>,
     pub expires_at: Duration,
     pub expires_at_utc: Option<String>,
     pub revoked_at: Option<Duration>,
@@ -391,14 +401,14 @@ impl Database {
             Ok((version, has_site_tables, published_at_type))
         }).await?;
         if published_at_type.is_some_and(|column_type| !column_type.eq_ignore_ascii_case("INTEGER")) {
-            return Err(REBUILD_DATABASE_MESSAGE.to_owned());
+            return Err(UNSUPPORTED_SCHEMA_MESSAGE.to_owned());
         }
-        if (user_version != 0 && user_version != CURRENT_SCHEMA_VERSION)
+        if (user_version != 0 && user_version != 10 && user_version != CURRENT_SCHEMA_VERSION)
             || (user_version == 0 && has_site_tables)
         {
-            return Err(REBUILD_DATABASE_MESSAGE.to_owned());
+            return Err(UNSUPPORTED_SCHEMA_MESSAGE.to_owned());
         }
-        self.run(initialize_schema).await
+        self.run(move |connection| initialize_schema(connection, user_version)).await
     }
 
     #[cfg(test)]
@@ -981,20 +991,42 @@ impl Database {
         created_at: Duration,
         access: ShareAccess,
     ) -> Result<Option<ShareLinkCreated>, String> {
+        self.create_share_link_posts(id, vec![post_id], None, token_digest, created_at, access).await
+    }
+
+    pub async fn create_share_link_posts(
+        &self,
+        id: String,
+        post_ids: Vec<i64>,
+        title: Option<String>,
+        token_digest: String,
+        created_at: Duration,
+        access: ShareAccess,
+    ) -> Result<Option<ShareLinkCreated>, String> {
+        if post_ids.is_empty() || post_ids.len() > 100 || post_ids.iter().any(|id| *id <= 0)
+            || post_ids.iter().collect::<std::collections::HashSet<_>>().len() != post_ids.len()
+        {
+            return Err("invalid post selection".to_owned());
+        }
         self.run(move |connection| {
             let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
             let created_at_seconds = unix_seconds(created_at);
             let (is_admin, author_username) = share_access_args(&access);
-            let published = transaction.query_row(
-                "SELECT EXISTS(SELECT 1 FROM posts WHERE id = ?1 AND published = 1 \
-                 AND (?2 = 1 OR author_id = (SELECT id FROM users WHERE username = ?3 COLLATE NOCASE)))",
+            let mut selected = Vec::new();
+            for post_id in post_ids {
+                let published_at = transaction.query_row(
+                "SELECT published_at FROM posts WHERE id = ?1 AND published = 1 \
+                 AND (?2 = 1 OR author_id = (SELECT id FROM users WHERE username = ?3 COLLATE NOCASE))",
                 params![post_id, is_admin, author_username],
-                |row| row.get::<_, bool>(0),
-            )?;
-            if !published {
-                transaction.commit()?;
-                return Ok(None);
+                |row| row.get::<_, i64>(0),
+                ).optional()?;
+                let Some(published_at) = published_at else { return Ok(None); };
+                selected.push((post_id, published_at));
             }
+            selected.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| b.0.cmp(&a.0)));
+            let post_count = selected.len();
+            let kind = if post_count == 1 { "single" } else { "multi" };
+            let title = if kind == "multi" { Some(title.unwrap_or_else(|| "Shared posts".to_owned())) } else { None };
             let lifetime_seconds = transaction.query_row(
                 "SELECT integer_value FROM site_settings WHERE name = 'share_link_lifetime_seconds'",
                 [],
@@ -1004,14 +1036,19 @@ impl Database {
                 .checked_add(lifetime_seconds)
                 .ok_or(rusqlite::Error::IntegralValueOutOfRange(0, lifetime_seconds))?;
             transaction.execute(
-                "INSERT INTO share_links (id, post_id, token_digest, created_at, expires_at) \
-                 VALUES (?1, ?2, ?3, ?4, ?5)",
-                params![id, post_id, token_digest, created_at_seconds, expires_at_seconds],
+                "INSERT INTO share_links (id, kind, title, creator_id, token_digest, created_at, expires_at) \
+                 VALUES (?1, ?2, ?3, (SELECT id FROM users WHERE username = ?4 COLLATE NOCASE), ?5, ?6, ?7)",
+                params![id, kind, title, author_username, token_digest, created_at_seconds, expires_at_seconds],
             )?;
+            for (position, (post_id, _)) in selected.iter().enumerate() {
+                transaction.execute("INSERT INTO share_link_posts (share_link_id, post_id, position) VALUES (?1, ?2, ?3)",
+                    params![id, post_id, position as i64])?;
+            }
             transaction.commit()?;
             Ok(Some(ShareLinkCreated {
                 id,
                 expires_at_unix: expires_at_seconds,
+                post_count,
             }))
         })
         .await
@@ -1020,7 +1057,7 @@ impl Database {
     pub async fn share_links(&self) -> Result<Vec<ShareLinkView>, String> {
         self.run(|connection| {
             let mut statement = connection.prepare(
-                "SELECT id, post_id, expires_at, \
+                "SELECT id, expires_at, \
                  strftime('%Y-%m-%dT%H:%M:%SZ', expires_at, 'unixepoch'), revoked_at \
                  FROM share_links \
                  ORDER BY created_at DESC, id",
@@ -1028,13 +1065,18 @@ impl Database {
             let rows = statement.query_map([], |row| {
                 Ok(ShareLinkView {
                     id: row.get(0)?,
-                    post_id: row.get(1)?,
-                    expires_at: duration_from_seconds(row.get(2)?),
-                    expires_at_utc: row.get(3)?,
-                    revoked_at: row.get::<_, Option<i64>>(4)?.map(duration_from_seconds),
+                    post_ids: Vec::new(),
+                    expires_at: duration_from_seconds(row.get(1)?),
+                    expires_at_utc: row.get(2)?,
+                    revoked_at: row.get::<_, Option<i64>>(3)?.map(duration_from_seconds),
                 })
             })?;
-            rows.collect()
+            let mut links = rows.collect::<rusqlite::Result<Vec<_>>>()?;
+            for link in &mut links {
+                let mut posts = connection.prepare("SELECT post_id FROM share_link_posts WHERE share_link_id = ?1 ORDER BY position")?;
+                link.post_ids = posts.query_map([&link.id], |row| row.get(0))?.collect::<rusqlite::Result<Vec<_>>>()?;
+            }
+            Ok(links)
         })
         .await
     }
@@ -1049,10 +1091,10 @@ impl Database {
             let (is_admin, author_username) = share_access_args(&access);
             let changed = connection.execute(
                 "UPDATE share_links SET revoked_at = COALESCE(revoked_at, ?2) \
-                 WHERE id = ?1 AND EXISTS (\
-                     SELECT 1 FROM posts AS p WHERE p.id = share_links.post_id AND p.published = 1 \
-                       AND (?3 = 1 OR p.author_id = (SELECT id FROM users WHERE username = ?4 COLLATE NOCASE))\
-                 )",
+                 WHERE id = ?1 AND (?3 = 1 OR (kind = 'multi' AND creator_id = (SELECT id FROM users WHERE username = ?4 COLLATE NOCASE)) \
+                     OR (kind = 'single' AND EXISTS (SELECT 1 FROM share_link_posts AS lp JOIN posts AS p ON p.id = lp.post_id \
+                         WHERE lp.share_link_id = share_links.id AND p.published = 1 \
+                         AND p.author_id = (SELECT id FROM users WHERE username = ?4 COLLATE NOCASE))))",
                 params![id, unix_seconds(revoked_at), is_admin, author_username],
             )?;
             Ok(changed != 0)
@@ -1066,18 +1108,21 @@ impl Database {
         link_token_digest: String,
         session_token_digest: String,
         created_at: Duration,
-    ) -> Result<Option<(i64, Duration)>, String> {
+    ) -> Result<Option<(Option<i64>, Duration)>, String> {
         self.run(move |connection| {
             let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
             let created_at_seconds = unix_seconds(created_at);
             let link = transaction
                 .query_row(
-                    "SELECT l.post_id, l.expires_at FROM share_links AS l \
-                     JOIN posts AS p ON p.id = l.post_id \
+                    "SELECT CASE WHEN l.kind = 'single' THEN (SELECT p.id FROM share_link_posts AS lp \
+                         JOIN posts AS p ON p.id = lp.post_id WHERE lp.share_link_id = l.id AND p.published = 1) ELSE NULL END, l.expires_at \
+                     FROM share_links AS l \
                      WHERE l.id = ?1 AND l.token_digest = ?2 AND l.expires_at > ?3 \
-                       AND l.revoked_at IS NULL AND p.published = 1",
+                       AND l.revoked_at IS NULL AND (l.kind = 'multi' OR EXISTS \
+                         (SELECT 1 FROM share_link_posts AS lp JOIN posts AS p ON p.id = lp.post_id \
+                          WHERE lp.share_link_id = l.id AND p.published = 1))",
                     params![share_link_id, link_token_digest, created_at_seconds],
-                    |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
+                    |row| Ok((row.get::<_, Option<i64>>(0)?, row.get::<_, i64>(1)?)),
                 )
                 .optional()?;
             let Some((post_id, expires_at_seconds)) = link else {
@@ -1106,10 +1151,11 @@ impl Database {
             let now_seconds = unix_seconds(now);
             let link = transaction
                 .query_row(
-                    "SELECT l.post_id, l.expires_at FROM share_links AS l \
-                     JOIN posts AS p ON p.id = l.post_id \
+                    "SELECT p.id, l.expires_at FROM share_links AS l \
+                     JOIN share_link_posts AS lp ON lp.share_link_id = l.id \
+                     JOIN posts AS p ON p.id = lp.post_id \
                      WHERE l.id = ?1 AND l.token_digest = ?2 AND l.expires_at > ?3 \
-                       AND l.revoked_at IS NULL AND p.published = 1",
+                       AND l.kind = 'single' AND l.revoked_at IS NULL AND p.published = 1",
                     params![share_link_id, link_token_digest, now_seconds],
                     |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
                 )
@@ -1136,11 +1182,12 @@ impl Database {
             connection
                 .query_row(
                     "SELECT a.storage_key, a.content_type FROM share_links AS l \
-                     JOIN posts AS p ON p.id = l.post_id \
+                     JOIN share_link_posts AS lp ON lp.share_link_id = l.id \
+                     JOIN posts AS p ON p.id = lp.post_id \
                      JOIN post_blocks AS b ON b.post_id = p.id \
                      JOIN media_assets AS a ON a.storage_key = b.storage_key \
                      WHERE l.id = ?1 AND b.id = ?2 \
-                       AND l.expires_at > ?3 AND l.revoked_at IS NULL AND p.published = 1 \
+                       AND l.kind = 'single' AND l.expires_at > ?3 AND l.revoked_at IS NULL AND p.published = 1 \
                        AND (a.content_type LIKE 'image/%' OR a.content_type LIKE 'video/%')",
                     params![share_link_id, block_id, now_seconds],
                     |row| {
@@ -1168,7 +1215,8 @@ impl Database {
             let authorized = transaction.query_row(
                 "SELECT EXISTS(SELECT 1 FROM share_sessions AS s \
                  JOIN share_links AS l ON l.id = s.share_link_id \
-                 JOIN posts AS p ON p.id = l.post_id \
+                 JOIN share_link_posts AS lp ON lp.share_link_id = l.id \
+                 JOIN posts AS p ON p.id = lp.post_id \
                  WHERE s.token_digest = ?1 AND s.share_link_id = ?2 \
                    AND s.expires_at > ?4 AND l.expires_at > ?4 \
                    AND l.revoked_at IS NULL AND p.published = 1 AND p.id = ?3)",
@@ -1186,6 +1234,40 @@ impl Database {
         .await
     }
 
+    pub async fn shared_feed(
+        &self,
+        share_link_id: String,
+        session_token_digest: String,
+        after_position: Option<i64>,
+        limit: usize,
+        now: Duration,
+    ) -> Result<Option<(String, FeedPage)>, String> {
+        self.run(move |connection| {
+            let authorized = connection.query_row(
+                "SELECT title FROM share_links AS l JOIN share_sessions AS s ON s.share_link_id = l.id \
+                 WHERE l.id = ?1 AND s.token_digest = ?2 AND s.expires_at > ?3 AND l.expires_at > ?3 \
+                   AND l.revoked_at IS NULL AND l.kind = 'multi'",
+                params![share_link_id, session_token_digest, unix_seconds(now)],
+                |row| row.get::<_, String>(0),
+            ).optional()?;
+            let Some(title) = authorized else { return Ok(None); };
+            let mut statement = connection.prepare(
+                "SELECT p.id, p.title, p.published_at, p.summary, lp.position \
+                 FROM share_link_posts AS lp JOIN posts AS p ON p.id = lp.post_id \
+                 WHERE lp.share_link_id = ?1 AND p.published = 1 AND lp.position > ?2 \
+                 ORDER BY lp.position LIMIT ?3",
+            )?;
+            let rows = statement.query_map(params![share_link_id, after_position.unwrap_or(-1), (limit + 1) as i64], |row| {
+                Ok((post_summary_from_row(row)?, row.get::<_, i64>(4)?))
+            })?;
+            let mut posts = rows.collect::<rusqlite::Result<Vec<_>>>()?;
+            let has_more = posts.len() > limit;
+            posts.truncate(limit);
+            let next_cursor = if has_more { posts.last().map(|(_, position)| position.to_string()) } else { None };
+            Ok(Some((title, FeedPage { posts: posts.into_iter().map(|(post, _)| post).collect(), next_cursor })))
+        }).await
+    }
+
     pub async fn shared_media_reference(
         &self,
         share_link_id: String,
@@ -1200,7 +1282,8 @@ impl Database {
                 .query_row(
                 "SELECT b.storage_key, a.content_type FROM share_sessions AS s \
                  JOIN share_links AS l ON l.id = s.share_link_id \
-                 JOIN posts AS p ON p.id = l.post_id \
+                 JOIN share_link_posts AS lp ON lp.share_link_id = l.id \
+                 JOIN posts AS p ON p.id = lp.post_id \
                  JOIN post_blocks AS b ON b.post_id = p.id \
                  JOIN media_assets AS a ON a.storage_key = b.storage_key \
                      WHERE s.token_digest = ?1 AND s.share_link_id = ?2 \
@@ -1608,7 +1691,9 @@ impl Database {
             connection
                 .pragma_update(None, "foreign_keys", "ON")
                 .map_err(|error| error.to_string())?;
-            if table_exists(&connection, "share_sessions").map_err(|error| error.to_string())? {
+            let version = connection.pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))
+                .map_err(|error| error.to_string())?;
+            if version == CURRENT_SCHEMA_VERSION && table_exists(&connection, "share_sessions").map_err(|error| error.to_string())? {
                 connection
                     .execute("DELETE FROM share_sessions WHERE expires_at <= ?1", [unix_seconds(unix_time())])
                     .map_err(|error| error.to_string())?;
@@ -1620,8 +1705,11 @@ impl Database {
     }
 }
 
-fn initialize_schema(connection: &mut Connection) -> rusqlite::Result<()> {
+fn initialize_schema(connection: &mut Connection, version: i64) -> rusqlite::Result<()> {
     let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    if version == 10 {
+        transaction.execute_batch("DROP TABLE share_sessions; DROP TABLE share_links;")?;
+    }
     transaction.execute_batch(POSTS_SCHEMA)?;
     transaction.execute_batch(MEDIA_ASSETS_SCHEMA)?;
     transaction.execute_batch(POST_BLOCKS_SCHEMA)?;
@@ -1899,7 +1987,7 @@ mod tests {
         time::{Duration, SystemTime, UNIX_EPOCH},
     };
 
-    use rusqlite::Connection;
+    use rusqlite::{Connection, OptionalExtension};
 
     use super::{Database, NewBlock, NewPost, PostAccess, ShareAccess};
 
@@ -2142,8 +2230,7 @@ mod tests {
 
         let database = Database::new(path.clone());
         let error = database.initialize().await.unwrap_err();
-        assert!(error.contains("recreate the SQLite database"));
-        assert!(error.contains("destructive importer"));
+        assert!(error.contains("unsupported site database schema version"));
 
         std::fs::remove_file(path).unwrap();
     }
@@ -2535,6 +2622,85 @@ mod tests {
             .await
             .unwrap());
 
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn version_ten_migration_preserves_other_data_and_is_repeatable() {
+        let path = test_database_path();
+        let database = Database::new(path.clone());
+        database.initialize().await.unwrap();
+        database.create_account("writer-one".to_owned(), super::AccountRole::Write, "test-hash".to_owned()).await.unwrap();
+        let connection = Connection::open(&path).unwrap();
+        connection.execute_batch("INSERT INTO posts (author_id, title, published_at, summary, published, tags) \
+            VALUES (1, 'Kept', 1767225600, 'Summary', 1, '[]'); \
+            INSERT INTO sessions (token_digest, user_id, created_at, expires_at) VALUES \
+            ('aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', 1, 1, 9999999999); \
+            UPDATE site_settings SET integer_value = 172800 WHERE name = 'share_link_lifetime_seconds'; \
+            DROP TABLE share_sessions; DROP TABLE share_link_posts; DROP TABLE share_links; \
+            CREATE TABLE share_links (id TEXT PRIMARY KEY, post_id INTEGER NOT NULL REFERENCES posts(id) ON DELETE CASCADE, \
+            token_digest TEXT NOT NULL UNIQUE, created_at INTEGER NOT NULL, expires_at INTEGER NOT NULL, revoked_at INTEGER); \
+            CREATE TABLE share_sessions (token_digest TEXT PRIMARY KEY, share_link_id TEXT NOT NULL REFERENCES share_links(id) ON DELETE CASCADE, \
+            created_at INTEGER NOT NULL, expires_at INTEGER NOT NULL); \
+            INSERT INTO share_links VALUES ('old', 1, 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb', 1, 9999999999, NULL); \
+            INSERT INTO share_sessions VALUES ('cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc', 'old', 1, 9999999999); \
+            PRAGMA user_version = 10;").unwrap();
+        drop(connection);
+        database.initialize().await.unwrap();
+        let connection = Connection::open(&path).unwrap();
+        assert_eq!(connection.query_row("SELECT count(*) FROM posts", [], |row| row.get::<_, i64>(0)).unwrap(), 1);
+        assert_eq!(connection.query_row("SELECT count(*) FROM sessions", [], |row| row.get::<_, i64>(0)).unwrap(), 1);
+        assert_eq!(connection.query_row("SELECT integer_value FROM site_settings WHERE name = 'share_link_lifetime_seconds'", [], |row| row.get::<_, i64>(0)).unwrap(), 172800);
+        assert_eq!(connection.query_row("SELECT count(*) FROM share_links", [], |row| row.get::<_, i64>(0)).unwrap(), 0);
+        assert_eq!(connection.query_row("PRAGMA foreign_key_check", [], |row| row.get::<_, Option<String>>(0)).optional().unwrap(), None);
+        drop(connection);
+        database.create_share_link("new".to_owned(), 1, "d".repeat(64), Duration::from_secs(1_800_000_000), ShareAccess::Admin).await.unwrap();
+        database.initialize().await.unwrap();
+        assert_eq!(database.share_links().await.unwrap().len(), 1);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn failed_version_ten_upgrade_keeps_version_and_other_rows() {
+        let path = test_database_path();
+        let database = Database::new(path.clone());
+        database.initialize().await.unwrap();
+        let connection = Connection::open(&path).unwrap();
+        connection.execute_batch("CREATE TABLE unrelated (value TEXT); INSERT INTO unrelated VALUES ('kept'); \
+            DROP TABLE share_sessions; PRAGMA user_version = 10;").unwrap();
+        drop(connection);
+        assert!(database.initialize().await.is_err());
+        let connection = Connection::open(&path).unwrap();
+        assert_eq!(connection.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0)).unwrap(), 10);
+        assert_eq!(connection.query_row("SELECT value FROM unrelated", [], |row| row.get::<_, String>(0)).unwrap(), "kept");
+        assert_eq!(connection.query_row("SELECT count(*) FROM share_links", [], |row| row.get::<_, i64>(0)).unwrap(), 0);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn multi_post_membership_survives_removed_posts_and_blocks_unrelated_posts() {
+        let path = test_database_path();
+        let database = Database::new(path.clone());
+        database.initialize().await.unwrap();
+        database.create_account("writer-one".to_owned(), super::AccountRole::Write, "test-hash".to_owned()).await.unwrap();
+        let connection = Connection::open(&path).unwrap();
+        connection.execute_batch("INSERT INTO posts (author_id, title, published_at, summary, published, tags) VALUES \
+            (1, 'Older', 100, '', 1, '[]'), (1, 'Newer', 200, '', 1, '[]'), (1, 'Other', 300, '', 1, '[]');").unwrap();
+        drop(connection);
+        let now = Duration::from_secs(1_800_000_000);
+        let created = database.create_share_link_posts("multi".to_owned(), vec![1, 2], Some("Two".to_owned()),
+            "d".repeat(64), now, ShareAccess::Author("writer-one".to_owned())).await.unwrap().unwrap();
+        assert_eq!(created.post_count, 2);
+        database.issue_share_session("multi".to_owned(), "d".repeat(64), "e".repeat(64), now).await.unwrap().unwrap();
+        let (_, page) = database.shared_feed("multi".to_owned(), "e".repeat(64), None, 1, now).await.unwrap().unwrap();
+        assert_eq!(page.posts[0].id, 2);
+        assert_eq!(page.next_cursor.as_deref(), Some("0"));
+        assert!(database.shared_post("multi".to_owned(), "e".repeat(64), 3, now).await.unwrap().is_none());
+        let connection = Connection::open(&path).unwrap();
+        connection.execute("DELETE FROM posts WHERE id = 2", []).unwrap();
+        drop(connection);
+        let (_, page) = database.shared_feed("multi".to_owned(), "e".repeat(64), None, 10, now).await.unwrap().unwrap();
+        assert_eq!(page.posts.iter().map(|post| post.id).collect::<Vec<_>>(), vec![1]);
         std::fs::remove_file(path).unwrap();
     }
 }

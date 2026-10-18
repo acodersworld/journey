@@ -1860,3 +1860,23 @@ figcaption {
   }
 
 }
+.share-selection-start { margin: 1rem 0; }
+.share-selection-start button, .share-selection-bar button, .share-review-area button {
+  cursor: pointer;
+  padding: .45rem .8rem;
+}
+.share-selection-bar {
+  position: sticky;
+  top: 0;
+  z-index: 10;
+  display: flex;
+  align-items: center;
+  gap: .7rem;
+  padding: .7rem;
+  background: var(--surface, #242424);
+}
+.share-selection-bar[hidden], .share-review-area[hidden] { display: none; }
+.share-select-checkbox { float: right; width: 1.3rem; height: 1.3rem; }
+.share-review-area ul { list-style: none; padding: 0; max-height: 35vh; overflow: auto; }
+.share-review-area li { display: flex; justify-content: space-between; gap: 1rem; margin: .5rem 0; }
+.share-review-area input { display: block; width: 100%; margin: .4rem 0 1rem; }

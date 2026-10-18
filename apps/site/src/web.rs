@@ -106,6 +106,14 @@ struct CreatedShareLinkResponse {
     id: String,
     url: String,
     expires_at_unix: i64,
+    post_count: usize,
+}
+
+#[derive(Deserialize, Default)]
+struct CreateShareLinkRequest {
+    #[serde(default)]
+    additional_post_ids: Vec<i64>,
+    title: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -303,6 +311,9 @@ pub fn router<S: StorageClient>(state: AppState<S>) -> Router {
         .route("/api/auth/current", get(current_account::<S>))
         .route("/api/auth/logout", post(logout::<S>))
         .route("/share/{share_link_id}/{secret}", get(open_share_link::<S>))
+        .route("/share/{share_link_id}", get(shared_feed_page::<S>))
+        .route("/share/{share_link_id}/feed", get(shared_feed_api::<S>))
+        .route("/share/{share_link_id}/posts/{post_id}/fragment", get(shared_post_fragment::<S>))
         .route(
             "/share/{share_link_id}/whatsapp-preview-image/{random_name}",
             get(whatsapp_preview::image::<S>),
@@ -428,7 +439,10 @@ fn safe_route_template(path: &str) -> &'static str {
                 ["share", _, "posts", _, "blocks", _, "media"] => {
                     "/share/{share_link_id}/posts/{post_id}/blocks/{block_id}/media"
                 }
+                ["share", _, "posts", _, "fragment"] => "/share/{share_link_id}/posts/{post_id}/fragment",
                 ["share", _, "posts", _] => "/share/{share_link_id}/posts/{post_id}",
+                ["share", _, "feed"] => "/share/{share_link_id}/feed",
+                ["share", id] if valid_share_link_id(id) => "/share/{share_link_id}",
                 ["perftest", _, "site"] => "/perftest/{token}/site",
                 ["perftest", _, "storage"] => "/perftest/{token}/storage",
                 ["share", _, _] => "/share/{share_link_id}/{secret}",
@@ -511,8 +525,10 @@ async fn open_share_link<S: StorageClient>(
         .await
     {
         Ok(Some((post_id, expires_at))) => {
-            log::info!("share_link_accessed share_link_id={share_link_id} post_id={post_id}");
-            let mut response = redirect_to(&format!("/share/{share_link_id}/posts/{post_id}"));
+            log::info!("share_link_accessed share_link_id={share_link_id}");
+            let destination = post_id.map(|id| format!("/share/{share_link_id}/posts/{id}"))
+                .unwrap_or_else(|| format!("/share/{share_link_id}"));
+            let mut response = redirect_to(&destination);
             set_share_cookie(
                 &mut response,
                 &state.security,
@@ -560,6 +576,69 @@ async fn shared_post_page<S: StorageClient>(
             log::error!("website shared-post lookup failed: {error}");
             no_store(StatusCode::INTERNAL_SERVER_ERROR.into_response())
         }
+    }
+}
+
+async fn shared_feed_page<S: StorageClient>(
+    State(state): State<AppState<S>>,
+    Path(share_link_id): Path<String>,
+    headers: HeaderMap,
+) -> Response {
+    let Some(token) = share_cookie_token(&headers, &share_link_id) else { return share_not_found(); };
+    match state.database.shared_feed(share_link_id.clone(), auth::session_token_digest(&token), None, 1, unix_time()).await {
+        Ok(Some((title, page))) => {
+            let mut feed = format!("<section id=\"feed\" aria-label=\"Shared posts\" data-mosaic data-share-feed=\"/share/{share_link_id}\" data-next-cursor=\"{}\">",
+                escape_html(page.next_cursor.as_deref().unwrap_or("")));
+            if let Some(summary) = page.posts.first() {
+                match state.database.shared_post(share_link_id.clone(), auth::session_token_digest(&token), summary.id, unix_time()).await {
+                    Ok(Some(post)) => feed.push_str(&render_post_with_media_prefix_mode(&post, true, Some(&format!("/share/{share_link_id}")), false, Some(state.mosaic_max_tiles))),
+                    Ok(None) => {},
+                    Err(error) => { log::error!("shared feed post failed: {error}"); return no_store(StatusCode::INTERNAL_SERVER_ERROR.into_response()); }
+                }
+            } else {
+                feed.push_str("<p class=\"empty-feed\">No shared posts are available.</p>");
+            }
+            feed.push_str("</section>");
+            let content = render_feed_controls(&format!("<main class=\"site site-feed\"><header class=\"feed-page-heading\"><h1>{}</h1></header>", escape_html(&title)), &feed, page.next_cursor.as_deref());
+            no_store(Html(pretty_html(&format!("<!doctype html><html lang=\"en\"><head>{}</head><body><div class=\"site-layout\">{content}</div>{}</body></html>",
+                html_head(&format!("{title} · Journey")), GALLERY_PANEL_HTML))).into_response())
+        }
+        Ok(None) => share_not_found(),
+        Err(error) => { log::error!("shared feed lookup failed: {error}"); no_store(StatusCode::INTERNAL_SERVER_ERROR.into_response()) }
+    }
+}
+
+async fn shared_feed_api<S: StorageClient>(
+    State(state): State<AppState<S>>,
+    Path(share_link_id): Path<String>,
+    Query(query): Query<FeedQuery>,
+    headers: HeaderMap,
+) -> Response {
+    let Some(token) = share_cookie_token(&headers, &share_link_id) else { return share_not_found(); };
+    let limit = query.limit.unwrap_or(DEFAULT_FEED_LIMIT);
+    if !(1..=MAX_FEED_LIMIT).contains(&limit) { return no_store(StatusCode::BAD_REQUEST.into_response()); }
+    let after = match query.after {
+        Some(cursor) => match cursor.parse::<i64>() { Ok(position) if position >= 0 => Some(position), _ => return no_store(StatusCode::BAD_REQUEST.into_response()) },
+        None => None,
+    };
+    match state.database.shared_feed(share_link_id, auth::session_token_digest(&token), after, limit, unix_time()).await {
+        Ok(Some((_, page))) => no_store(Json(page).into_response()),
+        Ok(None) => share_not_found(),
+        Err(error) => { log::error!("shared feed pagination failed: {error}"); no_store(StatusCode::INTERNAL_SERVER_ERROR.into_response()) }
+    }
+}
+
+async fn shared_post_fragment<S: StorageClient>(
+    State(state): State<AppState<S>>,
+    Path((share_link_id, post_id)): Path<(String, i64)>,
+    headers: HeaderMap,
+) -> Response {
+    let Some(token) = share_cookie_token(&headers, &share_link_id) else { return share_not_found(); };
+    match state.database.shared_post(share_link_id.clone(), auth::session_token_digest(&token), post_id, unix_time()).await {
+        Ok(Some(post)) => no_store(Html(pretty_html(&render_post_with_media_prefix_mode(&post, false,
+            Some(&format!("/share/{share_link_id}")), false, Some(state.mosaic_max_tiles)))).into_response()),
+        Ok(None) => share_not_found(),
+        Err(error) => { log::error!("shared fragment lookup failed: {error}"); no_store(StatusCode::INTERNAL_SERVER_ERROR.into_response()) }
     }
 }
 
@@ -629,6 +708,7 @@ async fn create_share_link<S: StorageClient>(
     Path(post_id): Path<i64>,
     Extension(principal): Extension<AuthPrincipal>,
     headers: HeaderMap,
+    body: axum::body::Bytes,
 ) -> Response {
     let Some(origin) = validated_request_origin(&headers, &state.security) else {
         return no_store((StatusCode::FORBIDDEN, "origin not allowed\n").into_response());
@@ -636,14 +716,31 @@ async fn create_share_link<S: StorageClient>(
     let Some(access) = principal.share_access() else {
         return no_store(StatusCode::FORBIDDEN.into_response());
     };
+    let request: CreateShareLinkRequest = if body.is_empty() {
+        CreateShareLinkRequest::default()
+    } else {
+        match serde_json::from_slice(&body) {
+            Ok(request) => request,
+            Err(_) => return no_store(StatusCode::BAD_REQUEST.into_response()),
+        }
+    };
+    let mut post_ids = vec![post_id];
+    post_ids.extend(request.additional_post_ids);
+    if post_ids.len() > 100 || post_ids.iter().any(|id| *id <= 0)
+        || post_ids.iter().collect::<std::collections::HashSet<_>>().len() != post_ids.len()
+        || request.title.as_deref().is_some_and(|title| title.chars().count() > 200)
+    {
+        return no_store(StatusCode::BAD_REQUEST.into_response());
+    }
 
     let link_id = auth::new_share_link_id();
     let secret = auth::new_share_link_secret();
     match state
         .database
-        .create_share_link(
+        .create_share_link_posts(
             link_id,
-            post_id,
+            post_ids,
+            request.title.map(|title| title.trim().to_owned()).filter(|title| !title.is_empty()),
             auth::session_token_digest(&secret),
             unix_time(),
             access,
@@ -660,6 +757,7 @@ async fn create_share_link<S: StorageClient>(
                 url: format!("{}/share/{}/{}", origin.key, link.id, secret),
                 id: link.id,
                 expires_at_unix: link.expires_at_unix,
+                post_count: link.post_count,
             })
             .into_response())
         }
@@ -2022,7 +2120,10 @@ fn render_home(
         feed.push_str("<p class=\"empty-feed\">No published posts yet.</p>");
     }
     feed.push_str("</section>");
-    let content = render_feed_controls("<main class=\"site site-feed\">", &feed, next_cursor);
+    let selection_controls = if share_access.is_some() {
+        "<div class=\"share-selection-start\"><button id=\"share-posts-start\" type=\"button\">Share posts</button></div><div id=\"share-selection-bar\" class=\"share-selection-bar\" hidden><span id=\"share-selected-count\">0 selected</span><button id=\"share-selection-cancel\" type=\"button\">Cancel</button><button id=\"share-selection-review\" type=\"button\" disabled>Review</button></div>"
+    } else { "" };
+    let content = render_feed_controls(&format!("<main class=\"site site-feed\">{selection_controls}"), &feed, next_cursor);
     render_site_page("Journey", sidebar, &content, true, username, role, true)
 }
 
@@ -3895,6 +3996,35 @@ mod tests {
         let body = to_bytes(writer_link.into_body(), usize::MAX).await.unwrap();
         let writer_link: serde_json::Value = serde_json::from_slice(&body).unwrap();
         let writer_link_id = writer_link["id"].as_str().unwrap();
+        assert_eq!(writer_link["post_count"], 1);
+        assert_eq!(request(&app, "POST", "/api/posts/4/share-links", &writer_cookie,
+            Some(r#"{"additional_post_ids":[5]}"#)).await.status(), StatusCode::NOT_FOUND);
+        assert_eq!(request(&app, "POST", "/api/posts/4/share-links", &admin_cookie,
+            Some(r#"{"additional_post_ids":[4]}"#)).await.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(request(&app, "POST", "/api/posts/4/share-links", &admin_cookie,
+            Some(r#"{"additional_post_ids":[2]}"#)).await.status(), StatusCode::NOT_FOUND);
+        let multi = request(&app, "POST", "/api/posts/4/share-links", &admin_cookie,
+            Some(r#"{"additional_post_ids":[5],"title":"Family updates"}"#)).await;
+        assert_eq!(multi.status(), StatusCode::OK);
+        let multi: serde_json::Value = serde_json::from_slice(&to_bytes(multi.into_body(), usize::MAX).await.unwrap()).unwrap();
+        assert_eq!(multi["post_count"], 2);
+        let multi_id = multi["id"].as_str().unwrap();
+        let multi_secret = multi["url"].as_str().unwrap().rsplit('/').next().unwrap();
+        let multi_token = auth::new_session_token();
+        database.issue_share_session(multi_id.to_owned(), auth::session_token_digest(multi_secret),
+            auth::session_token_digest(&multi_token), super::unix_time()).await.unwrap().unwrap();
+        let multi_cookie = format!("journey_share_{multi_id}={multi_token}");
+        let multi_page = request(&app, "GET", &format!("/share/{multi_id}"), &multi_cookie, None).await;
+        assert_eq!(multi_page.status(), StatusCode::OK);
+        let multi_html = String::from_utf8(to_bytes(multi_page.into_body(), usize::MAX).await.unwrap().to_vec()).unwrap();
+        assert!(multi_html.contains("Family updates"));
+        assert!(multi_html.contains("Other published"));
+        let second = request(&app, "GET", &format!("/share/{multi_id}/feed?limit=1&after=0"), &multi_cookie, None).await;
+        assert_eq!(second.status(), StatusCode::OK);
+        let second: serde_json::Value = serde_json::from_slice(&to_bytes(second.into_body(), usize::MAX).await.unwrap()).unwrap();
+        assert_eq!(second["posts"][0]["id"], 4);
+        assert_eq!(request(&app, "GET", &format!("/share/{multi_id}/posts/4/fragment"), &multi_cookie, None).await.status(), StatusCode::OK);
+        assert_eq!(request(&app, "GET", &format!("/share/{writer_link_id}/posts/5"), &multi_cookie, None).await.status(), StatusCode::NOT_FOUND);
         let writer_edit_page = request(&app, "GET", "/posts/4/edit", &writer_cookie, None).await;
         assert_eq!(writer_edit_page.status(), StatusCode::OK);
         let body = to_bytes(writer_edit_page.into_body(), usize::MAX).await.unwrap();
