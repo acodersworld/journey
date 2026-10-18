@@ -62,35 +62,35 @@ fn logged_storage_body(body: StorageBody, bytes: u64) -> Body {
     }))
 }
 
-fn requested_bytes(uri: &Uri) -> Result<u64, Response> {
+fn requested_bytes(uri: &Uri) -> Result<u64, Box<Response>> {
     let Some(query) = uri.query() else { return Ok(DEFAULT_TRANSFER_BYTES) };
     let value = query.strip_prefix("bytes=").ok_or_else(|| StatusCode::BAD_REQUEST.into_response())?;
     if value.is_empty() || !value.bytes().all(|byte| byte.is_ascii_digit()) {
-        return Err(StatusCode::BAD_REQUEST.into_response());
+        return Err(Box::new(StatusCode::BAD_REQUEST.into_response()));
     }
     value.parse::<u64>().ok().filter(|bytes| *bytes > 0)
-        .ok_or_else(|| StatusCode::BAD_REQUEST.into_response())
+        .ok_or_else(|| Box::new(StatusCode::BAD_REQUEST.into_response()))
 }
 
-fn allowed<S: StorageClient>(state: &AppState<S>, principal: &AuthPrincipal) -> Result<(), Response> {
+fn allowed<S: StorageClient>(state: &AppState<S>, principal: &AuthPrincipal) -> Result<(), Box<Response>> {
     if state.performance.is_none() {
-        return Err(StatusCode::NOT_FOUND.into_response());
+        return Err(Box::new(StatusCode::NOT_FOUND.into_response()));
     }
     if principal.role != AccountRole::Admin {
-        return Err(StatusCode::FORBIDDEN.into_response());
+        return Err(Box::new(StatusCode::FORBIDDEN.into_response()));
     }
     Ok(())
 }
 
-fn capability_allowed<S: StorageClient>(state: &AppState<S>, token: &str) -> Result<(), Response> {
+fn capability_allowed<S: StorageClient>(state: &AppState<S>, token: &str) -> Result<(), Box<Response>> {
     if state.performance.is_none() {
-        return Err(StatusCode::NOT_FOUND.into_response());
+        return Err(Box::new(StatusCode::NOT_FOUND.into_response()));
     }
     let Some(expected) = state.performance_token.as_deref() else {
-        return Err(StatusCode::NOT_FOUND.into_response());
+        return Err(Box::new(StatusCode::NOT_FOUND.into_response()));
     };
     if !bool::from(token.as_bytes().ct_eq(expected.as_bytes())) {
-        return Err(StatusCode::NOT_FOUND.into_response());
+        return Err(Box::new(StatusCode::NOT_FOUND.into_response()));
     }
     Ok(())
 }
@@ -109,7 +109,7 @@ pub(super) async fn site<S: StorageClient>(
     method: Method,
     uri: Uri,
 ) -> Response {
-    if let Err(response) = allowed(&state, &principal) { return response; }
+    if let Err(response) = allowed(&state, &principal) { return *response; }
     site_download(state, method, uri).await
 }
 
@@ -119,12 +119,12 @@ pub(super) async fn site_capability<S: StorageClient>(
     method: Method,
     uri: Uri,
 ) -> Response {
-    if let Err(response) = capability_allowed(&state, &token) { return super::no_store(response); }
+    if let Err(response) = capability_allowed(&state, &token) { return super::no_store(*response); }
     super::no_store(site_download(state, method, uri).await)
 }
 
 async fn site_download<S: StorageClient>(state: AppState<S>, method: Method, uri: Uri) -> Response {
-    let bytes = match requested_bytes(&uri) { Ok(bytes) => bytes, Err(response) => return response };
+    let bytes = match requested_bytes(&uri) { Ok(bytes) => bytes, Err(response) => return *response };
     let sample = state.performance.as_ref().unwrap();
     log::info!("site_performance_preparation bytes={bytes}");
     let file = match sample.prepare().await {
@@ -173,7 +173,7 @@ pub(super) async fn storage<S: StorageClient>(
     method: Method,
     uri: Uri,
 ) -> Response {
-    if let Err(response) = allowed(&state, &principal) { return response; }
+    if let Err(response) = allowed(&state, &principal) { return *response; }
     storage_download(state, method, uri).await
 }
 
@@ -183,12 +183,12 @@ pub(super) async fn storage_capability<S: StorageClient>(
     method: Method,
     uri: Uri,
 ) -> Response {
-    if let Err(response) = capability_allowed(&state, &token) { return super::no_store(response); }
+    if let Err(response) = capability_allowed(&state, &token) { return super::no_store(*response); }
     super::no_store(storage_download(state, method, uri).await)
 }
 
 async fn storage_download<S: StorageClient>(state: AppState<S>, method: Method, uri: Uri) -> Response {
-    let bytes = match requested_bytes(&uri) { Ok(bytes) => bytes, Err(response) => return response };
+    let bytes = match requested_bytes(&uri) { Ok(bytes) => bytes, Err(response) => return *response };
     log::info!("site_storage_performance_started bytes={bytes} method={method}");
     let response = match state.storage.performance(bytes, method == Method::HEAD).await {
         Ok(response) => response,

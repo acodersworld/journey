@@ -907,6 +907,7 @@ async fn login_form<S: StorageClient>(
     no_store(response)
 }
 
+#[allow(clippy::result_large_err)]
 async fn authenticate_and_issue_session<S: StorageClient>(
     state: &AppState<S>,
     headers: &HeaderMap,
@@ -1048,6 +1049,7 @@ async fn logout_form<S: StorageClient>(
     no_store(response)
 }
 
+#[allow(clippy::result_large_err)]
 async fn revoke_current_session<S: StorageClient>(
     state: &AppState<S>,
     headers: &HeaderMap,
@@ -1057,15 +1059,12 @@ async fn revoke_current_session<S: StorageClient>(
             (StatusCode::FORBIDDEN, "origin not allowed\n").into_response(),
         ));
     }
-    if let Some(token) = cookie_token(headers) {
-        if let Err(error) = state
+    if let Some(token) = cookie_token(headers) && let Err(error) = state
             .database
             .revoke_session(auth::session_token_digest(&token))
-            .await
-        {
-            log::error!("website logout failed: {error}");
-            return Err(no_store(StatusCode::INTERNAL_SERVER_ERROR.into_response()));
-        }
+            .await {
+        log::error!("website logout failed: {error}");
+        return Err(no_store(StatusCode::INTERNAL_SERVER_ERROR.into_response()));
     }
     Ok(())
 }
@@ -1164,15 +1163,9 @@ fn expire_session_cookie(response: &mut Response, security: &SiteSecurity) {
 }
 
 fn validated_request_origin(headers: &HeaderMap, security: &SiteSecurity) -> Option<ParsedOrigin> {
-    let Some(origin_header) = headers.get(header::ORIGIN) else {
-        return None;
-    };
-    let Ok(origin_value) = origin_header.to_str() else {
-        return None;
-    };
-    let Some(origin) = parse_origin(origin_value) else {
-        return None;
-    };
+    let origin_header = headers.get(header::ORIGIN)?;
+    let origin_value = origin_header.to_str().ok()?;
+    let origin = parse_origin(origin_value)?;
     match &security.public_origin {
         Some(configured) if origin.key == configured.key => Some(origin),
         None if origin.scheme == "http" && origin.is_loopback() => Some(origin),
@@ -1297,15 +1290,13 @@ fn no_store(mut response: Response) -> Response {
 }
 
 fn unauthenticated_response(request: &Request) -> Response {
-    if request.method() == Method::GET {
-        if is_content_page_path(request.uri().path()) {
-            let return_to = request
-                .uri()
-                .path_and_query()
-                .and_then(|path_and_query| valid_return_target(path_and_query.as_str()))
-                .unwrap_or_else(|| "/".to_owned());
-            return redirect_to(&format!("/login?return_to={}", encode_url_component(&return_to)));
-        }
+    if request.method() == Method::GET && is_content_page_path(request.uri().path()) {
+        let return_to = request
+            .uri()
+            .path_and_query()
+            .and_then(|path_and_query| valid_return_target(path_and_query.as_str()))
+            .unwrap_or_else(|| "/".to_owned());
+        return redirect_to(&format!("/login?return_to={}", encode_url_component(&return_to)));
     }
     no_store(StatusCode::UNAUTHORIZED.into_response())
 }
@@ -1698,7 +1689,7 @@ async fn upload_media<S: StorageClient>(
     }
 }
 
-fn single_header<'a>(headers: &'a HeaderMap, name: header::HeaderName) -> Option<&'a HeaderValue> {
+fn single_header(headers: &HeaderMap, name: header::HeaderName) -> Option<&HeaderValue> {
     let mut values = headers.get_all(name).iter();
     let value = values.next()?;
     values.next().is_none().then_some(value)
@@ -2890,7 +2881,7 @@ fn media_accessible_label(header: Option<&str>, caption: Option<&str>, fallback:
     header
         .filter(|value| !value.is_empty())
         .or_else(|| caption.filter(|value| !value.is_empty()))
-        .unwrap_or_else(|| if fallback.is_empty() { "media" } else { fallback })
+        .unwrap_or(if fallback.is_empty() { "media" } else { fallback })
         .to_owned()
 }
 
@@ -3098,6 +3089,7 @@ fn has_query_flag(query: Option<&str>, name: &str) -> bool {
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn proxy_media<S: StorageClient>(
     image_cache: Option<&std::sync::Arc<crate::image_cache::ImageCache>>,
     image_quality: ImageQuality,
@@ -3144,8 +3136,8 @@ async fn proxy_media<S: StorageClient>(
         (Some(image_cache), Some(identity)) => Some(image_cache.fill_generation(identity)),
         _ => None,
     };
-    if let (Some(image_cache), Some(identity)) = (image_cache, cache_identity.as_ref()) {
-        if let Some(hit) = image_cache.lookup(identity, head).await {
+    if let (Some(image_cache), Some(identity)) = (image_cache, cache_identity.as_ref())
+        && let Some(hit) = image_cache.lookup(identity, head).await {
             let mut builder = Response::builder()
                 .status(StatusCode::OK)
                 .header(header::CONTENT_TYPE, hit.content_type)
@@ -3162,7 +3154,6 @@ async fn proxy_media<S: StorageClient>(
             }
             return builder.body(Body::from_stream(hit.body)).unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response());
         }
-    }
 
     let stored = if quality_image {
         storage.get_quality_image(&media.storage_key, image_quality, head).await

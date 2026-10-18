@@ -54,11 +54,9 @@ impl Default for Settings {
 }
 
 #[derive(Clone, Copy, Debug)]
+#[derive(Default)]
 pub struct ByteLimit(pub u64);
 
-impl Default for ByteLimit {
-    fn default() -> Self { Self(0) }
-}
 
 impl<'de> Deserialize<'de> for ByteLimit {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
@@ -585,11 +583,10 @@ impl ImageCache {
 
     async fn remove_invalid_entry(&self, path: &Path) {
         let _gate = self.operation_gate.lock().await;
-        if let Err(error) = self.remove_completed_entry(path).await {
-            if error.kind() != io::ErrorKind::NotFound {
+        if let Err(error) = self.remove_completed_entry(path).await
+            && error.kind() != io::ErrorKind::NotFound {
                 log::warn!("image_cache_invalid_entry_remove_failed path={:?}: {error}", path);
             }
-        }
     }
 
     async fn remove_completed_entry(&self, path: &Path) -> io::Result<Option<u64>> {
@@ -745,16 +742,15 @@ impl FillState {
             return;
         }
         drop(file);
-        if let Some(reservation) = self.reservation.take() {
-            if let Err(error) = reservation.publish().await {
+        if let Some(reservation) = self.reservation.take()
+            && let Err(error) = reservation.publish().await {
                 log::warn!("image_cache_publish_failed: {error}");
             }
-        }
     }
 }
 
 fn acquire_process_lock(path: &Path) -> io::Result<fs::File> {
-    let file = OpenOptions::new().read(true).write(true).create(true).mode(0o600).open(path)?;
+    let file = OpenOptions::new().read(true).write(true).truncate(true).create(true).mode(0o600).open(path)?;
     file.set_permissions(fs::Permissions::from_mode(0o600))?;
     let result = unsafe { libc::flock(std::os::fd::AsRawFd::as_raw_fd(&file), libc::LOCK_EX | libc::LOCK_NB) };
     if result != 0 {

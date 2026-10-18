@@ -612,21 +612,21 @@ async fn main() -> AppResult<()> {
                 )
                 .await
             });
-            let mut result: AppResult<()> = loop {
+            let mut result: AppResult<()> = {
                 tokio::select! {
                     biased;
                     signal = shutdown::requested(&mut shutdown) => {
-                        break shutdown_result(signal);
+                        shutdown_result(signal)
                     }
                     result = &mut http_server => {
-                        break Err(format!("journey-site HTTP listener stopped unexpectedly: {result:?}").into());
+                        Err(format!("journey-site HTTP listener stopped unexpectedly: {result:?}").into())
                     }
                     Some(task_result) = listener_tasks.join_next(), if !listener_tasks.is_empty() => {
-                        break match task_result {
+                        match task_result {
                             Ok(Ok(())) => Err("journey-site background listener stopped unexpectedly".into()),
                             Ok(Err(error)) => Err(format!("journey-site background listener failed: {error}").into()),
                             Err(error) => Err(format!("journey-site background listener task failed: {error}").into()),
-                        };
+                        }
                     }
                 }
             };
@@ -649,11 +649,10 @@ async fn main() -> AppResult<()> {
             }
             shutdown_storage.close().await;
             log::info!("site_stopped");
-            if let Err(error) = control_socket.remove().await {
-                if result.is_ok() {
+            if let Err(error) = control_socket.remove().await
+                && result.is_ok() {
                     result = Err(format!("could not remove site control socket: {error}").into());
                 }
-            }
             result
         }
     }

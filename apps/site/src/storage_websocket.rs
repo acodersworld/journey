@@ -75,10 +75,10 @@ pub async fn serve(
                                 if authorized && request.uri().path() == "/internal/storage" {
                                     Ok(())
                                 } else {
-                                    Err(http::Response::builder()
+                                    Err(Box::new(http::Response::builder()
                                         .status(http::StatusCode::UNAUTHORIZED)
                                         .body(Some("storage authentication failed\n".to_owned()))
-                                        .expect("valid unauthorized response"))
+                                        .expect("valid unauthorized response")))
                                 }
                             }),
                         ) => handshake,
@@ -113,11 +113,10 @@ pub async fn serve(
         sessions.abort_all();
     }
     while let Some(task_result) = sessions.join_next().await {
-        if let Err(error) = task_result {
-            if !error.is_cancelled() && result.is_ok() {
+        if let Err(error) = task_result
+            && !error.is_cancelled() && result.is_ok() {
                 result = Err(std::io::Error::other(format!("storage WebSocket session task failed: {error}")));
             }
-        }
     }
     result
 }

@@ -7,6 +7,7 @@ use std::{
 
 #[derive(Debug, Deserialize)]
 #[serde(default, deny_unknown_fields)]
+#[derive(Default)]
 pub struct AppConfig {
     #[serde(default)]
     pub diagnostics: DiagnosticsSettings,
@@ -53,18 +54,6 @@ pub struct SiteConnectionSettings {
     pub websocket_secret: String,
 }
 
-impl Default for AppConfig {
-    fn default() -> Self {
-        Self {
-            diagnostics: DiagnosticsSettings::default(),
-            storage: StorageSettings::default(),
-            derivative_cache: DerivativeCacheConfig::default(),
-            management: ManagementSettings::default(),
-            site_connection: SiteConnectionSettings::default(),
-            logging: journey_logging::LoggingSettings::default(),
-        }
-    }
-}
 
 #[derive(Debug, Deserialize)]
 #[serde(default, deny_unknown_fields)]

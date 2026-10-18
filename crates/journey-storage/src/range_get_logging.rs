@@ -161,10 +161,8 @@ fn record_bytes(
     representation: &str,
     bytes: u64,
 ) {
-    if let Some(activity) = groups.get_mut(&(key.to_owned(), representation.to_owned())) {
-        if activity.active_requests.contains(&request_id) {
-            activity.bytes = activity.bytes.saturating_add(bytes);
-        }
+    if let Some(activity) = groups.get_mut(&(key.to_owned(), representation.to_owned())) && activity.active_requests.contains(&request_id) {
+        activity.bytes = activity.bytes.saturating_add(bytes);
     }
 }
 

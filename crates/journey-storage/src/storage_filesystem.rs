@@ -862,7 +862,7 @@ fn initialize_store(
     }
     let root_lock = Arc::new(lock_file);
 
-    config.derivative_cache.validate().map_err(|error| unavailable(error))?;
+    config.derivative_cache.validate().map_err(unavailable)?;
     let derivative_cache = match DerivativeCache::open(&root, config.derivative_cache.clone()) {
         Ok(cache) => {
             if let Err(error) = cleanup_legacy_thumbnail_cache(&root.join("thumbnail-cache")) {

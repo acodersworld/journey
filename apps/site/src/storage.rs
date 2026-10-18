@@ -786,6 +786,7 @@ async fn get_response<T: StorageRequestTransport>(
     Ok(StorageResponse { status, headers, body })
 }
 
+#[allow(clippy::too_many_arguments)]
 fn storage_request(
     method: Method,
     key: &str,

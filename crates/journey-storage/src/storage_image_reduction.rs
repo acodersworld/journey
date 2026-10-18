@@ -185,7 +185,7 @@ fn process_image_blocking(
         .ok_or_else(|| capacity("Reduced image canvas is too large"))?;
     let mut canvas = vec![255_u8; canvas_length];
     if !is_jpeg {
-        for pixel in canvas.chunks_exact_mut(4) {
+        for pixel in canvas.as_chunks_mut::<4>().0 {
             pixel[3] = 255;
         }
     }
@@ -201,7 +201,7 @@ fn process_image_blocking(
         let destination = &mut canvas[destination_start..destination_start + row_length];
         destination.copy_from_slice(source);
         if is_jpeg {
-            for pixel in destination.chunks_exact_mut(4) {
+            for pixel in destination.as_chunks_mut::<4>().0 {
                 let alpha = u16::from(pixel[3]);
                 for channel in &mut pixel[..3] {
                     *channel = ((u16::from(*channel) * alpha + 255 * (255 - alpha) + 127) / 255) as u8;
@@ -219,7 +219,7 @@ fn process_image_blocking(
         .ok_or_else(|| capacity("Reduced image output is too large"))?;
     let mut output_bytes = Vec::with_capacity(output_bytes_len);
     if is_jpeg {
-        for pixel in canvas.chunks_exact(4) {
+        for pixel in canvas.as_chunks_mut::<4>().0 {
             output_bytes.extend_from_slice(&pixel[..3]);
         }
     } else {
@@ -291,27 +291,25 @@ fn encoder_id(format: ReducedFormat) -> Option<ffmpeg::codec::Id> {
 fn receive_image_frame(
     decoder: &mut ffmpeg::decoder::Video,
 ) -> Result<Option<ffmpeg::frame::Video>, StoreError> {
-    loop {
-        let mut frame = ffmpeg::frame::Video::empty();
-        match decoder.receive_frame(&mut frame) {
-            Ok(()) => {
-                if frame.is_corrupt() || frame.has_decode_errors() {
-                    return Err(StoreError::new(StoreErrorKind::Corrupt, "FFmpeg decoded a corrupt image frame"));
-                }
-                let pixels = u64::from(frame.width())
-                    .checked_mul(u64::from(frame.height()))
-                    .ok_or_else(|| capacity("Decoded image dimensions overflow"))?;
-                if frame.width() == 0 || frame.height() == 0 || pixels > MAX_DECODED_IMAGE_PIXELS {
-                    return Err(capacity(format!(
-                        "Decoded image dimensions exceed the {MAX_DECODED_IMAGE_PIXELS}-pixel limit"
-                    )));
-                }
-                return Ok(Some(frame));
+    let mut frame = ffmpeg::frame::Video::empty();
+    match decoder.receive_frame(&mut frame) {
+        Ok(()) => {
+            if frame.is_corrupt() || frame.has_decode_errors() {
+                return Err(StoreError::new(StoreErrorKind::Corrupt, "FFmpeg decoded a corrupt image frame"));
             }
-            Err(ffmpeg::Error::Other { errno }) if errno == libc::EAGAIN => return Ok(None),
-            Err(ffmpeg::Error::Eof) => return Ok(None),
-            Err(error) => return Err(ffmpeg_error("decode image frame", error)),
+            let pixels = u64::from(frame.width())
+                .checked_mul(u64::from(frame.height()))
+                .ok_or_else(|| capacity("Decoded image dimensions overflow"))?;
+            if frame.width() == 0 || frame.height() == 0 || pixels > MAX_DECODED_IMAGE_PIXELS {
+                return Err(capacity(format!(
+                    "Decoded image dimensions exceed the {MAX_DECODED_IMAGE_PIXELS}-pixel limit"
+                )));
+            }
+            Ok(Some(frame))
         }
+        Err(ffmpeg::Error::Other { errno }) if errno == libc::EAGAIN => Ok(None),
+        Err(ffmpeg::Error::Eof) => Ok(None),
+        Err(error) => Err(ffmpeg_error("decode image frame", error)),
     }
 }
 
@@ -531,10 +529,8 @@ fn exif_orientation(bytes: &[u8]) -> Option<u16> {
     if let Some(orientation) = tiff_orientation(bytes) {
         return Some(orientation);
     }
-    if let Some(exif) = bytes.windows(6).position(|window| window == b"Exif\0\0") {
-        if let Some(orientation) = tiff_orientation(&bytes[exif + 6..]) {
-            return Some(orientation);
-        }
+    if let Some(exif) = bytes.windows(6).position(|window| window == b"Exif\0\0") && let Some(orientation) = tiff_orientation(&bytes[exif + 6..]) {
+        return Some(orientation);
     }
     bytes.windows(4)
         .enumerate()
@@ -675,7 +671,7 @@ mod tests {
         bmp[22..26].copy_from_slice(&(height as u32).to_le_bytes());
         bmp[26..28].copy_from_slice(&1u16.to_le_bytes());
         bmp[28..30].copy_from_slice(&24u16.to_le_bytes());
-        for pixel in bmp[54..].chunks_exact_mut(3) { pixel.copy_from_slice(&[40, 80, 120]); }
+        for pixel in bmp[54..].as_chunks_mut::<3>().0 { pixel.copy_from_slice(&[40, 80, 120]); }
         let permit = acquire_image_reduction_slot().await.unwrap();
         let image = reencode_image_with_slot(Bytes::from(bmp), "image/bmp".into(), ImageQuality::new(80).unwrap(), permit).await.unwrap();
         assert_eq!(image.content_type(), "image/jpeg");

@@ -146,7 +146,7 @@ pub async fn bind(socket_path: &Path) -> AppResult<UnixListener> {
         Err(error) => return Err(error.into()),
     }
 
-    let listener = UnixListener::bind(&socket_path)?;
+    let listener = UnixListener::bind(socket_path)?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;

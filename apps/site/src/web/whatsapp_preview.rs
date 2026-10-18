@@ -235,9 +235,9 @@ pub(super) async fn image<S: StorageClient>(
         video_thumbnail,
     );
     let fill_generation = state.image_cache.as_ref().map(|cache| cache.fill_generation(&cache_identity));
-    if let Some(image_cache) = &state.image_cache {
-        if let Some(hit) = image_cache.lookup(&cache_identity, head).await {
-            if hit.content_type == "image/jpeg" && (1..=WHATSAPP_PREVIEW_IMAGE_MAX_BYTES).contains(&hit.payload_length) {
+    if let Some(image_cache) = &state.image_cache
+        && let Some(hit) = image_cache.lookup(&cache_identity, head).await
+            && hit.content_type == "image/jpeg" && (1..=WHATSAPP_PREVIEW_IMAGE_MAX_BYTES).contains(&hit.payload_length) {
                 let response = Response::builder()
                     .status(StatusCode::OK)
                     .header(header::CONTENT_TYPE, "image/jpeg")
@@ -247,8 +247,6 @@ pub(super) async fn image<S: StorageClient>(
                     .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response());
                 return no_store(response);
             }
-        }
-    }
     let stored = match state.storage.get_reduced_image(
         &media.storage_key,
         options,

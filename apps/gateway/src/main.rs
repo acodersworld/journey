@@ -237,7 +237,7 @@ fn unauthorized() -> Response {
         .into_response()
 }
 
-fn require_site(request: &Request<Body>, state: &GatewayState) -> Result<(), Response> {
+fn require_site(request: &Request<Body>, state: &GatewayState) -> Result<(), Box<Response>> {
     if state
         .auth
         .site
@@ -245,7 +245,7 @@ fn require_site(request: &Request<Body>, state: &GatewayState) -> Result<(), Res
     {
         Ok(())
     } else {
-        Err(unauthorized())
+        Err(Box::new(unauthorized()))
     }
 }
 
@@ -260,17 +260,17 @@ fn reject_home() -> journey_websocket::tungstenite::handshake::server::ErrorResp
 fn authorize_home(
     request: &journey_websocket::tungstenite::handshake::server::Request,
     credential: &Credential,
-) -> Result<(), journey_websocket::tungstenite::handshake::server::ErrorResponse> {
+) -> Result<(), Box<journey_websocket::tungstenite::handshake::server::ErrorResponse>> {
     if credential.accepts(request.headers().get(header::AUTHORIZATION)) {
         Ok(())
     } else {
-        Err(reject_home())
+        Err(Box::new(reject_home()))
     }
 }
 
 async fn index(State(state): State<GatewayState>, request: Request<Body>) -> Response {
     if let Err(response) = require_site(&request, &state) {
-        return response;
+        return *response;
     }
     Response::builder()
         .status(StatusCode::OK)
@@ -282,7 +282,7 @@ async fn index(State(state): State<GatewayState>, request: Request<Body>) -> Res
 
 async fn not_found(State(state): State<GatewayState>, request: Request<Body>) -> Response {
     if let Err(response) = require_site(&request, &state) {
-        return response;
+        return *response;
     }
     (StatusCode::NOT_FOUND, "not found\n").into_response()
 }
@@ -302,7 +302,7 @@ async fn media(
     fallback_content_type: &str,
 ) -> Response {
     if let Err(response) = require_site(&request, &state) {
-        return response;
+        return *response;
     }
     let method = request.method().clone();
     if method != Method::GET && method != Method::HEAD {
@@ -363,7 +363,7 @@ async fn media(
 
 async fn health(State(state): State<GatewayState>, request: Request<Body>) -> Response {
     if let Err(response) = require_site(&request, &state) {
-        return response;
+        return *response;
     }
     let (id, response_future, _request_body) = match send_inner_request(
         &state,
@@ -403,7 +403,7 @@ async fn health(State(state): State<GatewayState>, request: Request<Body>) -> Re
 
 async fn upload(State(state): State<GatewayState>, request: Request<Body>) -> Response {
     if let Err(response) = require_site(&request, &state) {
-        return response;
+        return *response;
     }
     let content_length = match request.headers().get(header::CONTENT_LENGTH) {
         Some(value) => match value.to_str().ok().and_then(|value| value.parse::<u64>().ok()) {
@@ -465,11 +465,9 @@ async fn upload(State(state): State<GatewayState>, request: Request<Body>) -> Re
             };
         }
     }
-    if let Some(expected) = content_length {
-        if expected != observed {
-            send_stream.send_reset(h2::Reason::CANCEL);
-            return (StatusCode::BAD_REQUEST, "Content-Length did not match body\n").into_response();
-        }
+    if let Some(expected) = content_length && expected != observed {
+        send_stream.send_reset(h2::Reason::CANCEL);
+        return (StatusCode::BAD_REQUEST, "Content-Length did not match body\n").into_response();
     }
     if let Err(error) = send_stream.send_data(Bytes::new(), true) {
         state.home.clear_if(id).await;

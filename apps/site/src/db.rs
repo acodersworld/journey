@@ -145,7 +145,9 @@ pub struct Database {
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "lowercase")]
+#[derive(Default)]
 pub enum AccountRole {
+    #[default]
     Read,
     Write,
     Admin,
@@ -170,11 +172,6 @@ impl AccountRole {
     }
 }
 
-impl Default for AccountRole {
-    fn default() -> Self {
-        Self::Read
-    }
-}
 
 impl std::fmt::Display for AccountRole {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -533,6 +530,7 @@ impl Database {
         .await
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub async fn save_draft(
         &self,
         id: i64,
@@ -591,21 +589,19 @@ impl Database {
                 if root.storage_key.is_some() {
                     return Err(rusqlite::Error::InvalidParameterName("visible blocks cannot reference media assets".to_owned()));
                 }
-                if let Some(block_id) = root.id {
-                    if !desired_ids.insert(block_id) || existing_by_id.get(&block_id) != Some(&None) {
+                if let Some(block_id) = root.id
+                    && (!desired_ids.insert(block_id) || existing_by_id.get(&block_id) != Some(&None)) {
                         return Err(rusqlite::Error::InvalidParameterName("draft block ID is invalid or duplicated".to_owned()));
                     }
-                }
                 desired_roots.push(root.id);
                 for child in &root.children {
                     if child.storage_key.is_none() {
                         return Err(rusqlite::Error::InvalidParameterName("gallery items must reference a media asset".to_owned()));
                     }
-                    if let Some(block_id) = child.id {
-                        if !desired_ids.insert(block_id) || existing_by_id.get(&block_id).is_none_or(Option::is_none) {
+                    if let Some(block_id) = child.id
+                        && (!desired_ids.insert(block_id) || existing_by_id.get(&block_id).is_none_or(Option::is_none)) {
                             return Err(rusqlite::Error::InvalidParameterName("gallery item ID is invalid or duplicated".to_owned()));
                         }
-                    }
                     desired_children.push((root.id, child.id));
                 }
             }
@@ -686,6 +682,7 @@ impl Database {
         }).await
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub async fn save_published_text(
         &self,
         id: i64,
@@ -1327,12 +1324,11 @@ impl Database {
                     |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
                 )
                 .optional()?;
-            if let Some((started_seconds, attempts)) = existing {
-                if now_seconds.saturating_sub(started_seconds) <= window_seconds && attempts >= maximum_attempts {
+            if let Some((started_seconds, attempts)) = existing
+                && now_seconds.saturating_sub(started_seconds) <= window_seconds && attempts >= maximum_attempts {
                     transaction.commit()?;
                     return Ok(false);
                 }
-            }
             transaction.execute(
                 "DELETE FROM login_throttles WHERE username_digest = (\
                     SELECT username_digest FROM login_throttles ORDER BY window_started ASC LIMIT 1\

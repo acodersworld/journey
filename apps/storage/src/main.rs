@@ -284,11 +284,10 @@ async fn run_storage_session<S: journey_storage::StoreInterface>(
                 Ok(Some((request, respond))) => {
                     let service = service.clone();
                     handlers.spawn(async move {
-                        if let Err(error) = service.handle(request, respond).await {
-                            if !error.is_peer_cancelled_get() {
+                        if let Err(error) = service.handle(request, respond).await
+                            && !error.is_peer_cancelled_get() {
                                 log::error!("storage_request_failed error={error}");
                             }
-                        }
                     });
                 }
                 Ok(None) => break,

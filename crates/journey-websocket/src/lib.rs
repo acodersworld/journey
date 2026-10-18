@@ -681,7 +681,7 @@ fn accept_websocket_response(
 /// Accepts a WebSocket after a synchronous application authorization decision.
 ///
 /// The callback runs during the HTTP upgrade, before an HTTP/2 session or any
-/// inner request is started. It may return a complete HTTP rejection response.
+/// inner request is started. It may return a boxed HTTP rejection response.
 /// The transport still validates its configuration before reading the request,
 /// and it still enforces the required subprotocol after authorization succeeds.
 pub async fn accept_websocket_with_authorizer<S, F>(
@@ -691,11 +691,13 @@ pub async fn accept_websocket_with_authorizer<S, F>(
 ) -> Result<WebSocketStream<S>, Error>
 where
     S: AsyncRead + AsyncWrite + Unpin,
-    F: FnOnce(&Request) -> Result<(), ErrorResponse> + Unpin,
+    F: FnOnce(&Request) -> Result<(), Box<ErrorResponse>> + Unpin,
 {
     config.validate()?;
+    // Tungstenite requires the concrete error response in this callback.
+    #[allow(clippy::result_large_err)]
     let callback = move |request: &Request, response: Response| {
-        authorize(request)?;
+        authorize(request).map_err(|response| *response)?;
         accept_websocket_response(request, response)
     };
     let websocket = accept_hdr_async_with_config(
@@ -2675,10 +2677,10 @@ mod tests {
         let (client_io, server_io) = duplex(1024 * 1024);
         let server = tokio::spawn(async move {
             accept_websocket_with_authorizer(server_io, Config::default(), |_request| {
-                Err(http::Response::builder()
+                Err(Box::new(http::Response::builder()
                     .status(http::StatusCode::UNAUTHORIZED)
                     .body(Some("rejected".to_owned()))
-                    .expect("rejection response"))
+                    .expect("rejection response")))
             })
             .await
         });

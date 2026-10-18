@@ -9,6 +9,7 @@ use crate::control;
 
 #[derive(Debug, Deserialize)]
 #[serde(default, deny_unknown_fields)]
+#[derive(Default)]
 pub struct AppConfig {
     #[serde(default)]
     pub backup: BackupSettings,
@@ -64,18 +65,6 @@ pub struct StorageSettings {
     pub initial_connection_window_size: u32,
 }
 
-impl Default for AppConfig {
-    fn default() -> Self {
-        Self {
-            backup: BackupSettings::default(),
-            diagnostics: DiagnosticsSettings::default(),
-            image_cache: crate::image_cache::Settings::default(),
-            site: SiteSettings::default(),
-            storage: StorageSettings::default(),
-            logging: journey_logging::LoggingSettings::default(),
-        }
-    }
-}
 
 impl Default for SiteSettings {
     fn default() -> Self {

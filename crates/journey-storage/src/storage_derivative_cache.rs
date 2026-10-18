@@ -117,16 +117,17 @@ impl DerivativeCache {
             Ok(image) => {
                 if file.metadata().and_then(|metadata| metadata.modified()).ok()
                     .and_then(|modified| modified.elapsed().ok())
-                    .is_some_and(|elapsed| elapsed >= self.settings.access_timestamp_interval) {
-                    if let Err(error) = file.set_modified(SystemTime::now()) { log::warn!("derivative cache access timestamp failed: {error}"); }
+                    .is_some_and(|elapsed| elapsed >= self.settings.access_timestamp_interval) &&
+                        let Err(error) = file.set_modified(SystemTime::now()) {
+                    log::warn!("derivative cache access timestamp failed: {error}");
                 }
                 Some(image)
             }
             Err(error) => {
                 log::warn!("derivative cache entry invalid {}: {error}", path.display());
                 let mut occupied = self.occupied.lock().unwrap();
-                if fs::remove_file(&path).is_ok() {
-                    if let Ok(metadata) = file.metadata() { *occupied = occupied.saturating_sub(metadata.len()); }
+                if fs::remove_file(&path).is_ok() && let Ok(metadata) = file.metadata() {
+                    *occupied = occupied.saturating_sub(metadata.len());
                 }
                 None
             }

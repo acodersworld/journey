@@ -372,7 +372,7 @@ async fn stream_fixture(
         sent += count as u64;
         chunks += 1;
         stream.send_data(Bytes::from(buffer[..count].to_vec()), remaining == 0)?;
-        if chunks % TRANSFER_LOG_INTERVAL == 0 || remaining == 0 {
+        if chunks.is_multiple_of(TRANSFER_LOG_INTERVAL) || remaining == 0 {
             println!(
                 "home upload: type={} message=HTTP/2 DATA chunk={} size={} bytes total={}/{} bytes",
                 content_type,

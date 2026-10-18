@@ -1140,10 +1140,8 @@ impl<S: StoreInterface> Service<S> {
             content_length,
             key.as_str(),
             |bytes| {
-                if report_range_bytes {
-                    if let Some(aggregator) = range_get_aggregator {
-                        aggregator.bytes_sent(request_id, key.as_str(), "original", bytes);
-                    }
+                if report_range_bytes && let Some(aggregator) = range_get_aggregator {
+                    aggregator.bytes_sent(request_id, key.as_str(), "original", bytes);
                 }
             },
         )
@@ -1682,7 +1680,6 @@ mod tests {
     use sha2::{Digest, Sha256};
     use std::{
         collections::HashMap,
-        future::Future,
         fs,
         num::NonZeroUsize,
         path::PathBuf,
@@ -1812,41 +1809,39 @@ mod tests {
     }
 
     impl ObjectInterface for FailureObject {
-        fn read(
+        async fn read(
             &mut self,
             buffer: &mut BytesMut,
-        ) -> impl Future<Output = Result<usize, StoreError>> + Send {
-            async move {
-                if self.read_failure && self.cursor >= self.read_limit {
-                    if let Some(read_gate) = &self.read_gate {
-                        read_gate.notified().await;
-                    }
-                    return Err(StoreError::new(
-                        StoreErrorKind::Internal,
-                        SECRET_STORAGE_ERROR,
-                    ));
+        ) -> Result<usize, StoreError> {
+            if self.read_failure && self.cursor >= self.read_limit {
+                if let Some(read_gate) = &self.read_gate {
+                    read_gate.notified().await;
                 }
-                if self.early_eof && self.cursor >= self.read_limit {
-                    if let Some(read_gate) = &self.read_gate {
-                        read_gate.notified().await;
-                    }
-                    return Ok(0);
-                }
-                if self.over_read && self.cursor >= self.read_limit {
-                    if let Some(read_gate) = &self.read_gate {
-                        read_gate.notified().await;
-                    }
-                    return Ok(buffer.len() + 1);
-                }
-                let count = buffer
-                    .len()
-                    .min(self.contents.len() - self.cursor)
-                    .min(self.read_limit);
-                buffer[..count]
-                    .copy_from_slice(&self.contents[self.cursor..self.cursor + count]);
-                self.cursor += count;
-                Ok(count)
+                return Err(StoreError::new(
+                    StoreErrorKind::Internal,
+                    SECRET_STORAGE_ERROR,
+                ));
             }
+            if self.early_eof && self.cursor >= self.read_limit {
+                if let Some(read_gate) = &self.read_gate {
+                    read_gate.notified().await;
+                }
+                return Ok(0);
+            }
+            if self.over_read && self.cursor >= self.read_limit {
+                if let Some(read_gate) = &self.read_gate {
+                    read_gate.notified().await;
+                }
+                return Ok(buffer.len() + 1);
+            }
+            let count = buffer
+                .len()
+                .min(self.contents.len() - self.cursor)
+                .min(self.read_limit);
+            buffer[..count]
+                .copy_from_slice(&self.contents[self.cursor..self.cursor + count]);
+            self.cursor += count;
+            Ok(count)
         }
     }
 

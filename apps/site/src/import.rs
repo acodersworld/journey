@@ -212,7 +212,7 @@ fn validate_post(post: &ManifestPost) -> AppResult<i64> {
 fn parse_publication_timestamp(value: &str) -> AppResult<i64> {
     let has_explicit_offset = value.ends_with('Z')
         || value.ends_with('z')
-        || value.rfind(|character| matches!(character, '+' | '-')).is_some_and(|offset_start| {
+        || value.rfind(['+', '-']).is_some_and(|offset_start| {
             offset_start > 10
                 && matches!(value.len() - offset_start, 3 | 5 | 6)
                 && value[offset_start + 1..]
