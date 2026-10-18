@@ -3,11 +3,16 @@
 ## Summary
 
 Allow an external script to submit a title and time bounds, receive a share
-link, and email it. Recipients see a compact paginated list of posts and open
-individual posts in the shared full-post viewer overlay.
+link, and email it. Recipients see the selected posts in the existing
+multi-post guest feed, using mosaics and the media scroller.
 
 The website handles collection creation and guest access. Scheduling and email
 delivery remain in the external script.
+
+Build on [Manual multi-post sharing](manual-multi-post-share-links.md). This
+plan adds automation credentials and time-bound selection to that common
+sharing mechanism; it does not introduce separate collection links, sessions,
+or guest rendering.
 
 ## Automation API and credentials
 
@@ -41,10 +46,10 @@ delivery remain in the external script.
 
 ## Persistence and guest authorization
 
-- Add separate tables for automation accounts, collection share links,
-  collection membership, and collection guest sessions. Preserve existing
-  single-post share tables and URLs.
-- A collection link stores its title, time bounds, creator, secret digest,
+- Add automation-account storage and extend common share-link metadata for
+  automation creators and time bounds as needed. Reuse `share_links`,
+  `share_link_posts`, and `share_sessions` from manual multi-post sharing.
+- The common share link stores its title, time bounds, creator, secret digest,
   creation/expiry/revocation times, and an ordered list of selected post IDs.
 - Save membership and create the link in one transaction. Freeze order at
   creation using publication time descending, then post ID descending.
@@ -52,36 +57,31 @@ delivery remain in the external script.
   collection; unpublished or deleted posts become inaccessible.
 - Use the existing global admin-controlled share-link lifetime, measured from
   creation. Reuse existing random ID/secret generation and digest storage.
-- Opening `/collection-share/{id}/{secret}` issues a link-scoped guest cookie
-  and redirects to `/collection-share/{id}`.
+- Return the existing `/share/{id}/{secret}` URL. Reuse the common link-scoped
+  guest cookie and redirect to `/share/{id}` for a multi-post feed; a
+  single-post result retains ordinary single-post link behavior.
 - Revalidate session, expiry, revocation, membership, and publication state on
   every collection, post, and media request. Collection guests gain no
   access to other posts or drafts.
-- Add CLI listing and revocation for collection links. Revocation invalidates
-  access through existing guest sessions.
+- Reuse common CLI link listing and revocation, including automation-created
+  links. Revocation invalidates access through existing guest sessions.
 - Introduce a versioned, additive migration from the deployed schema. Preserve
   existing accounts, posts, media references, links, and sessions; do not
-  recreate the database.
+  recreate the database. The permission to discard pre-upgrade share links in
+  the manual multi-post migration is specific to that migration and does not
+  apply to this later automation upgrade.
 
-## Collection list and viewer integration
+## Recipient feed
 
-- Use the existing dark theme and a compact list with one entry per selected
-  post. Show the supplied collection title, post titles, summaries, authors,
-  and publication times converted to the visitor's local time.
-- Load entries in pages of 24, with on-demand loading and a Load more fallback.
-  No mosaic or cover-image generation is required.
-- Reuse the viewer behavior defined in
-  [Full-post viewer overlay](full-post-viewer-overlay.md), including its
-  same-origin iframe, dismissal, focus restoration, retained underlying scroll
-  position, loading/error states, nested galleries, and media cleanup. Do not
-  implement a second overlay.
-- Add collection-authorized inline post URLs and wire collection entries to
-  that shared viewer. These routes must use the collection guest session and
-  revalidate expiry, revocation, membership, and publication state; the
-  account-authenticated viewer route does not authorize collection guests.
-- Provide those inline post pages as real link fallbacks for modified clicks
-  and JavaScript-disabled navigation. Render full posts without mosaics,
-  retaining captions and collection-authorized media URLs.
+- Reuse the manual multi-post guest feed, including the supplied title, dark
+  theme, post text, mosaics, author bylines, and local publication times.
+- Reuse on-demand loading, the Load more fallback, frozen membership/order,
+  empty states, and the existing media scroller. Images use existing media
+  URLs and caches; no separate cover generation is required.
+- Reuse `/share/{id}` feed, fragment, post, and media authorization. Account
+  cookies do not authorize guest routes, and the link cannot expose posts
+  outside its frozen selection.
+- Add no full-post overlay or iframe viewer.
 - Apply existing guest caching and logging policies, adding safe route
   templates for the new endpoints. Never log credentials or share secrets.
 
@@ -93,10 +93,9 @@ delivery remain in the external script.
   cross-collection access, unrelated media, and unpublished posts.
 - Verify migration preserves populated deployed data and existing single-post
   sharing.
-- Check desktop and mobile collection lists, pagination, collection-authorized
-  inline post pages, real link fallbacks, and integration with the shared
-  viewer. Verify dismissal, focus restoration, retained scroll position,
-  nested galleries, and video cleanup in the collection guest context.
-- Document provisioning and an example API request/response. Explicit post
-  selections, collection editing, and specialized email/WhatsApp previews are
-  deferred.
+- Verify automation-created links use the common single/multi-post guest
+  behavior. Check pagination, mosaics, media scroller behavior, video cleanup,
+  and inaccessible or removed members in the guest context.
+- Document provisioning and an example API request/response. Explicit manual
+  selections are covered by the manual multi-post plan. Collection editing
+  and specialized email/WhatsApp previews remain deferred.
